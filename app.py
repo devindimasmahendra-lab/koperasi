@@ -20,13 +20,16 @@ from reportlab.lib.units import mm
 
 APP_TITLE = 'Koperasi Enterprise V4 Smart Control'
 APP_SHORT = 'KOPERASI'
-UI_UX_VERSION = '27.0-mobile-logout-settings'
+UI_UX_VERSION = '27.4-home-profile-consistency'
 DB_NAME = 'koperasi_enterprise_v3.db'
 SECRET_KEY = os.environ.get('KOPERASI_SECRET_KEY', 'dev-only-change-me')
 LOAN_AUTO_APPROVE_LIMIT = 5000000
 MANUAL_JOURNAL_APPROVE_LIMIT = 10000000
 LOAN_VERIFICATION_REQUIRED = True
 LATE_PENALTY_PERCENT = 0.005
+PROFILE_PHOTO_DIR = Path(os.environ.get('KOPERASI_PROFILE_PHOTO_DIR', 'profile_photos'))
+PROFILE_PHOTO_MAX_BYTES = 5 * 1024 * 1024
+PROFILE_PHOTO_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -476,6 +479,7 @@ def init_db():
     
     add_column_if_not_exists('users', 'branch_id', 'INTEGER')
     add_column_if_not_exists('users', 'supplier_id', 'INTEGER')
+    add_column_if_not_exists('users', 'profile_photo', 'TEXT')
     
     add_column_if_not_exists('quick_cashier_items', 'stock_branch_id', 'INTEGER')
     
@@ -3315,6 +3319,62 @@ body.smartphone-v5:not(.page-login) .credit-detail-page .table-wrap table{min-wi
 }
 @media(min-width:769px){.settings-mobile-hero,.settings-mobile-tabs,.mobile-app-account{display:none!important}}
 
+/* User profile photo */
+.mh-profile img,.maa-photo,.smh-profile>img,.profile-photo-preview img{display:block;object-fit:cover;object-position:center}
+.mh-profile img{width:34px;height:34px;border-radius:11px}
+.maa-photo{width:40px!important;height:40px!important;border-radius:13px!important}
+.smh-profile>img{width:54px;height:54px;border-radius:18px;border:2px solid rgba(255,255,255,.25)}
+.profile-photo-editor{display:grid;grid-template-columns:120px minmax(0,1fr);gap:20px;align-items:center;padding:20px}
+.profile-photo-preview{display:grid;place-items:center;width:120px;height:120px;border-radius:30px;background:#edf7f1;color:#126b4a;overflow:hidden;font-size:38px;font-weight:950;box-shadow:inset 0 0 0 1px #dfe8e2}
+.profile-photo-preview img{width:100%;height:100%}
+.profile-photo-controls{display:grid;gap:10px}.profile-photo-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:end}.profile-file-picker{display:grid;gap:3px;padding:12px;border:1px dashed #b9d4c7;border-radius:14px;background:#f8fbf9;cursor:pointer}.profile-file-picker b{font-size:12px}.profile-file-picker small{color:#6c7c73;font-size:9px}.profile-file-picker input{margin-top:7px}.remove-photo-form{margin:0}.remove-photo-form .btn{min-width:130px}
+@media(max-width:768px){body.smartphone-v5.page-settings .profile-photo-editor{grid-template-columns:1fr!important;justify-items:center!important;padding:16px!important}body.smartphone-v5.page-settings .profile-photo-preview{width:112px!important;height:112px!important;border-radius:30px!important}body.smartphone-v5.page-settings .profile-photo-controls{width:100%!important}body.smartphone-v5.page-settings .profile-photo-form{grid-template-columns:1fr!important}body.smartphone-v5.page-settings .profile-photo-form button,body.smartphone-v5.page-settings .remove-photo-form .btn{width:100%!important;min-height:46px!important}body.smartphone-v5.page-settings .profile-file-picker{padding:14px!important;border-radius:16px!important}}
+
+/* Premium member home V27.2 */
+.page-member_dashboard{--ph-green:#126b4a;--ph-green-deep:#0c4934;--ph-green-bright:#23855f;--ph-soft:#edf7f1;--ph-lime:#cbea72;--ph-bg:#f2f6f3;--ph-paper:#fff;--ph-line:#dfe8e2;--ph-ink:#10231a;--ph-muted:#6d7d74;background:var(--ph-bg)!important}
+.premium-home{display:grid;gap:14px;width:100%;max-width:1180px;margin:0 auto 30px;padding:0 12px;color:var(--ph-ink)}
+.ph-hero{position:relative;isolation:isolate;overflow:hidden;padding:28px;border-radius:30px;background:linear-gradient(135deg,#0b4733 0%,#126b4a 55%,#23855f 100%);color:#fff;box-shadow:0 24px 65px rgba(12,73,52,.24)}
+.ph-grid{position:absolute;inset:0;z-index:-1;background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:32px 32px;mask-image:linear-gradient(120deg,transparent,black 28%,black 72%,transparent)}
+.ph-orb{position:absolute;z-index:-1;border-radius:50%;border:1px solid rgba(255,255,255,.13)}.ph-orb-a{width:290px;height:290px;right:-115px;top:-135px;box-shadow:0 0 0 45px rgba(255,255,255,.025),0 0 0 90px rgba(255,255,255,.018)}.ph-orb-b{width:180px;height:180px;left:-110px;bottom:-115px;background:rgba(203,234,114,.06)}
+.ph-hero-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.ph-identity{display:flex;align-items:center;gap:13px;min-width:0}.ph-identity img,.ph-avatar{display:grid;place-items:center;width:48px;height:48px;flex:0 0 48px;border-radius:16px;object-fit:cover;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.17);color:#fff;font-size:17px;font-weight:900}.ph-identity small,.ph-eyebrow{font-size:8px;font-weight:950;letter-spacing:.16em}.ph-identity small{color:#bfe3d3}.ph-identity h1{margin:3px 0 2px;color:#fff;font-size:21px;line-height:1}.ph-identity p{margin:0;color:#b9d7ca;font-size:9px}.ph-notification{position:relative;display:grid;place-items:center;width:44px;height:44px;flex:0 0 44px;border:1px solid rgba(255,255,255,.15);border-radius:15px;background:rgba(255,255,255,.10);color:#fff;text-decoration:none}.ph-notification span{font-size:21px}.ph-notification b{position:absolute;right:-4px;top:-5px;display:grid;place-items:center;min-width:19px;height:19px;padding:0 4px;border:2px solid #126b4a;border-radius:99px;background:#e8663a;color:#fff;font-size:8px}
+.ph-wealth{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-top:34px}.ph-wealth-copy>span{display:block;color:#bfe3d3;font-size:9px;font-weight:900;letter-spacing:.14em}.ph-wealth-copy>strong{display:block;margin:7px 0 6px;color:#fff;font-size:clamp(32px,6vw,48px);line-height:1;letter-spacing:-.06em;font-variant-numeric:tabular-nums}.ph-wealth-copy>small{display:block;color:#b9d7ca;font-size:10px}.ph-asset-mark{position:relative;display:grid;place-items:center;width:108px;height:108px;flex:0 0 108px;border-radius:50%;background:conic-gradient(var(--ph-lime) 0 72%,rgba(255,255,255,.12) 72% 100%);box-shadow:0 15px 35px rgba(0,0,0,.13)}.ph-asset-mark:before{content:'';position:absolute;inset:8px;border-radius:50%;background:#155c43}.ph-asset-mark b,.ph-asset-mark small{position:relative;z-index:1}.ph-asset-mark b{font-size:11px}.ph-asset-mark small{color:#bfe3d3;font-size:6px;letter-spacing:.1em}.ph-asset-mark i{display:none}
+.ph-actions{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:27px}.ph-actions a{display:flex;align-items:center;gap:10px;min-width:0;padding:11px 12px;border:1px solid rgba(255,255,255,.13);border-radius:16px;background:rgba(255,255,255,.10);color:#fff;text-decoration:none}.ph-actions i{display:grid;place-items:center;width:35px;height:35px;flex:0 0 35px;border-radius:12px;background:#fff;color:var(--ph-green);font-size:18px;font-style:normal}.ph-actions span,.ph-actions b,.ph-actions small{display:block;min-width:0}.ph-actions b{font-size:10px}.ph-actions small{margin-top:2px;color:#bad8ca;font-size:8px}
+.ph-assets{display:grid;grid-template-columns:repeat(3,1fr);gap:11px}.ph-asset-card{display:grid;grid-template-columns:46px minmax(0,1fr) 20px;align-items:center;gap:12px;padding:17px;border:1px solid var(--ph-line);border-radius:22px;background:#fff;box-shadow:0 8px 25px rgba(13,55,38,.055)}.ph-card-icon{display:grid;place-items:center;width:46px;height:46px;border-radius:15px;background:var(--ph-soft);color:var(--ph-green);font-size:20px}.ph-asset-card span,.ph-asset-card strong,.ph-asset-card small{display:block}.ph-asset-card span{color:var(--ph-muted);font-size:9px;font-weight:800}.ph-asset-card strong{margin:4px 0 3px;font-size:17px;letter-spacing:-.03em}.ph-asset-card small{color:#8a978f;font-size:8px}.ph-asset-card>a{display:grid;place-items:center;width:20px;height:20px;border-radius:50%;background:#f1f5f2;color:#718078;text-decoration:none}.ph-saving .ph-card-icon{background:#eef3ff;color:#5775bf}.ph-shu .ph-card-icon{background:#fff4df;color:#be7b18}
+.ph-credit,.ph-services,.ph-activity{padding:21px;border:1px solid var(--ph-line);border-radius:24px;background:#fff;box-shadow:0 8px 28px rgba(13,55,38,.05)}.ph-credit header,.ph-section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px}.ph-eyebrow{display:block;color:var(--ph-green)}.ph-credit h2,.ph-section-head h2{margin:4px 0 0;font-size:17px;letter-spacing:-.025em}.ph-credit header>a,.ph-section-head>a{color:var(--ph-green);font-size:9px;font-weight:850;text-decoration:none}.ph-credit-main{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:end;margin-top:20px;padding:18px;border-radius:18px;background:linear-gradient(135deg,#f3f8f5,#edf7f1)}.ph-credit-main small,.ph-credit-main p,.ph-due span{display:block;color:var(--ph-muted);font-size:8px}.ph-credit-main strong{display:block;margin:4px 0 3px;font-size:25px;letter-spacing:-.04em}.ph-credit-main p{margin:0}.ph-due{text-align:right}.ph-due span{font-weight:900;letter-spacing:.09em}.ph-due b{display:block;margin:4px 0;font-size:14px}.ph-progress-head{display:flex;justify-content:space-between;margin:15px 1px 6px;color:var(--ph-muted);font-size:9px}.ph-progress{height:7px;border-radius:99px;background:#e8eee9;overflow:hidden}.ph-progress i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--ph-green),#69b187)}.ph-pay{display:flex;align-items:center;justify-content:space-between;margin-top:14px;padding:12px 14px;border-radius:14px;background:var(--ph-green);color:#fff;text-decoration:none;font-size:10px;font-weight:850}.ph-credit-empty{display:flex;align-items:center;justify-content:space-between;gap:15px;background:linear-gradient(135deg,#fff,#f2f8f4)}.ph-credit-empty p{margin:5px 0 0;color:var(--ph-muted);font-size:9px}.ph-credit-empty>a{padding:11px 14px;border-radius:13px;background:var(--ph-green);color:#fff;text-decoration:none;font-size:9px;font-weight:850;white-space:nowrap}
+.ph-service-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:9px;margin-top:17px}.ph-service-grid a{position:relative;display:flex;min-width:0;min-height:116px;flex-direction:column;padding:14px;border:1px solid #e8eee9;border-radius:19px;background:#fbfcfb;color:var(--ph-ink);text-decoration:none}.ph-service-grid i{display:grid;place-items:center;width:38px;height:38px;margin-bottom:auto;border-radius:13px;background:var(--ph-soft);color:var(--ph-green);font-style:normal;font-size:18px}.ph-service-grid a:nth-child(2) i{background:#eef3ff;color:#5775bf}.ph-service-grid a:nth-child(3) i{background:#fff4df;color:#be7b18}.ph-service-grid a:nth-child(4) i{background:#f5ecff;color:#8255b2}.ph-service-grid a:nth-child(5) i{background:#eaf7f6;color:#2d8881}.ph-service-grid a:nth-child(6) i{background:#f1f2f4;color:#596675}.ph-service-grid b{margin-top:12px;font-size:10px}.ph-service-grid small{margin-top:3px;color:var(--ph-muted);font-size:8px}.ph-service-grid em{position:absolute;right:12px;top:13px;color:#9caaa2;font-style:normal}.ph-activity-list{margin-top:10px}.ph-activity-list>a{display:grid;grid-template-columns:40px minmax(0,1fr) auto;align-items:center;gap:11px;padding:12px 0;border-bottom:1px solid #edf1ee;color:var(--ph-ink);text-decoration:none}.ph-activity-list>a:last-child{border-bottom:0}.ph-activity-list>a>i{display:grid;place-items:center;width:40px;height:40px;border-radius:14px;background:var(--ph-soft);color:var(--ph-green);font-style:normal}.ph-activity-list b,.ph-activity-list small{display:block}.ph-activity-list b{font-size:10px}.ph-activity-list small{margin-top:3px;color:var(--ph-muted);font-size:8px}.ph-activity-list strong{font-size:10px;white-space:nowrap}.ph-empty{display:grid;justify-items:center;padding:28px;color:var(--ph-muted)}.ph-empty i{font-size:25px;font-style:normal}.ph-empty b{margin-top:6px;font-size:11px}.ph-empty span{margin-top:3px;font-size:8px}.ph-trust{display:flex;justify-content:center;gap:18px;padding:5px;color:#7d8b83;font-size:8px}
+@media(max-width:768px){body.smartphone-v5.page-member_dashboard .main-content{padding-top:82px!important;background:var(--ph-bg)!important}.premium-home{gap:11px;padding:0 11px 15px}.ph-hero{margin:0 -11px;border-radius:0 0 28px 28px;padding:21px 20px 23px;box-shadow:0 18px 45px rgba(12,73,52,.22)}.ph-identity img,.ph-avatar{width:43px;height:43px;flex-basis:43px;border-radius:14px}.ph-identity h1{font-size:18px}.ph-identity p{max-width:210px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ph-notification{width:40px;height:40px;flex-basis:40px}.ph-wealth{margin-top:27px}.ph-wealth-copy>strong{font-size:32px}.ph-asset-mark{width:82px;height:82px;flex-basis:82px}.ph-actions{gap:7px;margin-top:23px}.ph-actions a{display:grid;justify-items:center;gap:6px;padding:10px 4px;text-align:center}.ph-actions i{width:34px;height:34px;border-radius:50%}.ph-actions small{display:none}.ph-assets{display:flex;gap:9px;overflow-x:auto;scroll-snap-type:x mandatory;scrollbar-width:none;padding:1px 0 3px}.ph-assets::-webkit-scrollbar{display:none}.ph-asset-card{flex:0 0 215px;scroll-snap-align:start;padding:15px;border-radius:20px}.ph-credit,.ph-services,.ph-activity{padding:17px;border-radius:22px}.ph-credit-main{padding:15px}.ph-credit-main strong{font-size:21px}.ph-service-grid{grid-template-columns:repeat(3,1fr);gap:8px}.ph-service-grid a{min-height:105px;padding:12px}.ph-service-grid i{width:36px;height:36px}.ph-section-head h2{font-size:15px;max-width:230px}.ph-activity-list>a{grid-template-columns:38px minmax(0,1fr)}.ph-activity-list>a>strong{grid-column:2;text-align:left;color:#38473f}.ph-trust{gap:10px;flex-wrap:wrap}.ph-credit-empty{display:block}.ph-credit-empty>a{display:block;margin-top:12px;text-align:center}}
+@media(max-width:390px){.ph-asset-mark{display:none}.ph-wealth-copy>strong{font-size:30px}.ph-service-grid{grid-template-columns:repeat(2,1fr)}.ph-actions b{font-size:8px}.ph-credit-main{grid-template-columns:1fr}.ph-due{text-align:left}}
+@media(prefers-reduced-motion:no-preference){.ph-hero{animation:phEnter .5s ease both}.ph-assets,.ph-credit,.ph-services,.ph-activity{animation:phEnter .45s ease both}.ph-credit{animation-delay:.05s}.ph-services{animation-delay:.1s}.ph-activity{animation-delay:.15s}.ph-service-grid a,.ph-actions a,.ph-asset-card{transition:transform .18s ease,box-shadow .18s ease}.ph-service-grid a:active,.ph-actions a:active,.ph-asset-card:active{transform:scale(.97)}@keyframes phEnter{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}}
+
+/* Mobile vertical scroll recovery V27.3 */
+@media(max-width:768px){
+ html{height:auto!important;min-height:100%!important;overflow-x:hidden!important;overflow-y:auto!important;overscroll-behavior-y:auto!important;touch-action:pan-y!important}
+ body.smartphone-v5{position:static!important;height:auto!important;min-height:100dvh!important;max-height:none!important;overflow-x:hidden!important;overflow-y:auto!important;overscroll-behavior-y:auto!important;touch-action:pan-y!important;-webkit-overflow-scrolling:touch!important}
+ body.smartphone-v5.mobile-drawer-open:not(:has(#sidebar.open)){overflow-y:auto!important;touch-action:pan-y!important}
+ body.smartphone-v5:not(.page-login) .app-wrap,body.smartphone-v5:not(.page-login) .main-content{position:relative!important;height:auto!important;max-height:none!important;overflow-y:visible!important;overscroll-behavior-y:auto!important;touch-action:pan-y!important}
+ body.smartphone-v5.page-member_dashboard .premium-home{height:auto!important;min-height:0!important;max-height:none!important;overflow:visible!important;touch-action:pan-y!important}
+ body.smartphone-v5.page-member_dashboard .ph-hero,body.smartphone-v5.page-member_dashboard .ph-credit,body.smartphone-v5.page-member_dashboard .ph-services,body.smartphone-v5.page-member_dashboard .ph-activity{touch-action:pan-y!important}
+ body.smartphone-v5.page-member_dashboard .ph-assets{touch-action:pan-x pan-y!important}
+ body.smartphone-v5.mobile-app-open,body.smartphone-v5.mobile-notif-open{overflow-y:auto!important;touch-action:pan-y!important}
+ body.smartphone-v5.mobile-app-open .mobile-app-sheet,body.smartphone-v5.mobile-notif-open .mobile-notif-sheet{touch-action:pan-y!important;overscroll-behavior:contain!important}
+ body.smartphone-v5 .mobile-app-grid-wrap,body.smartphone-v5 .mobile-notif-list{overflow-y:auto!important;-webkit-overflow-scrolling:touch!important;touch-action:pan-y!important}
+}
+
+/* Premium home consistency V27.4: profile exists only in the topbar */
+.maa-settings-icon{background:#edf7f1!important;color:#126b4a!important;font-size:17px!important}
+.ph-member-mark{display:grid;place-items:center;width:48px;height:48px;flex:0 0 48px;border-radius:16px;background:linear-gradient(145deg,rgba(255,255,255,.19),rgba(255,255,255,.08));border:1px solid rgba(255,255,255,.18);color:#cbea72;font-size:18px;font-weight:900;box-shadow:inset 0 1px 0 rgba(255,255,255,.12)}
+/* All dashboard sections share the same premium geometry, border and spacing. */
+.page-member_dashboard .ph-assets,.page-member_dashboard .ph-credit,.page-member_dashboard .ph-services,.page-member_dashboard .ph-activity{position:relative;isolation:isolate}
+.page-member_dashboard .ph-credit,.page-member_dashboard .ph-services,.page-member_dashboard .ph-activity{border:1px solid rgba(18,107,74,.10)!important;background:linear-gradient(180deg,#fff 0%,#fcfdfc 100%)!important;box-shadow:0 10px 30px rgba(13,55,38,.055)!important}
+.page-member_dashboard .ph-credit:before,.page-member_dashboard .ph-services:before,.page-member_dashboard .ph-activity:before{content:'';position:absolute;left:20px;top:0;width:42px;height:3px;border-radius:0 0 99px 99px;background:linear-gradient(90deg,#126b4a,#cbea72)}
+.page-member_dashboard .ph-section-head,.page-member_dashboard .ph-credit>header{min-height:42px;padding-bottom:13px;border-bottom:1px solid #edf2ee}
+.page-member_dashboard .ph-eyebrow{color:#126b4a!important}.page-member_dashboard .ph-section-head h2,.page-member_dashboard .ph-credit h2{font-weight:900!important;letter-spacing:-.03em!important}
+.page-member_dashboard .ph-asset-card{border-color:rgba(18,107,74,.10)!important;background:linear-gradient(145deg,#fff,#fbfdfc)!important;box-shadow:0 9px 26px rgba(13,55,38,.05)!important}
+.page-member_dashboard .ph-service-grid a{border-color:#e4ece6!important;background:linear-gradient(145deg,#fff,#f8fbf9)!important;box-shadow:0 5px 16px rgba(13,55,38,.035)!important}
+.page-member_dashboard .ph-activity-list>a{min-height:62px!important}.page-member_dashboard .ph-activity-list>a>strong{font-variant-numeric:tabular-nums!important}
+.page-member_dashboard .ph-trust{margin-top:2px;padding:12px;border-top:1px solid #dfe8e2;color:#718078;font-weight:750}
+@media(max-width:768px){body.smartphone-v5.page-member_dashboard .ph-member-mark{width:43px;height:43px;flex-basis:43px;border-radius:14px}.page-member_dashboard .ph-credit:before,.page-member_dashboard .ph-services:before,.page-member_dashboard .ph-activity:before{left:17px}.page-member_dashboard .ph-section-head,.page-member_dashboard .ph-credit>header{padding-bottom:11px}.page-member_dashboard .ph-assets{padding-bottom:4px}.page-member_dashboard .ph-service-grid a{box-shadow:none!important}.page-member_dashboard .ph-trust{margin-left:2px;margin-right:2px}}
+
 '''
 
 # PROFESSIONAL_UI_FINAL - total redesign retained with corrected system flows
@@ -3731,7 +3791,7 @@ def render_page(title, body, **ctx):
     <div class="mobile-header">
       <button type="button" class="mh-hamburger" onclick="toggleMobileApps(event)" aria-label="Buka semua menu" aria-controls="mobileAppSheet" aria-expanded="false"><span></span><span></span><span></span></button>
       <div class="mh-center"><div class="mh-greeting">Halo, {{{{ (user['full_name'] or user['username']).split(' ')[0] }}}}</div><div class="mh-title">{{{{ title }}}}</div></div>
-      <button type="button" class="mh-profile" onclick="window.location.href='/settings'" aria-label="Buka akun"><span>{{{{ (user['full_name'] or user['username'] or 'U')[0]|upper }}}}</span><i id="mh-badge" class="mh-badge" style="display:none;">0</i></button>
+      <button type="button" class="mh-profile" onclick="window.location.href='/settings'" aria-label="Buka akun">{{% if user['profile_photo'] %}}<img src="{{{{ url_for('profile_photo', user_id=user['id']) }}}}" alt="Foto profil">{{% else %}}<span>{{{{ (user['full_name'] or user['username'] or 'U')[0]|upper }}}}</span>{{% endif %}}<i id="mh-badge" class="mh-badge" style="display:none;">0</i></button>
     </div>
     <div id="mobileNotifBackdrop" class="mobile-notif-backdrop" onclick="closeMobileNotifications(event)"></div>
     <section id="mobileNotifSheet" class="mobile-notif-sheet" aria-hidden="true" aria-label="Panel notifikasi">
@@ -3754,7 +3814,7 @@ def render_page(title, body, **ctx):
       <div class="mobile-app-search"><input id="mobileAppSearch" type="search" placeholder="Cari aplikasi..." oninput="filterMobileApps(this.value)"></div>
       <div class="mobile-app-grid-wrap">{{{{ mobile_grid|safe }}}}</div>
       <footer class="mobile-app-account">
-        <a href="{{{{ url_for('settings') }}}}" class="mobile-account-link"><span class="maa-avatar">{{{{ (user['full_name'] or user['username'] or 'U')[0]|upper }}}}</span><span><b>{{{{ user['full_name'] or user['username'] }}}}</b><small>Pengaturan akun</small></span><i>›</i></a>
+        <a href="{{{{ url_for('settings') }}}}" class="mobile-account-link"><span class="maa-avatar maa-settings-icon" aria-hidden="true">⚙</span><span><b>{{{{ user['full_name'] or user['username'] }}}}</b><small>Pengaturan akun</small></span><i>›</i></a>
         <form method="POST" action="{{{{ url_for('logout') }}}}" class="mobile-logout-form"><button type="submit" class="mobile-logout-btn" data-confirm="Keluar dari aplikasi sekarang?"><span>↪</span><b>Keluar</b></button></form>
       </footer>
     </section>
@@ -3924,6 +3984,7 @@ def render_page(title, body, **ctx):
       if(sheet){{sheet.classList.remove('open');sheet.setAttribute('aria-hidden','true');}}
       if(back)back.classList.remove('open');
       document.body.classList.remove('mobile-app-open');
+      setTimeout(recoverMobilePageScroll,0);
       document.querySelectorAll('.nav-primary,.mh-hamburger').forEach(function(btn){{btn.setAttribute('aria-expanded','false');btn.classList.remove('sheet-open');}});
       return false;
     }}
@@ -3959,7 +4020,26 @@ def render_page(title, body, **ctx):
       if(backdrop)backdrop.setAttribute('aria-hidden','true');
       return false;
     }}
-    document.addEventListener('keydown',function(ev){{if(ev.key==='Escape'){{closeMobileApps();closeMobileNotifications();closeMobileDrawer();}}}});
+    function recoverMobilePageScroll(){{
+      if(window.innerWidth>768)return;
+      var appSheet=document.getElementById('mobileAppSheet');
+      var notifSheet=document.getElementById('mobileNotifSheet');
+      var sidebar=document.getElementById('sidebar');
+      if(!appSheet || !appSheet.classList.contains('open'))document.body.classList.remove('mobile-app-open');
+      if(!notifSheet || !notifSheet.classList.contains('open'))document.body.classList.remove('mobile-notif-open');
+      if(!sidebar || !sidebar.classList.contains('open'))document.body.classList.remove('mobile-drawer-open');
+      document.documentElement.style.removeProperty('overflow');
+      document.documentElement.style.removeProperty('height');
+      document.body.style.removeProperty('overflow');
+      document.body.style.removeProperty('height');
+      document.body.style.removeProperty('position');
+      document.body.style.removeProperty('touch-action');
+    }}
+    if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',recoverMobilePageScroll);
+    else recoverMobilePageScroll();
+    window.addEventListener('pageshow',recoverMobilePageScroll);
+    window.addEventListener('resize',recoverMobilePageScroll);
+    document.addEventListener('keydown',function(ev){{if(ev.key==='Escape'){{closeMobileApps();closeMobileNotifications();closeMobileDrawer();recoverMobilePageScroll();}}}});
     document.addEventListener('DOMContentLoaded',function(){{
       document.querySelectorAll('.hamburger').forEach(function(btn){{
         btn.addEventListener('click',function(ev){{ev.preventDefault();ev.stopImmediatePropagation();openMobileDrawer(ev);}},true);
@@ -4098,6 +4178,7 @@ def render_page(title, body, **ctx):
       if(back) back.classList.remove('open');
       if(btn) btn.setAttribute('aria-expanded','false');
       document.body.classList.remove('mobile-notif-open');
+      setTimeout(recoverMobilePageScroll,0);
     }}
     function toggleNotifPopup(){{
       var popup=document.getElementById('notif-popup');
@@ -4925,14 +5006,59 @@ def member_dashboard():
     except Exception: pass
     remaining=max(0,float(active_loan['total_receivable'] or 0)-float(paid)) if active_loan else 0
     body=render_template_string(r'''
-    <div class="mx-app">
-      <section class="mx-hero"><div class="mx-hero-top"><div><span class="mx-overline">RUANG FINANSIAL</span><h2>Halo, {{member.name.split()[0]}}</h2><p>{{member.member_code}} · Anggota sejak {{member.join_date or '-'}}</p></div><a href="{{url_for('notifications')}}" class="mx-bell" aria-label="Notifikasi">◌{% if unread %}<b>{{unread}}</b>{% endif %}</a></div><div class="mx-balance"><span>Total aset koperasi</span><strong>{{rupiah(saldo_wallet+total_simpanan+shu)}}</strong><small>Dompet, simpanan, dan estimasi SHU</small></div><div class="mx-hero-actions"><a href="{{url_for('wallet')}}"><i>＋</i><span>Isi Saldo</span></a><a href="{{url_for('apply_loan')}}"><i>↗</i><span>Ajukan Kredit</span></a><a href="{{url_for('member_digital_card')}}"><i>◇</i><span>Kartu Digital</span></a></div></section>
-      <section class="mx-glance"><article><span>Dompet</span><b>{{rupiah(saldo_wallet)}}</b><small>Tersedia</small></article><article><span>Simpanan</span><b>{{rupiah(total_simpanan)}}</b><small>Total bersih</small></article><article><span>SHU {{now().year}}</span><b>{{rupiah(shu)}}</b><small>Estimasi</small></article></section>
-      {% if active_loan %}<section class="mx-loan"><div class="mx-section-title"><div><span>KREDIT AKTIF</span><h3>{{active_loan.loan_no}}</h3></div><a href="{{url_for('loans')}}">Detail</a></div><div class="mx-loan-grid"><div><small>Sisa tagihan</small><strong>{{rupiah(remaining)}}</strong></div><div><small>Angsuran</small><strong>{{rupiah(active_loan.monthly_installment)}}</strong></div><div><small>Jatuh tempo</small><strong>{{next_due.due_date if next_due else '-'}}</strong></div></div><div class="mx-progress"><i style="width:{{[100,((paid/(active_loan.total_receivable or 1))*100)]|min|round}}%"></i></div><a class="mx-pay" href="{{url_for('pay_loan_installment',loan_id=active_loan.id)}}">Bayar angsuran</a></section>{% endif %}
-      <section class="mx-menu"><div class="mx-section-title"><div><span>LAYANAN</span><h3>Akses cepat</h3></div><a href="{{url_for('member_hub')}}">Lihat semua</a></div><div class="mx-service-grid"><a href="{{url_for('member_hub',tab='goals')}}"><i>◎</i><b>Target</b><small>{{goals}} aktif</small></a><a href="{{url_for('member_hub',tab='calendar')}}"><i>▦</i><b>Kalender</b><small>Agenda finansial</small></a><a href="{{url_for('member_hub',tab='benefits')}}"><i>✦</i><b>Manfaat</b><small>Benefit anggota</small></a><a href="{{url_for('member_hub',tab='requests')}}"><i>◫</i><b>Layanan</b><small>{{open_requests}} proses</small></a><a href="{{url_for('member_hub',tab='insights')}}"><i>⌁</i><b>Insight</b><small>Analisis pribadi</small></a><a href="{{url_for('member_purchases')}}"><i>≡</i><b>Aktivitas</b><small>Riwayat transaksi</small></a></div></section>
-      <section class="mx-activity"><div class="mx-section-title"><div><span>AKTIVITAS</span><h3>Transaksi terbaru</h3></div><a href="{{url_for('member_purchases')}}">Riwayat</a></div>{% for r in recent %}<a class="mx-activity-row" href="{{url_for('member_purchases')}}"><i>↙</i><div><b>Belanja koperasi</b><small>{{r.invoice_no}} · {{r.trx_date}}</small></div><strong>-{{rupiah(r.total)}}</strong></a>{% else %}<div class="mx-empty">Belum ada transaksi terbaru.</div>{% endfor %}</section>
+    <div class="premium-home">
+      <section class="ph-hero">
+        <div class="ph-orb ph-orb-a"></div><div class="ph-orb ph-orb-b"></div><div class="ph-grid"></div>
+        <header class="ph-hero-head">
+          <div class="ph-identity">
+            <span class="ph-member-mark" aria-hidden="true">◆</span>
+            <div><small>SELAMAT DATANG</small><h1>{{member.name.split()[0]}}</h1><p>{{member.member_code}} · Anggota sejak {{member.join_date or '-'}}</p></div>
+          </div>
+          <a href="{{url_for('notifications')}}" class="ph-notification" aria-label="Notifikasi"><span>◌</span>{% if unread %}<b>{{unread if unread < 100 else '99+'}}</b>{% endif %}</a>
+        </header>
+        <div class="ph-wealth">
+          <div class="ph-wealth-copy"><span>TOTAL ASET KOPERASI</span><strong>{{rupiah(saldo_wallet+total_simpanan+shu)}}</strong><small>Dompet, simpanan, dan estimasi SHU tahun {{now().year}}</small></div>
+          <div class="ph-asset-mark" aria-hidden="true"><i></i><b>ASET</b><small>TERHUBUNG</small></div>
+        </div>
+        <div class="ph-actions">
+          <a href="{{url_for('wallet')}}"><i>＋</i><span><b>Isi Saldo</b><small>Top up dompet</small></span></a>
+          <a href="{{url_for('apply_loan')}}"><i>↗</i><span><b>Ajukan Kredit</b><small>Proses digital</small></span></a>
+          <a href="{{url_for('member_digital_card')}}"><i>◇</i><span><b>Kartu Digital</b><small>Identitas anggota</small></span></a>
+        </div>
+      </section>
+
+      <section class="ph-assets">
+        <article class="ph-asset-card ph-wallet"><div class="ph-card-icon">◎</div><div><span>Dompet aktif</span><strong>{{rupiah(saldo_wallet)}}</strong><small>Saldo siap digunakan</small></div><a href="{{url_for('wallet')}}">›</a></article>
+        <article class="ph-asset-card ph-saving"><div class="ph-card-icon">◉</div><div><span>Total simpanan</span><strong>{{rupiah(total_simpanan)}}</strong><small>Akumulasi bersih</small></div><a href="{{url_for('member_expense_history')}}">›</a></article>
+        <article class="ph-asset-card ph-shu"><div class="ph-card-icon">✦</div><div><span>Estimasi SHU {{now().year}}</span><strong>{{rupiah(shu)}}</strong><small>Nilai sementara</small></div><a href="{{url_for('shu_member')}}">›</a></article>
+      </section>
+
+      {% if active_loan %}<section class="ph-credit">
+        <header><div><span class="ph-eyebrow">KREDIT AKTIF</span><h2>Tagihan berikutnya</h2></div><a href="{{url_for('loans')}}">Lihat detail <b>›</b></a></header>
+        <div class="ph-credit-main"><div><small>Sisa tagihan</small><strong>{{rupiah(remaining)}}</strong><p>{{active_loan.loan_no}}</p></div><div class="ph-due"><span>JATUH TEMPO</span><b>{{next_due.due_date if next_due else '-'}}</b><small>{{rupiah(active_loan.monthly_installment)}} / angsuran</small></div></div>
+        <div class="ph-progress-head"><span>Progres pembayaran</span><b>{{[100,((paid/(active_loan.total_receivable or 1))*100)]|min|round|int}}%</b></div><div class="ph-progress"><i style="width:{{[100,((paid/(active_loan.total_receivable or 1))*100)]|min|round}}%"></i></div>
+        <a class="ph-pay" href="{{url_for('pay_loan_installment',loan_id=active_loan.id)}}"><span>Bayar angsuran</span><b>→</b></a>
+      </section>{% else %}<section class="ph-credit ph-credit-empty"><div><span class="ph-eyebrow">KREDIT</span><h2>Belum ada kredit aktif</h2><p>Ajukan kebutuhan produktif melalui proses digital koperasi.</p></div><a href="{{url_for('apply_loan')}}">Ajukan sekarang →</a></section>{% endif %}
+
+      <section class="ph-services">
+        <header class="ph-section-head"><div><span class="ph-eyebrow">LAYANAN EKSKLUSIF</span><h2>Semua kebutuhan dalam satu sentuhan</h2></div><a href="{{url_for('member_hub')}}">Lihat semua</a></header>
+        <div class="ph-service-grid">
+          <a href="{{url_for('member_hub',tab='goals')}}"><i>◎</i><b>Target</b><small>{{goals}} aktif</small><em>›</em></a>
+          <a href="{{url_for('member_hub',tab='calendar')}}"><i>▦</i><b>Kalender</b><small>Agenda finansial</small><em>›</em></a>
+          <a href="{{url_for('member_hub',tab='benefits')}}"><i>✦</i><b>Manfaat</b><small>Benefit anggota</small><em>›</em></a>
+          <a href="{{url_for('member_hub',tab='requests')}}"><i>◫</i><b>Layanan</b><small>{{open_requests}} diproses</small><em>›</em></a>
+          <a href="{{url_for('member_hub',tab='insights')}}"><i>⌁</i><b>Insight</b><small>Analisis pribadi</small><em>›</em></a>
+          <a href="{{url_for('member_purchases')}}"><i>≡</i><b>Aktivitas</b><small>Riwayat transaksi</small><em>›</em></a>
+        </div>
+      </section>
+
+      <section class="ph-activity">
+        <header class="ph-section-head"><div><span class="ph-eyebrow">AKTIVITAS TERKINI</span><h2>Pergerakan dana terbaru</h2></div><a href="{{url_for('member_purchases')}}">Semua</a></header>
+        <div class="ph-activity-list">{% for r in recent %}<a href="{{url_for('member_purchases')}}"><i>↙</i><span><b>Belanja koperasi</b><small>{{r.invoice_no}} · {{r.trx_date}}</small></span><strong>-{{rupiah(r.total)}}</strong></a>{% else %}<div class="ph-empty"><i>◇</i><b>Belum ada aktivitas</b><span>Transaksi terbaru akan tampil di sini.</span></div>{% endfor %}</div>
+      </section>
+      <footer class="ph-trust"><span>◈ Data terlindungi</span><span>● Sistem aktif</span><span>✓ Transaksi tercatat</span></footer>
     </div>
-    ''',member=member,saldo_wallet=saldo_wallet,total_simpanan=total_simpanan,shu=shu,active_loan=active_loan,next_due=next_due,paid=paid,remaining=remaining,recent=recent,unread=unread,goals=goals,open_requests=open_requests,rupiah=rupiah,now=lambda:datetime.now)
+    ''',member=member,user=user,saldo_wallet=saldo_wallet,total_simpanan=total_simpanan,shu=shu,active_loan=active_loan,next_due=next_due,paid=paid,remaining=remaining,recent=recent,unread=unread,goals=goals,open_requests=open_requests,rupiah=rupiah,now=lambda:datetime.now)
     return render_page('Beranda',body)
 
 # =========================
@@ -6966,13 +7092,87 @@ def audit():
     body = render_template_string('<div class="card"><h2>🔍 Audit Log</h2><div class="table-wrap"><table><thead><tr><th>Waktu</th><th>User</th><th>Aksi</th><th>Detail</th></tr></thead><tbody>{% for r in rows %}<tr><td>{{ r.log_time }}</td><td>{{ r.username }}</td><td>{{ r.action }}</td><td>{{ r.detail }}</td></tr>{% else %}<tr><td colspan="4" class="muted text-center">Belum ada log.</td></tr>{% endfor %}</tbody></table></div>{{ pag_html|safe }}</div>', rows=rows, pag_html=pag_html)
     return render_page('Jejak Audit', body)
 
+def _valid_profile_photo_signature(data, ext):
+    """Validate common image signatures without requiring extra packages."""
+    if not data:
+        return False
+    ext = (ext or '').lower()
+    if ext in ('.jpg', '.jpeg'):
+        return len(data) > 4 and data[:3] == b'\xff\xd8\xff' and data[-2:] == b'\xff\xd9'
+    if ext == '.png':
+        return data.startswith(b'\x89PNG\r\n\x1a\n')
+    if ext == '.webp':
+        return len(data) > 12 and data[:4] == b'RIFF' and data[8:12] == b'WEBP'
+    return False
+
+def _delete_profile_photo(filename):
+    if not filename:
+        return
+    safe_name = Path(str(filename)).name
+    target = PROFILE_PHOTO_DIR / safe_name
+    try:
+        if target.is_file():
+            target.unlink()
+    except OSError:
+        pass
+
+@app.route('/profile-photo/<int:user_id>')
+@login_required
+def profile_photo(user_id):
+    row = q_one('SELECT profile_photo, active FROM users WHERE id=?', [user_id])
+    if not row or not row['active'] or not row['profile_photo']:
+        return ('', 404)
+    safe_name = Path(str(row['profile_photo'])).name
+    file_path = PROFILE_PHOTO_DIR / safe_name
+    if not file_path.is_file():
+        return ('', 404)
+    return send_file(file_path, conditional=True, max_age=3600)
+
 @app.route('/settings', methods=['GET', 'POST'])
 @login_required
 def settings():
     user = current_user()
     if request.method == 'POST':
         action = request.form.get('action')
-        if action == 'change_password':
+        if action == 'update_profile_photo':
+            photo = request.files.get('profile_photo')
+            if not photo or not photo.filename:
+                flash('Pilih foto profil terlebih dahulu.', 'error')
+                return redirect(url_for('settings') + '#profile-photo')
+            original = secure_filename(photo.filename)
+            ext = Path(original).suffix.lower()
+            if ext not in PROFILE_PHOTO_EXTENSIONS:
+                flash('Format foto harus JPG, PNG, atau WEBP.', 'error')
+                return redirect(url_for('settings') + '#profile-photo')
+            data = photo.read(PROFILE_PHOTO_MAX_BYTES + 1)
+            if len(data) > PROFILE_PHOTO_MAX_BYTES:
+                flash('Ukuran foto maksimal 5 MB.', 'error')
+                return redirect(url_for('settings') + '#profile-photo')
+            if not _valid_profile_photo_signature(data, ext):
+                flash('File bukan gambar yang valid atau isi file tidak sesuai ekstensi.', 'error')
+                return redirect(url_for('settings') + '#profile-photo')
+            PROFILE_PHOTO_DIR.mkdir(parents=True, exist_ok=True)
+            stored_ext = '.jpg' if ext == '.jpeg' else ext
+            filename = f'user_{int(user["id"])}_{int(datetime.now().timestamp())}{stored_ext}'
+            temp_path = PROFILE_PHOTO_DIR / (filename + '.tmp')
+            final_path = PROFILE_PHOTO_DIR / filename
+            temp_path.write_bytes(data)
+            temp_path.replace(final_path)
+            old_photo = user['profile_photo'] if 'profile_photo' in user.keys() else None
+            exec_sql('UPDATE users SET profile_photo=? WHERE id=?', [filename, user['id']])
+            if old_photo and old_photo != filename:
+                _delete_profile_photo(old_photo)
+            log_action('UPDATE_PROFILE_PHOTO', 'users', user['id'], 'Foto profil diperbarui')
+            flash('Foto profil berhasil diperbarui.', 'success')
+            return redirect(url_for('settings') + '#profile-photo')
+        elif action == 'remove_profile_photo':
+            old_photo = user['profile_photo'] if 'profile_photo' in user.keys() else None
+            exec_sql('UPDATE users SET profile_photo=NULL WHERE id=?', [user['id']])
+            _delete_profile_photo(old_photo)
+            log_action('REMOVE_PROFILE_PHOTO', 'users', user['id'], 'Foto profil dihapus')
+            flash('Foto profil berhasil dihapus.', 'success')
+            return redirect(url_for('settings') + '#profile-photo')
+        elif action == 'change_password':
             old_pass = request.form.get('old_password', '')
             new_pass = request.form.get('new_password', '')
             if not verify_password(user['password_hash'], old_pass):
@@ -7067,10 +7267,10 @@ def settings():
     }
     body = render_template_string("""
     <div class="settings-mobile-hero">
-      <div class="smh-profile"><span>{{ (user.full_name or user.username or 'U')[0]|upper }}</span><div><small>AKUN AKTIF</small><h2>{{ user.full_name or user.username }}</h2><p>{{ user.role|replace('_',' ')|title }}</p></div></div>
+      <div class="smh-profile">{% if user.profile_photo %}<img src="{{ url_for('profile_photo', user_id=user.id) }}" alt="Foto profil {{ user.full_name or user.username }}">{% else %}<span>{{ (user.full_name or user.username or 'U')[0]|upper }}</span>{% endif %}<div><small>AKUN AKTIF</small><h2>{{ user.full_name or user.username }}</h2><p>{{ user.role|replace('_',' ')|title }}</p></div></div>
       <div class="smh-actions"><a href="#account-security">Ubah Password</a><form method="POST" action="{{ url_for('logout') }}"><button type="submit" data-confirm="Keluar dari aplikasi sekarang?">Keluar</button></form></div>
     </div>
-    <div class="settings-mobile-tabs" aria-label="Navigasi pengaturan"><a href="#account-security" class="active">Akun</a>{% if user.role == 'admin' %}<a href="#general-preferences">Umum</a><a href="#financial-policy">Finansial</a>{% endif %}<a href="#data-management">Backup</a>{% if user.role == 'admin' %}<a href="#role-access">Akses</a>{% endif %}</div>
+    <div class="settings-mobile-tabs" aria-label="Navigasi pengaturan"><a href="#profile-photo" class="active">Foto</a><a href="#account-security">Akun</a>{% if user.role == 'admin' %}<a href="#general-preferences">Umum</a><a href="#financial-policy">Finansial</a>{% endif %}<a href="#data-management">Backup</a>{% if user.role == 'admin' %}<a href="#role-access">Akses</a>{% endif %}</div>
     <div class="settings-shell">
       <aside class="settings-nav-panel">
         <span class="settings-kicker">SYSTEM PREFERENCES</span><h2>Pengaturan</h2><p>Konfigurasi identitas, tampilan, kebijakan finansial, keamanan, dan akses aplikasi.</p>
@@ -7078,12 +7278,14 @@ def settings():
       </aside>
       <div class="settings-content">
         {% if user.role == 'admin' %}<section id="general-preferences" class="settings-section"><div class="settings-section-head"><span>01</span><div><h2>Umum & Tampilan</h2><p>Atur identitas aplikasi, kepadatan antarmuka, jumlah data, dan interval notifikasi.</p></div></div><form method="post" class="settings-form settings-form-grid"><input type="hidden" name="action" value="save_general_preferences"><div class="form-group"><label>Nama Organisasi</label><input name="organization_name" value="{{cfg.organization_name}}" maxlength="80" required></div><div class="form-group"><label>Nama Singkat</label><input name="organization_short" value="{{cfg.organization_short}}" maxlength="20" required></div><div class="form-group"><label>Kepadatan Tampilan</label><select name="ui_density"><option value="compact" {% if cfg.ui_density=='compact' %}selected{% endif %}>Ringkas</option><option value="comfortable" {% if cfg.ui_density=='comfortable' %}selected{% endif %}>Nyaman</option><option value="spacious" {% if cfg.ui_density=='spacious' %}selected{% endif %}>Lapang</option></select></div><div class="form-group"><label>Data per Halaman</label><select name="per_page">{% for n in [10,20,30,50,100] %}<option value="{{n}}" {% if cfg.per_page|int==n %}selected{% endif %}>{{n}} baris</option>{% endfor %}</select></div><div class="form-group"><label>Refresh Notifikasi</label><select name="notification_seconds">{% for n in [10,20,30,60,120,300] %}<option value="{{n}}" {% if cfg.notification_seconds|int==n %}selected{% endif %}>{{n}} detik</option>{% endfor %}</select></div><div class="settings-form-actions"><button type="submit">Simpan Preferensi</button></div></form></section>{% endif %}
+        <section id="profile-photo" class="settings-section profile-photo-section"><div class="settings-section-head"><span>👤</span><div><h2>Foto Profil</h2><p>Gunakan foto JPG, PNG, atau WEBP. Ukuran maksimum 5 MB.</p></div></div><div class="profile-photo-editor"><div class="profile-photo-preview">{% if user.profile_photo %}<img id="profilePhotoPreview" src="{{ url_for('profile_photo', user_id=user.id) }}" alt="Foto profil saat ini">{% else %}<span id="profilePhotoFallback">{{ (user.full_name or user.username or 'U')[0]|upper }}</span><img id="profilePhotoPreview" alt="Pratinjau foto profil" hidden>{% endif %}</div><div class="profile-photo-controls"><form method="post" enctype="multipart/form-data" class="profile-photo-form"><input type="hidden" name="action" value="update_profile_photo"><label class="profile-file-picker"><b>Pilih Foto Baru</b><small>JPG, PNG, WEBP · Maks. 5 MB</small><input id="profilePhotoInput" type="file" name="profile_photo" accept="image/jpeg,image/png,image/webp" required></label><button type="submit" class="btn btn-success">Simpan Foto</button></form>{% if user.profile_photo %}<form method="post" class="remove-photo-form"><input type="hidden" name="action" value="remove_profile_photo"><button type="submit" class="btn btn-danger" data-confirm="Hapus foto profil sekarang?">Hapus Foto</button></form>{% endif %}</div></div></section>
         <section id="account-security" class="settings-section"><div class="settings-section-head"><span>{{'02' if user.role=='admin' else '01'}}</span><div><h2>Keamanan Akun</h2><p>Perbarui kata sandi akun yang sedang digunakan.</p></div></div><form method="post" class="settings-form"><input type="hidden" name="action" value="change_password"><div class="form-group"><label>Password Lama</label><input type="password" name="old_password" placeholder="Masukkan password saat ini" autocomplete="current-password" required></div><div class="form-group"><label>Password Baru</label><input type="password" name="new_password" placeholder="Minimal 4 karakter" minlength="4" autocomplete="new-password" required></div><div class="settings-form-actions"><button type="submit">Simpan Password</button></div></form></section>
         {% if user.role == 'admin' %}<section id="financial-policy" class="settings-section"><div class="settings-section-head"><span>03</span><div><h2>Kebijakan Finansial</h2><p>Atur batas persetujuan dan denda. Perubahan tercatat pada jejak audit.</p></div></div><form method="post" class="settings-form settings-form-grid"><input type="hidden" name="action" value="save_financial_policy"><div class="form-group"><label>Batas Otomatis Kredit</label><input type="number" name="loan_auto_approve_limit" min="0" step="100000" value="{{cfg.loan_auto_approve_limit}}"></div><div class="form-group"><label>Batas Persetujuan Jurnal</label><input type="number" name="manual_journal_approve_limit" min="0" step="100000" value="{{cfg.manual_journal_approve_limit}}"></div><div class="form-group"><label>Denda Keterlambatan</label><div class="input-suffix"><input type="number" name="late_penalty_percent" min="0" max="0.1" step="0.001" value="{{cfg.late_penalty_percent}}"><span>desimal</span></div><small class="field-note">Contoh: 0,005 berarti 0,5% per periode.</small></div><div class="settings-form-actions"><button type="submit">Simpan Kebijakan</button></div></form></section>{% endif %}
         <section id="data-management" class="settings-section"><div class="settings-section-head"><span>{{'04' if user.role=='admin' else '02'}}</span><div><h2>Data & Backup</h2><p>Unduh cadangan atau pulihkan database dengan file SQLite yang sah.</p></div></div><div class="backup-grid"><div class="backup-row"><div><strong>{{ db_name }}</strong><small>Database aktif aplikasi</small></div><a href="{{ url_for('download_db') }}" class="btn btn-ghost">Download Backup</a></div>{% if user.role=='admin' %}<form method="post" enctype="multipart/form-data" class="restore-row"><input type="hidden" name="action" value="restore_db"><div><strong>Pulihkan Database</strong><small>File lama dicadangkan otomatis sebelum pemulihan.</small></div><input type="file" name="db_file" accept=".db,.sqlite,.sqlite3" required><button type="submit" class="btn btn-warn" data-confirm="Pulihkan database dari file ini? Database aktif akan diganti.">Restore</button></form>{% endif %}</div></section>
         {% if user.role == 'admin' %}<section id="role-access" class="settings-section role-access-section"><div class="settings-section-head"><span>05</span><div><h2>Hak Akses Menu</h2><p>Tentukan menu yang tampil untuk setiap peran pengguna.</p></div></div>{{ menu_editor|safe }}</section>{% endif %}
       </div>
     </div>
+    <script>(function(){var input=document.getElementById('profilePhotoInput'),preview=document.getElementById('profilePhotoPreview'),fallback=document.getElementById('profilePhotoFallback');if(!input||!preview)return;input.addEventListener('change',function(){var f=this.files&&this.files[0];if(!f)return;if(f.size>5*1024*1024){alert('Ukuran foto maksimal 5 MB.');this.value='';return;}if(!/^image[/](jpeg|png|webp)$/.test(f.type)){alert('Format foto harus JPG, PNG, atau WEBP.');this.value='';return;}var url=URL.createObjectURL(f);preview.src=url;preview.hidden=false;if(fallback)fallback.style.display='none';});})();</script>
     """, db_name=DB_NAME, locks=locks, menu_editor=menu_editor, user=user, cfg=general_settings)
     return render_page('Pengaturan', body)
 
