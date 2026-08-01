@@ -397,7 +397,8 @@ ALL_MENU_ITEMS = {
     # Member-specific
     'member_dashboard': 'Dashboard Member',
     'wallet': 'Dompet & Isi Saldo',
-    'member_purchases': 'Riwayat Belanja',
+    'member_purchases': 'Riwayat Pembayaran Kantin',
+    'member_payment_receipt': 'Struk Pembayaran Kantin',
     'member_digital_card': 'Kartu Digital',
     'member_card_pdf': 'Kartu PDF',
     'apply_loan': 'Ajukan Kredit',
@@ -416,6 +417,7 @@ ALL_MENU_ITEMS = {
     'admin_cashier_control': 'Control Center Kasir',
     'admin_cashier_operators': 'Akun Operator Kasir',
     'admin_cashier_rotation_log': 'Log Rotasi Kasir',
+    'admin_operator_payment_history': 'History Pembayaran Operator',
 }
 
 
@@ -462,6 +464,7 @@ MENU_ROLE_ACCESS = {
     'admin_cashier_control': {'admin'}, 'admin_cashier_operators': {'admin'},
     'cashier_operator_sessions': {'admin','branch_admin','manager'},
     'admin_cashier_rotation_log': {'admin'},
+    'admin_operator_payment_history': {'admin','branch_admin','manager'},
     'cashier_qr_payment': {'admin','kasir','branch_admin','branch_cashier'},
     'cashier_qr_dynamic': {'admin','kasir','branch_admin','branch_cashier'},
     'branch_qr_payment_history': {'admin','branch_admin','manager','kasir','branch_cashier'},
@@ -3561,7 +3564,7 @@ def mobile_app_menu(user, active_url=''):
         '/loans/my-payments': 'my_payments', '/member/expense-history': 'member_expense_history',
         '/shu/member': 'shu_member',
         '/manager/dashboard':'manager_dashboard','/manager/finance':'manager_finance',
-        '/manager/inventory':'manager_inventory','/manager/flow':'manager_flow','/cashier/operator-sessions':'cashier_operator_sessions','/admin/cashier-control':'admin_cashier_control','/admin/cashier-operators':'admin_cashier_operators','/admin/cashier-rotation-log':'admin_cashier_rotation_log','/cashier/qr-payment':'cashier_qr_payment','/cashier/qr-dynamic':'cashier_qr_dynamic','/cashier/qr-payment/history':'branch_qr_payment_history','/wallet/scan-qr':'wallet_qr_scanner','/cashier/payment-code':'cashier_payment_code','/wallet/pay-code':'member_pay_code'
+        '/manager/inventory':'manager_inventory','/manager/flow':'manager_flow','/cashier/operator-sessions':'cashier_operator_sessions','/admin/cashier-control':'admin_cashier_control','/admin/cashier-operators':'admin_cashier_operators','/admin/cashier-rotation-log':'admin_cashier_rotation_log','/admin/operator-payment-history':'admin_operator_payment_history','/cashier/qr-payment':'cashier_qr_payment','/cashier/qr-dynamic':'cashier_qr_dynamic','/cashier/qr-payment/history':'branch_qr_payment_history','/wallet/scan-qr':'wallet_qr_scanner','/cashier/payment-code':'cashier_payment_code','/wallet/pay-code':'member_pay_code'
     }
     def add(icon, label, url):
         menu_id = mobile_menu_ids.get(url)
@@ -3582,7 +3585,7 @@ def mobile_app_menu(user, active_url=''):
         add('◇', 'Kredit Saya', '/loans')
         add('↗', 'Ajukan Kredit', '/loans/apply')
         add('◷', 'Pembayaran', '/loans/my-payments')
-        add('≡', 'Riwayat Belanja', '/member/purchases')
+        add('≡','Riwayat Kantin','/member/purchases')
         add('▤', 'Riwayat Biaya', '/member/expense-history')
         add('◆', 'Kartu Anggota', '/member/digital-card')
         add('▣', 'Cetak Kartu', '/member/card-pdf')
@@ -3826,7 +3829,7 @@ def render_page(title, body, **ctx):
                 ('wallet',url_for('wallet'),'◎','Dompet & Topup'),
                 ('member_pay_code',url_for('member_pay_code'),'123','Bayar Kode 3 Digit'),
                 ('loans', url_for('loans'), '◇', 'Kredit Saya'),
-                ('member_purchases', url_for('member_purchases'), '≡', 'Riwayat Aktivitas'),
+                ('member_purchases',url_for('member_purchases'),'≡','Riwayat Pembayaran Kantin'),
                 ('member_digital_card', url_for('member_digital_card'), '▣', 'Kartu Anggota'),
                 ('settings', url_for('settings'), '⚙', 'Pengaturan Akun'),
             ], default_open=True)
@@ -3914,6 +3917,7 @@ def render_page(title, body, **ctx):
                 ('admin_cashier_operators',url_for('admin_cashier_operators'),'♙','Akun Operator Kasir'),
                 ('cashier_operator_sessions',url_for('cashier_operator_sessions'),'▤','Rekap Sesi Kasir'),
                 ('branch_qr_payment_history',url_for('branch_qr_payment_history'),'◎','Riwayat QR Payment'),
+                ('admin_operator_payment_history',url_for('admin_operator_payment_history'),'▥','History Pembayaran Operator'),
                 ('admin_cashier_rotation_log',url_for('admin_cashier_rotation_log'),'⇄','Log Rotasi Kasir'),
                 ('sales_history', url_for('sales_history'), '◷', 'Riwayat Penjualan'),
                 ('sales_returns', url_for('sales_returns'), '↶', 'Retur Penjualan'),
@@ -5305,7 +5309,14 @@ def member_dashboard():
     next_due=None
     if active_loan: next_due=q_one('SELECT * FROM loan_schedules WHERE loan_id=? AND COALESCE(status,"BELUM_BAYAR") NOT IN ("LUNAS","PAID") ORDER BY CASE WHEN due_date IS NULL OR due_date="" THEN 1 ELSE 0 END, due_date ASC, installment_number ASC, id ASC LIMIT 1',[active_loan['id']])
     paid=q_one('SELECT COALESCE(SUM(lp.amount),0) x FROM loan_payments lp JOIN loans l ON l.id=lp.loan_id WHERE l.member_id=? AND lp.status="VERIFIED"',[mid])['x'] or 0
-    shu=calculate_shu(mid,datetime.now().year); recent=q_all('SELECT invoice_no,trx_date,total FROM sales WHERE member_id=? AND status="Posted" ORDER BY id DESC LIMIT 4',[mid])
+    shu=calculate_shu(mid,datetime.now().year)
+    recent=q_all('''SELECT reference_no,trx_time,total,source FROM (
+      SELECT invoice_no reference_no,trx_date trx_time,total,'KASIR' source,id sort_id FROM sales WHERE member_id=? AND status='Posted'
+      UNION ALL
+      SELECT payment_code reference_no,paid_at trx_time,amount total,'QR' source,id sort_id FROM branch_qr_payment_intents WHERE member_id=? AND status='PAID'
+      UNION ALL
+      SELECT payment_no reference_no,created_at trx_time,amount total,'KODE 3D' source,id sort_id FROM branch_code_payments WHERE member_id=? AND status='PAID'
+    ) ORDER BY trx_time DESC,sort_id DESC LIMIT 4''',[mid,mid,mid])
     unread=q_one('SELECT COUNT(*) n FROM notifications WHERE user_id=? AND is_read=0',[user['id']])['n'] or 0
     goals=0; open_requests=0
     try:
@@ -5363,7 +5374,7 @@ def member_dashboard():
 
       <section class="ph-activity">
         <header class="ph-section-head"><div><span class="ph-eyebrow">AKTIVITAS TERKINI</span><h2>Pergerakan dana terbaru</h2></div><a href="{{url_for('member_purchases')}}">Semua</a></header>
-        <div class="ph-activity-list">{% for r in recent %}<a href="{{url_for('member_purchases')}}"><i>↙</i><span><b>Belanja koperasi</b><small>{{r.invoice_no}} · {{r.trx_date}}</small></span><strong>-{{rupiah(r.total)}}</strong></a>{% else %}<div class="ph-empty"><i>◇</i><b>Belum ada aktivitas</b><span>Transaksi terbaru akan tampil di sini.</span></div>{% endfor %}</div>
+        <div class="ph-activity-list">{% for r in recent %}<a href="{{url_for('member_purchases')}}"><i>↙</i><span><b>Pembayaran kantin · {{r.source}}</b><small>{{r.reference_no}} · {{r.trx_time}}</small></span><strong>-{{rupiah(r.total)}}</strong></a>{% else %}<div class="ph-empty"><i>◇</i><b>Belum ada aktivitas</b><span>Transaksi terbaru akan tampil di sini.</span></div>{% endfor %}</div>
       </section>
       <footer class="ph-trust"><span>◈ Data terlindungi</span><span>● Sistem aktif</span><span>✓ Transaksi tercatat</span></footer>
     </div>
@@ -5376,34 +5387,69 @@ def member_dashboard():
 @app.route('/member/purchases', methods=['GET'])
 @login_required
 def member_purchases():
-    user = current_user()
-    member = q_one('SELECT * FROM members WHERE member_code = ?', [f'EMP-{user["employee_number"]}'])
+    ensure_branch_qr_payment_schema(); ensure_payment_code_schema()
+    user=current_user(); member=q_one('SELECT * FROM members WHERE member_code=?',[f'EMP-{user["employee_number"]}'])
     if not member:
-        flash('Akun member tidak ditemukan.', 'warning')
-        return redirect(url_for('dashboard'))
-    start, end = date_range_from_request()
-    params = [member['id']]
-    sql = 'SELECT s.*, u.full_name as kasir_name FROM sales s LEFT JOIN users u ON u.id=s.cashier_id WHERE s.member_id = ? AND s.status="Posted"'
-    if start:
-        sql += ' AND s.trx_date >= ?'; params.append(start)
-    if end:
-        sql += ' AND s.trx_date <= ?'; params.append(end)
-    sql += ' ORDER BY s.id DESC LIMIT 200'
-    rows = q_all(sql, params)
-    total_all = q_one('SELECT COALESCE(SUM(total),0) as x FROM sales WHERE member_id=? AND status="Posted"', [member['id']])['x']
-    body = render_template_string('''
-    <div class="card">
-        <div class="kartu"><div><h2>🛒 Riwayat Belanja</h2><div class="muted small">{{ member.member_code }} — {{ member.name }} | Total: <strong>{{ rupiah(total_all) }}</strong></div></div>
-        <form method="get" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;width:auto;">
-            <div><div class="small muted">Dari</div><input type="date" name="start" value="{{ start }}" style="width:140px;"></div>
-            <div><div class="small muted">Sampai</div><input type="date" name="end" value="{{ end }}" style="width:140px;"></div>
-            <button class="btn-ghost" type="submit">Filter</button>
-        </form></div>
-        <div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Tanggal</th><th>Total</th><th>Kasir</th><th>Aksi</th></tr></thead>
-        <tbody>{% for r in rows %}<tr><td>{{ r['invoice_no'] }}</td><td>{{ r['trx_date'] }}</td><td>{{ rupiah(r['total']) }}</td><td>{{ r['kasir_name'] or '-' }}</td><td><a href="{{ url_for('receipt_pdf', sale_id=r['id']) }}" class="btn btn-sm btn-ghost">Struk</a></td></tr>{% else %}<tr><td colspan="5" class="muted text-center">Belum ada transaksi.</td></tr>{% endfor %}</tbody></table></div>
-    </div>
-    ''', rows=rows, member=member, total_all=total_all, rupiah=rupiah, start=start, end=end)
-    return render_page('Riwayat Belanja', body)
+        flash('Akun member tidak ditemukan.','warning'); return redirect(url_for('dashboard'))
+    start_date,end_date=date_range_from_request(); payment_source=(request.args.get('source') or '').upper(); params=[member['id'],member['id'],member['id']]
+    sql='''SELECT * FROM (
+      SELECT s.id record_id,'SALE' source,s.invoice_no reference_no,s.trx_date paid_at,s.total amount,s.payment_method method,
+             s.branch_id,COALESCE(b.name,'PUSAT') branch_name,s.cashier_id operator_user_id,s.cashier_session_id,
+             COALESCE(u.full_name,u.username,'-') operator_name,'Belanja kasir' description
+      FROM sales s LEFT JOIN users u ON u.id=s.cashier_id LEFT JOIN koperasi_branches b ON b.id=s.branch_id
+      WHERE s.member_id=? AND s.status='Posted'
+      UNION ALL
+      SELECT i.id record_id,'QR' source,i.payment_code reference_no,i.paid_at,i.amount,'WALLET' method,
+             i.branch_id,COALESCE(b.name,'PUSAT') branch_name,i.operator_user_id,i.cashier_session_id,
+             COALESCE(u.full_name,u.username,'Belum terhubung') operator_name,
+             CASE WHEN i.qr_mode='DYNAMIC' THEN 'QR nominal' ELSE 'QR statis cabang' END description
+      FROM branch_qr_payment_intents i LEFT JOIN users u ON u.id=i.operator_user_id LEFT JOIN koperasi_branches b ON b.id=i.branch_id
+      WHERE i.member_id=? AND i.status='PAID'
+      UNION ALL
+      SELECT p.id record_id,'KODE_3D' source,p.payment_no reference_no,p.created_at paid_at,p.amount,'WALLET' method,
+             p.branch_id,COALESCE(b.name,'PUSAT') branch_name,p.operator_user_id,p.cashier_session_id,
+             COALESCE(u.full_name,u.username,'Belum terhubung') operator_name,'Kode cabang '||p.code description
+      FROM branch_code_payments p LEFT JOIN users u ON u.id=p.operator_user_id LEFT JOIN koperasi_branches b ON b.id=p.branch_id
+      WHERE p.member_id=? AND p.status='PAID'
+    ) x WHERE 1=1'''
+    if start_date: sql+=' AND substr(x.paid_at,1,10)>=?'; params.append(start_date)
+    if end_date: sql+=' AND substr(x.paid_at,1,10)<=?'; params.append(end_date)
+    if payment_source in ('SALE','QR','KODE_3D'): sql+=' AND x.source=?'; params.append(payment_source)
+    rows=q_all(sql+' ORDER BY x.paid_at DESC,x.record_id DESC LIMIT 500',params)
+    total_all=sum(float(r['amount'] or 0) for r in rows); qr_count=sum(1 for r in rows if r['source']=='QR'); code_count=sum(1 for r in rows if r['source']=='KODE_3D')
+    body=render_template_string(r'''<div class="member-canteen-history"><header class="mch-hero"><div><span>CANTEEN PAYMENT RECORD</span><h2>Riwayat Pembayaran Kantin</h2><p>Semua transaksi kasir, scan QR, dan kode 3 digit tersimpan bersama operator serta struk digital.</p></div><div><strong>{{rows|length}}</strong><small>transaksi ditemukan</small></div></header><section class="mch-kpis"><article><span>Total periode</span><b>{{rupiah(total_all)}}</b></article><article><span>QR Payment</span><b>{{qr_count}}</b></article><article><span>Kode 3 digit</span><b>{{code_count}}</b></article></section><section class="mch-panel"><form method="get" class="mch-filter"><input type="date" name="start" value="{{start}}"><input type="date" name="end" value="{{end}}"><select name="source"><option value="">Semua metode</option><option value="SALE" {{'selected' if payment_source=='SALE'}}>Kasir</option><option value="QR" {{'selected' if payment_source=='QR'}}>QR</option><option value="KODE_3D" {{'selected' if payment_source=='KODE_3D'}}>Kode 3 digit</option></select><button>Terapkan</button></form><div class="mch-list">{% for r in rows %}<article><div class="mch-source {{r.source|lower}}">{{'▦' if r.source=='QR' else '123' if r.source=='KODE_3D' else '▣'}}</div><div class="mch-main"><span>{{r.source}} · {{r.branch_name}}</span><b>{{r.description}}</b><small>{{r.reference_no}} · {{r.paid_at}}</small><p>Operator: <strong>{{r.operator_name}}</strong> · Sesi #{{r.cashier_session_id or '-'}}</p></div><strong class="mch-amount">-{{rupiah(r.amount)}}</strong><a href="{{url_for('member_payment_receipt',source=r.source,record_id=r.record_id)}}">Lihat Struk</a></article>{% else %}<div class="mch-empty">Belum ada pembayaran kantin pada periode ini.</div>{% endfor %}</div></section></div>''',rows=rows,total_all=total_all,qr_count=qr_count,code_count=code_count,start=start_date,end=end_date,payment_source=payment_source,rupiah=rupiah)
+    return render_page('Riwayat Pembayaran Kantin',body)
+
+@app.route('/member/payment-receipt/<source>/<int:record_id>')
+@login_required
+def member_payment_receipt(source,record_id):
+    ensure_branch_qr_payment_schema(); ensure_payment_code_schema()
+    user=current_user(); member=q_one('SELECT * FROM members WHERE member_code=?',[f'EMP-{user["employee_number"]}'])
+    if not member: return ('Member tidak ditemukan',404)
+    source=source.upper(); row=None
+    if source=='SALE':
+        sale=q_one('''SELECT s.id,s.invoice_no reference_no,s.trx_date paid_at,s.total amount,s.payment_method method,s.cashier_session_id,
+                      COALESCE(b.name,'PUSAT') branch_name,COALESCE(u.full_name,u.username,'-') operator_name
+                      FROM sales s LEFT JOIN users u ON u.id=s.cashier_id LEFT JOIN koperasi_branches b ON b.id=s.branch_id
+                      WHERE s.id=? AND s.member_id=? AND s.status='Posted' ''',[record_id,member['id']])
+        if sale: return redirect(url_for('receipt_pdf',sale_id=record_id))
+    elif source=='QR':
+        row=q_one('''SELECT i.payment_code reference_no,i.paid_at,i.amount,'WALLET' method,i.cashier_session_id,i.qr_mode detail,
+                     COALESCE(b.name,'PUSAT') branch_name,COALESCE(u.full_name,u.username,'Belum terhubung') operator_name
+                     FROM branch_qr_payment_intents i LEFT JOIN users u ON u.id=i.operator_user_id LEFT JOIN koperasi_branches b ON b.id=i.branch_id
+                     WHERE i.id=? AND i.member_id=? AND i.status='PAID' ''',[record_id,member['id']])
+    elif source=='KODE_3D':
+        row=q_one('''SELECT p.payment_no reference_no,p.created_at paid_at,p.amount,'WALLET' method,p.cashier_session_id,'Kode 3 digit: '||p.code detail,
+                     COALESCE(b.name,'PUSAT') branch_name,COALESCE(u.full_name,u.username,'Belum terhubung') operator_name
+                     FROM branch_code_payments p LEFT JOIN users u ON u.id=p.operator_user_id LEFT JOIN koperasi_branches b ON b.id=p.branch_id
+                     WHERE p.id=? AND p.member_id=? AND p.status='PAID' ''',[record_id,member['id']])
+    if not row: return ('Struk tidak ditemukan atau bukan milik akun ini.',404)
+    body=render_template_string(r'''<div class="digital-receipt"><section class="dr-paper"><header><span>KOPERASI CANTEEN</span><h2>STRUK PEMBAYARAN</h2><p>{{row.branch_name}}</p></header><div class="dr-dashed"></div><dl><div><dt>Referensi</dt><dd>{{row.reference_no}}</dd></div><div><dt>Waktu</dt><dd>{{row.paid_at}}</dd></div><div><dt>Metode</dt><dd>{{receipt_source}} · {{row.method}}</dd></div><div><dt>Detail</dt><dd>{{row.detail}}</dd></div><div><dt>Anggota</dt><dd>{{member.name}}</dd></div><div><dt>Operator</dt><dd>{{row.operator_name}}</dd></div><div><dt>Sesi Operator</dt><dd>#{{row.cashier_session_id or '-'}}</dd></div></dl><div class="dr-dashed"></div><div class="dr-total"><span>TOTAL DIBAYAR</span><strong>{{rupiah(row.amount)}}</strong></div><footer><i>✓</i><b>PEMBAYARAN BERHASIL</b><small>Struk digital ini tersimpan di akun anggota.</small></footer></section><div class="dr-actions"><button type="button" onclick="window.print()">Cetak / Simpan PDF</button><a href="{{url_for('member_purchases')}}">Kembali ke Riwayat</a></div></div>''',row=row,member=member,receipt_source=source,rupiah=rupiah)
+    return render_page('Struk Pembayaran',body)
+
+CSS_DESIGN += r'''
+.member-canteen-history{display:grid;gap:14px}.mch-hero{display:flex;justify-content:space-between;align-items:end;padding:25px;border-radius:21px;background:radial-gradient(circle at 84% 15%,rgba(37,99,235,.38),transparent 28%),linear-gradient(135deg,#06111d,#123b55);color:#fff}.mch-hero span{color:#67e8f9;font-size:8px;font-weight:950;letter-spacing:.18em}.mch-hero h2{margin:7px 0;color:#fff}.mch-hero p{margin:0;color:#b9cede}.mch-hero>div:last-child{text-align:right}.mch-hero>div:last-child strong,.mch-hero>div:last-child small{display:block}.mch-hero>div:last-child strong{font-size:35px}.mch-hero>div:last-child small{color:#b9cede}.mch-kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}.mch-kpis article{padding:15px;border:1px solid #dce6ed;border-radius:14px;background:#fff}.mch-kpis span,.mch-kpis b{display:block}.mch-kpis span{color:#718293;font-size:8px}.mch-kpis b{margin-top:6px;font-size:18px}.mch-panel{overflow:hidden;border:1px solid #dce6ed;border-radius:17px;background:#fff}.mch-filter{display:flex;gap:8px;padding:14px;border-bottom:1px solid #e8eef3}.mch-list>article{display:grid;grid-template-columns:46px minmax(0,1fr) auto auto;gap:12px;align-items:center;padding:14px 17px;border-bottom:1px solid #edf2f6}.mch-source{display:grid;place-items:center;width:44px;height:44px;border-radius:14px;background:#edf7ff;color:#2563eb;font-weight:950}.mch-source.qr{background:#e8faf5;color:#087e6a}.mch-source.kode_3d{background:#f5edff;color:#7c3aed}.mch-main span,.mch-main b,.mch-main small,.mch-main p{display:block}.mch-main span{color:#0f9f97;font-size:7px;font-weight:950;letter-spacing:.1em}.mch-main b{margin:4px 0;font-size:11px}.mch-main small{color:#8494a5;font-size:8px}.mch-main p{margin:4px 0 0;color:#637485;font-size:8px}.mch-amount{font-size:12px}.mch-list>article>a{padding:8px 10px;border:1px solid #cfdde7;border-radius:9px;text-decoration:none;font-size:8px;font-weight:850}.mch-empty{padding:45px;text-align:center;color:#8494a5}.digital-receipt{display:grid;gap:14px;max-width:500px;margin:auto}.dr-paper{position:relative;padding:28px;border:1px solid #d8e2e9;border-radius:4px;background:#fff;box-shadow:0 18px 55px rgba(15,35,52,.13)}.dr-paper:before,.dr-paper:after{content:'';position:absolute;left:0;right:0;height:8px;background:linear-gradient(135deg,transparent 5px,#fff 0) 0 0/10px 10px repeat-x}.dr-paper:before{top:-8px}.dr-paper:after{bottom:-8px;transform:rotate(180deg)}.dr-paper header{text-align:center}.dr-paper header span{font-size:8px;font-weight:950;letter-spacing:.18em}.dr-paper header h2{margin:7px 0}.dr-paper header p{margin:0;color:#758594}.dr-dashed{margin:19px 0;border-top:1px dashed #aebcc7}.dr-paper dl{display:grid;gap:10px}.dr-paper dl>div{display:flex;justify-content:space-between;gap:20px}.dr-paper dt{color:#738493;font-size:9px}.dr-paper dd{margin:0;text-align:right;font-size:9px;font-weight:800}.dr-total{display:flex;justify-content:space-between;align-items:center}.dr-total span{font-size:9px;font-weight:900}.dr-total strong{font-size:24px}.dr-paper footer{display:grid;place-items:center;margin-top:24px;text-align:center}.dr-paper footer i{display:grid;place-items:center;width:45px;height:45px;border-radius:50%;background:#10b981;color:#fff;font-size:23px;font-style:normal}.dr-paper footer b,.dr-paper footer small{display:block;margin-top:7px}.dr-paper footer small{color:#8494a5}.dr-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.dr-actions a{display:grid;place-items:center;border:1px solid #d3dfe7;border-radius:10px;background:#fff;text-decoration:none;font-size:9px;font-weight:850}@media(max-width:768px){.member-canteen-history{padding:0 12px}.mch-hero{align-items:flex-start;flex-direction:column;padding:20px}.mch-hero>div:last-child{text-align:left}.mch-kpis{grid-template-columns:1fr 1fr}.mch-filter{display:grid;grid-template-columns:1fr 1fr}.mch-filter select,.mch-filter button{grid-column:1/-1}.mch-list>article{grid-template-columns:42px minmax(0,1fr) auto}.mch-list>article>a{grid-column:2/-1;text-align:center}.mch-amount{font-size:10px}.digital-receipt{padding:0 12px}.dr-paper{padding:22px}.dr-actions{grid-template-columns:1fr}}@media print{.sidebar,.topbar,.mobile-header,.mobile-nav,.dr-actions,.footer{display:none!important}.main-content{padding:0!important}.dr-paper{box-shadow:none;border:0}.digital-receipt{max-width:80mm}}
+'''
 
 # =========================
 # Member Card PDF
@@ -6241,22 +6287,53 @@ def close_cashier_operator_session(reason='Logout operator',closing_cash=None,cl
         session.pop('cashier_operator_session_id',None); session.pop('cashier_operator_user_id',None); return
     stats=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM sales WHERE cashier_session_id=?',[op['id']])
     qstats=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM quick_cashier_queue WHERE cashier_session_id=?',[op['id']])
+    qrstats=q_one("SELECT COUNT(*) n,COALESCE(SUM(amount),0) total FROM branch_qr_payment_intents WHERE cashier_session_id=? AND status='PAID'",[op['id']])
+    codestats=q_one("SELECT COUNT(*) n,COALESCE(SUM(amount),0) total FROM branch_code_payments WHERE cashier_session_id=? AND status='PAID'",[op['id']])
     cash_sales=q_one("SELECT COALESCE(SUM(total),0) total FROM sales WHERE cashier_session_id=? AND LOWER(COALESCE(payment_method,''))='tunai' AND status='Posted'",[op['id']])['total'] or 0
     cash_quick=q_one("SELECT COALESCE(SUM(total),0) total FROM quick_cashier_queue WHERE cashier_session_id=? AND LOWER(COALESCE(payment_method,''))='tunai'",[op['id']])['total'] or 0
     expected=float(op['opening_cash'] or 0)+float(cash_sales)+float(cash_quick)
     actual=expected if closing_cash is None else float(closing_cash or 0); difference=actual-expected
     exec_sql('''UPDATE cashier_operator_sessions SET logout_at=?,status='CLOSED',sales_count=?,sales_total=?,quick_count=?,quick_total=?,last_activity_at=?,closing_cash=?,expected_cash=?,cash_difference=?,closing_note=?,logout_ip=? WHERE id=?''',
-             [now_str(),stats['n'],stats['total'],qstats['n'],qstats['total'],now_str(),actual,expected,difference,closing_note,safe_request_ip(),op['id']])
+             [now_str(),stats['n']+qrstats['n']+codestats['n'],float(stats['total'] or 0)+float(qrstats['total'] or 0)+float(codestats['total'] or 0),qstats['n'],qstats['total'],now_str(),actual,expected,difference,closing_note,safe_request_ip(),op['id']])
     exec_sql('''INSERT INTO cashier_rotation_logs(operator_user_id,session_id,home_branch_id,worked_branch_id,event_type,event_at,terminal_user_id,ip_address,note) VALUES(?,?,?,?,?,?,?,?,?)''',[op['operator_user_id'],op['id'],op['home_branch_id'],op['branch_id'],'LOGOUT',now_str(),op['terminal_user_id'],safe_request_ip(),f'{reason}; selisih kas={difference}'])
-    log_action('CASHIER_OPERATOR_LOGOUT','cashier_operator_sessions',op['id'],f"{op['full_name'] or op['username']}; {reason}; sales={stats['n']}; quick={qstats['n']}")
+    log_action('CASHIER_OPERATOR_LOGOUT','cashier_operator_sessions',op['id'],f"{op['full_name'] or op['username']}; {reason}; sales={stats['n']}; quick={qstats['n']}; qr={qrstats['n']}; code={codestats['n']}")
     session.pop('cashier_operator_session_id',None); session.pop('cashier_operator_user_id',None)
+
+def cashier_operator_summary_data(op):
+    sid=int(op['id'])
+    stats=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM sales WHERE cashier_session_id=?',[sid])
+    qstats=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM quick_cashier_queue WHERE cashier_session_id=?',[sid])
+    qr=q_one("SELECT COUNT(*) n,COALESCE(SUM(amount),0) total FROM branch_qr_payment_intents WHERE cashier_session_id=? AND status='PAID'",[sid]) if 'ensure_branch_qr_payment_schema' in globals() else {'n':0,'total':0}
+    code=q_one("SELECT COUNT(*) n,COALESCE(SUM(amount),0) total FROM branch_code_payments WHERE cashier_session_id=? AND status='PAID'",[sid]) if 'ensure_payment_code_schema' in globals() else {'n':0,'total':0}
+    return {'sales_n':int(stats['n'] or 0),'sales_total':float(stats['total'] or 0),'quick_n':int(qstats['n'] or 0),'quick_total':float(qstats['total'] or 0),'qr_n':int(qr['n'] or 0),'qr_total':float(qr['total'] or 0),'code_n':int(code['n'] or 0),'code_total':float(code['total'] or 0),'record_total':int(stats['n'] or 0)+int(qstats['n'] or 0)+int(qr['n'] or 0)+int(code['n'] or 0),'amount_total':float(stats['total'] or 0)+float(qstats['total'] or 0)+float(qr['total'] or 0)+float(code['total'] or 0)}
 
 def cashier_operator_banner():
     op=active_cashier_operator()
     if not op: return ''
-    stats=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM sales WHERE cashier_session_id=?',[op['id']])
-    qstats=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM quick_cashier_queue WHERE cashier_session_id=?',[op['id']])
-    return render_template_string('''<section class="operator-strip"><div class="operator-avatar">{{(op.full_name or op.username)[0]|upper}}</div><div class="operator-main"><span>OPERATOR KASIR AKTIF</span><b>{{op.full_name or op.username}}</b><small>Bertugas di {{op.branch_name}} · Asal {{op.home_branch_name}} · Shift {{op.shift_name or '-'}} · Masuk {{op.login_at}}</small></div><div class="operator-stat"><span>Sales</span><b>{{stats.n}}</b></div><div class="operator-stat"><span>Quick</span><b>{{qstats.n}}</b></div><div class="operator-stat operator-value"><span>Total sesi</span><b>{{rupiah((stats.total or 0)+(qstats.total or 0))}}</b></div><div class="operator-actions"><form method="post" action="{{url_for('cashier_operator_break')}}"><button type="submit" class="btn btn-ghost">{{'Selesai Istirahat' if op.break_started_at else 'Istirahat'}}</button></form><a class="btn btn-danger" href="{{url_for('cashier_operator_close')}}">Tutup Sesi</a></div></section>''',op=op,stats=stats,qstats=qstats,rupiah=rupiah)
+    summary=cashier_operator_summary_data(op)
+    return render_template_string('''<section class="operator-strip operator-strip-live" data-session-id="{{op.id}}"><div class="operator-avatar">{{(op.full_name or op.username)[0]|upper}}</div><div class="operator-main"><span>OPERATOR KASIR AKTIF</span><b>{{op.full_name or op.username}}</b><small>Bertugas di {{op.branch_name}} · Asal {{op.home_branch_name}} · Shift {{op.shift_name or '-'}} · Masuk {{op.login_at}}</small></div><div class="operator-stat"><span>Sales</span><b id="opSalesCount">{{summary.sales_n}}</b></div><div class="operator-stat"><span>Quick</span><b id="opQuickCount">{{summary.quick_n}}</b></div><div class="operator-stat operator-qr-stat"><span>QR</span><b id="opQrCount">{{summary.qr_n}}</b><small id="opQrAmount">{{rupiah(summary.qr_total)}}</small></div><div class="operator-stat operator-code-stat"><span>Kode 3D</span><b id="opCodeCount">{{summary.code_n}}</b><small id="opCodeAmount">{{rupiah(summary.code_total)}}</small></div><div class="operator-stat operator-value"><span>Total sesi</span><b id="opSessionTotal">{{rupiah(summary.amount_total)}}</b><small id="opRecordTotal">{{summary.record_total}} record</small></div><div class="operator-actions"><form method="post" action="{{url_for('cashier_operator_break')}}"><button type="submit" class="btn btn-ghost">{{'Selesai Istirahat' if op.break_started_at else 'Istirahat'}}</button></form><a class="btn btn-danger" href="{{url_for('cashier_operator_close')}}">Tutup Sesi</a></div></section><script>(function(){var busy=false;function update(){if(busy||document.hidden)return;busy=true;fetch('{{url_for("api_cashier_operator_live_summary")}}',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){if(!d.ok)return;var ids={opSalesCount:d.sales_n,opQuickCount:d.quick_n,opQrCount:d.qr_n,opCodeCount:d.code_n,opQrAmount:d.qr_total_text,opCodeAmount:d.code_total_text,opSessionTotal:d.amount_total_text,opRecordTotal:d.record_total+' record'};Object.keys(ids).forEach(function(id){var el=document.getElementById(id);if(el&&el.textContent!==String(ids[id])){el.textContent=ids[id];el.classList.remove('stat-pulse');void el.offsetWidth;el.classList.add('stat-pulse')}})}).catch(function(){}).finally(function(){busy=false})}update();setInterval(update,1000)})();</script>''',op=op,summary=summary,rupiah=rupiah)
+
+@app.route('/api/cashier/operator-live-summary')
+@login_required
+@role_required('admin','kasir','branch_admin','branch_cashier')
+def api_cashier_operator_live_summary():
+    op=active_cashier_operator()
+    if not op: return jsonify({'ok':False,'reason':'NO_ACTIVE_SESSION'}),409
+    # Repair recent paid rows at this branch that were not yet linked to any operator.
+    conn=get_conn()
+    try:
+        conn.execute("UPDATE branch_qr_payment_intents SET operator_user_id=?,cashier_session_id=? WHERE branch_id=? AND status='PAID' AND cashier_session_id IS NULL AND paid_at>=?",[op['operator_user_id'],op['id'],op['branch_id'],op['login_at']])
+        conn.execute("UPDATE branch_code_payments SET operator_user_id=?,cashier_session_id=? WHERE branch_id=? AND status='PAID' AND cashier_session_id IS NULL AND created_at>=?",[op['operator_user_id'],op['id'],op['branch_id'],op['login_at']])
+        conn.commit()
+    finally: conn.close()
+    d=cashier_operator_summary_data(op); d.update(ok=True,session_id=op['id'],operator_id=op['operator_user_id'],qr_total_text=rupiah(d['qr_total']),code_total_text=rupiah(d['code_total']),amount_total_text=rupiah(d['amount_total']))
+    return jsonify(d)
+
+CSS_DESIGN += r"""
+.operator-strip-live{grid-template-columns:42px minmax(240px,1fr) repeat(5,minmax(62px,auto)) auto!important}.operator-stat small{display:block;margin-top:2px;color:#83948b;font-size:6px;white-space:nowrap}.operator-qr-stat b{color:#087e6a}.operator-code-stat b{color:#7c3aed}.stat-pulse{animation:operatorStatPulse .55s ease}@keyframes operatorStatPulse{0%{transform:scale(.85);color:#10b981}55%{transform:scale(1.16)}100%{transform:none}}
+@media(max-width:1180px){.operator-strip-live{grid-template-columns:42px minmax(220px,1fr) repeat(3,auto) auto!important}.operator-strip-live .operator-stat:nth-of-type(1),.operator-strip-live .operator-stat:nth-of-type(2){display:none!important}}
+@media(max-width:768px){.operator-strip-live{grid-template-columns:36px minmax(0,1fr)!important}.operator-strip-live .operator-stat{display:grid!important;grid-template-columns:1fr auto;grid-column:1/-1;min-width:0;padding:8px 4px;border-left:0;border-top:1px solid #d7e7e0}.operator-strip-live .operator-stat small{grid-column:1/-1}.operator-strip-live .operator-actions{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr}.operator-strip-live .operator-actions a,.operator-strip-live .operator-actions button{width:100%}}
+"""
 
 @app.before_request
 def require_cashier_operator_session():
@@ -6342,12 +6419,14 @@ def cashier_operator_sessions():
     enriched=[]
     for r in rows:
         d=dict(r)
-        if d['status']=='OPEN':
-            st=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM sales WHERE cashier_session_id=?',[d['id']]); qs=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM quick_cashier_queue WHERE cashier_session_id=?',[d['id']])
-            d['sales_count'],d['sales_total'],d['quick_count'],d['quick_total']=st['n'],st['total'],qs['n'],qs['total']
+        st=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM sales WHERE cashier_session_id=?',[d['id']]); qs=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM quick_cashier_queue WHERE cashier_session_id=?',[d['id']])
+        qr=q_one("SELECT COUNT(*) n,COALESCE(SUM(amount),0) total FROM branch_qr_payment_intents WHERE cashier_session_id=? AND status='PAID'",[d['id']])
+        code=q_one("SELECT COUNT(*) n,COALESCE(SUM(amount),0) total FROM branch_code_payments WHERE cashier_session_id=? AND status='PAID'",[d['id']])
+        d['sales_count'],d['sales_total'],d['quick_count'],d['quick_total']=st['n'],st['total'],qs['n'],qs['total']
+        d['qr_count'],d['qr_total'],d['code_count'],d['code_total']=qr['n'],qr['total'],code['n'],code['total']
         enriched.append(d)
     rows=enriched
-    body=render_template_string('''<div class="sales-suite"><header class="sales-hero"><div><span>CASHIER ACCOUNTABILITY</span><h2>Rekap Sesi Operator</h2><p>Siapa menjalankan kasir, waktu masuk-keluar, jumlah record, dan nilai transaksi setiap sesi.</p></div></header><div class="card sales-panel"><div class="table-wrap"><table><thead><tr><th>Operator</th><th>Cabang Asal</th><th>Cabang Bertugas</th><th>Shift</th><th>Login</th><th>Logout</th><th>Sales</th><th>Quick</th><th>Total Sesi</th><th>Status</th></tr></thead><tbody>{% for r in rows %}<tr><td><b>{{r.full_name or r.username}}</b><small>{{r.username}}</small></td><td>{{r.home_branch_name or '-'}}</td><td>{{r.branch_name}}</td><td>{{r.shift_name or '-'}}</td><td>{{r.login_at}}</td><td>{{r.logout_at or '-'}}</td><td>{{r.sales_count}}</td><td>{{r.quick_count}}</td><td>{{rupiah((r.sales_total or 0)+(r.quick_total or 0))}}</td><td><span class="badge {{'badge-success' if r.status=='OPEN' else 'badge-gray'}}">{{r.status}}</span></td></tr>{% else %}<tr><td colspan="10" class="muted text-center">Belum ada sesi operator.</td></tr>{% endfor %}</tbody></table></div></div></div>''',rows=rows,rupiah=rupiah)
+    body=render_template_string('''<div class="sales-suite"><header class="sales-hero"><div><span>CASHIER ACCOUNTABILITY</span><h2>Rekap Sesi Operator</h2><p>Siapa menjalankan kasir, waktu masuk-keluar, jumlah record, dan nilai transaksi setiap sesi.</p></div></header><div class="card sales-panel"><div class="table-wrap"><table><thead><tr><th>Operator</th><th>Cabang Asal</th><th>Cabang Bertugas</th><th>Shift</th><th>Login</th><th>Logout</th><th>Sales</th><th>Quick</th><th>QR</th><th>Kode 3D</th><th>Total Sesi</th><th>Status</th></tr></thead><tbody>{% for r in rows %}<tr><td><b>{{r.full_name or r.username}}</b><small>{{r.username}}</small></td><td>{{r.home_branch_name or '-'}}</td><td>{{r.branch_name}}</td><td>{{r.shift_name or '-'}}</td><td>{{r.login_at}}</td><td>{{r.logout_at or '-'}}</td><td>{{r.sales_count}}</td><td>{{r.quick_count}}</td><td><b>{{r.qr_count}}</b><small>{{rupiah(r.qr_total or 0)}}</small></td><td><b>{{r.code_count}}</b><small>{{rupiah(r.code_total or 0)}}</small></td><td>{{rupiah((r.sales_total or 0)+(r.quick_total or 0)+(r.qr_total or 0)+(r.code_total or 0))}}</td><td><span class="badge {{'badge-success' if r.status=='OPEN' else 'badge-gray'}}">{{r.status}}</span></td></tr>{% else %}<tr><td colspan="12" class="muted text-center">Belum ada sesi operator.</td></tr>{% endfor %}</tbody></table></div></div></div>''',rows=rows,rupiah=rupiah)
     return render_page('Sesi Operator Kasir',body)
 
 CSS_DESIGN += r'''
@@ -6375,7 +6454,7 @@ def admin_cashier_control():
         d=dict(r); st=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM sales WHERE cashier_session_id=?',[r['id']]); qs=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM quick_cashier_queue WHERE cashier_session_id=?',[r['id']]); d.update(sales_n=st['n'],sales_total=st['total'],quick_n=qs['n'],quick_total=qs['total']); live.append(d)
     today=today_str(); today_summary=q_one('''SELECT COUNT(*) sessions,COUNT(DISTINCT operator_user_id) operators,COALESCE(SUM(sales_count+quick_count),0) records,COALESCE(SUM(sales_total+quick_total),0) total,COALESCE(SUM(ABS(cash_difference)),0) cash_diff FROM cashier_operator_sessions WHERE substr(login_at,1,10)=?''',[today])
     rotations=q_one("SELECT COUNT(*) n FROM cashier_rotation_logs WHERE event_type='LOGIN' AND substr(event_at,1,10)=? AND COALESCE(home_branch_id,0)<>COALESCE(worked_branch_id,0)",[today])
-    body=render_template_string(r'''<div class="cash-admin"><header class="cash-admin-hero"><div><span>CASHIER OPERATIONS COMMAND</span><h2>Control Center Kasir</h2><p>Pusat administrasi operator, sesi aktif, rotasi cabang, transaksi, dan rekonsiliasi kas.</p></div></header><section class="cash-admin-kpis"><article><span>Sesi Aktif</span><b>{{live|length}}</b><small>Sedang bertugas</small></article><article><span>Operator Hari Ini</span><b>{{today_summary.operators}}</b><small>{{today_summary.sessions}} sesi</small></article><article><span>Record Hari Ini</span><b>{{today_summary.records}}</b><small>Sales + Quick</small></article><article><span>Nilai Sesi</span><b>{{rupiah(today_summary.total)}}</b><small>Hari ini</small></article><article><span>Rotasi Cabang</span><b>{{rotations.n}}</b><small>Penugasan lintas cabang</small></article></section><section class="cash-admin-grid"><article class="cash-admin-card"><div class="cash-admin-head"><div><span>LIVE CASHIER FLOOR</span><h3>Operator Sedang Aktif</h3></div><a href="{{url_for('cashier_operator_sessions')}}">Semua Sesi</a></div><div class="cash-live-list">{% for r in live %}<div class="cash-live"><i>{{(r.full_name or r.username)[0]|upper}}</i><div><b>{{r.full_name or r.username}}</b><small>{{r.branch_name}} - Shift {{r.shift_name or '-'}}{% if r.break_started_at %} - ISTIRAHAT{% endif %}</small></div><strong><span>RECORD</span>{{r.sales_n+r.quick_n}}</strong><strong><span>TOTAL</span>{{rupiah((r.sales_total or 0)+(r.quick_total or 0))}}</strong><strong><span>MASUK</span>{{r.login_at[11:16]}}</strong></div>{% else %}<div class="ai-empty">Tidak ada operator aktif.</div>{% endfor %}</div></article><article class="cash-admin-card"><div class="cash-admin-head"><div><span>ADMIN TOOLS</span><h3>Administrasi Kasir</h3></div></div><div class="cash-admin-actions"><a href="{{url_for('admin_cashier_operators')}}"><i>♙</i><b>Akun Operator</b><small>Buat, aktifkan, reset password, dan atur cabang asal kasir.</small></a><a href="{{url_for('cashier_operator_sessions')}}"><i>▤</i><b>Rekap Sesi</b><small>Lihat login, logout, shift, transaksi, kas, dan selisih.</small></a><a href="{{url_for('admin_cashier_rotation_log')}}"><i>⇄</i><b>Log Rotasi</b><small>Telusuri perpindahan operator dan aktivitas istirahat.</small></a><a href="{{url_for('sales_history')}}"><i>◷</i><b>Riwayat Penjualan</b><small>Audit transaksi berdasarkan operator dan cabang.</small></a></div></article></section></div>''',live=live,today_summary=today_summary,rotations=rotations,rupiah=rupiah)
+    body=render_template_string(r'''<div class="cash-admin"><header class="cash-admin-hero"><div><span>CASHIER OPERATIONS COMMAND</span><h2>Control Center Kasir</h2><p>Pusat administrasi operator, sesi aktif, rotasi cabang, transaksi, dan rekonsiliasi kas.</p></div></header><section class="cash-admin-kpis"><article><span>Sesi Aktif</span><b>{{live|length}}</b><small>Sedang bertugas</small></article><article><span>Operator Hari Ini</span><b>{{today_summary.operators}}</b><small>{{today_summary.sessions}} sesi</small></article><article><span>Record Hari Ini</span><b>{{today_summary.records}}</b><small>Sales + Quick</small></article><article><span>Nilai Sesi</span><b>{{rupiah(today_summary.total)}}</b><small>Hari ini</small></article><article><span>Rotasi Cabang</span><b>{{rotations.n}}</b><small>Penugasan lintas cabang</small></article></section><section class="cash-admin-grid"><article class="cash-admin-card"><div class="cash-admin-head"><div><span>LIVE CASHIER FLOOR</span><h3>Operator Sedang Aktif</h3></div><a href="{{url_for('cashier_operator_sessions')}}">Semua Sesi</a></div><div class="cash-live-list">{% for r in live %}<div class="cash-live"><i>{{(r.full_name or r.username)[0]|upper}}</i><div><b>{{r.full_name or r.username}}</b><small>{{r.branch_name}} - Shift {{r.shift_name or '-'}}{% if r.break_started_at %} - ISTIRAHAT{% endif %}</small></div><strong><span>RECORD</span>{{r.sales_n+r.quick_n}}</strong><strong><span>TOTAL</span>{{rupiah((r.sales_total or 0)+(r.quick_total or 0))}}</strong><strong><span>MASUK</span>{{r.login_at[11:16]}}</strong></div>{% else %}<div class="ai-empty">Tidak ada operator aktif.</div>{% endfor %}</div></article><article class="cash-admin-card"><div class="cash-admin-head"><div><span>ADMIN TOOLS</span><h3>Administrasi Kasir</h3></div></div><div class="cash-admin-actions"><a href="{{url_for('admin_cashier_operators')}}"><i>♙</i><b>Akun Operator</b><small>Buat, aktifkan, reset password, dan atur cabang asal kasir.</small></a><a href="{{url_for('cashier_operator_sessions')}}"><i>▤</i><b>Rekap Sesi</b><small>Lihat login, logout, shift, transaksi, kas, dan selisih.</small></a><a href="{{url_for('admin_operator_payment_history')}}"><i>▥</i><b>History Pembayaran</b><small>Audit QR dan kode 3 digit per operator dan sesi.</small></a><a href="{{url_for('admin_cashier_rotation_log')}}"><i>⇄</i><b>Log Rotasi</b><small>Telusuri perpindahan operator dan aktivitas istirahat.</small></a><a href="{{url_for('sales_history')}}"><i>◷</i><b>Riwayat Penjualan</b><small>Audit transaksi berdasarkan operator dan cabang.</small></a></div></article></section></div>''',live=live,today_summary=today_summary,rotations=rotations,rupiah=rupiah)
     return render_page('Control Center Kasir',body)
 
 @app.route('/admin/cashier-operators',methods=['GET','POST'])
@@ -6418,6 +6497,24 @@ def admin_cashier_rotation_log():
 # =========================
 # Static Branch QR Wallet Payment
 # =========================
+
+def resolve_branch_payment_operator(branch_id):
+    # Resolve the operator who currently owns incoming branch payments.
+    # Priority: active non-break session with most recent activity, then latest login.
+    ensure_cashier_operator_schema()
+    row=q_one('''SELECT id,operator_user_id FROM cashier_operator_sessions
+                 WHERE branch_id=? AND status='OPEN' AND break_started_at IS NULL
+                 ORDER BY COALESCE(last_activity_at,login_at) DESC,id DESC LIMIT 1''',[branch_id])
+    if not row:
+        row=q_one('''SELECT id,operator_user_id FROM cashier_operator_sessions
+                     WHERE branch_id=? AND status='OPEN'
+                     ORDER BY COALESCE(last_activity_at,login_at) DESC,id DESC LIMIT 1''',[branch_id])
+    return (int(row['operator_user_id']),int(row['id'])) if row else (None,None)
+
+def touch_payment_operator_session(conn,operator_user_id,cashier_session_id):
+    if cashier_session_id:
+        conn.execute('UPDATE cashier_operator_sessions SET last_activity_at=? WHERE id=? AND status="OPEN"',[now_str(),cashier_session_id])
+
 def ensure_branch_qr_payment_schema():
     conn=get_conn()
     try:
@@ -6555,7 +6652,37 @@ def cashier_payment_code():
             finally: conn.close()
         return redirect(url_for('cashier_payment_code'))
     row=get_branch_payment_code(bid); recent=q_all('''SELECT p.*,m.name member_name FROM branch_code_payments p LEFT JOIN members m ON m.id=p.member_id WHERE p.branch_id=? ORDER BY p.id DESC LIMIT 25''',[bid])
-    body=render_template_string(r'''<div class="code-pay-suite"><header class="code-pay-hero"><div><span>BRANCH SHORT CODE PAYMENT</span><h2>Kode Bayar {{branch}}</h2><p>Anggota cukup memasukkan kode cabang 3 digit dan nominal. Tidak membutuhkan kamera atau QR scanner.</p></div><b><i></i> AKTIF</b></header><section class="code-pay-layout"><article class="code-display"><span>KODE CABANG</span><strong>{{row.code}}</strong><small>Versi {{row.version_no}} · Dibuat {{row.regenerated_at or row.generated_at}}</small><div class="code-dots"><i></i><i></i><i></i></div><p>Tempel kode ini di meja kasir. Kode tidak berubah sampai kasir melakukan regenerasi.</p></article><article class="code-control"><h3>Regenerasi kode</h3><p>Gunakan hanya jika kode bocor atau perlu diganti. Kode lama langsung tidak berlaku.</p><form method="post"><label>Password akun terminal<input type="password" name="password" required autocomplete="current-password"></label><button class="btn-danger" data-confirm="Ganti kode cabang sekarang? Kode lama akan langsung tidak berlaku.">Generate Kode Baru</button></form><small>Penggantian dibatasi satu kali setiap 5 menit dan direkam di audit log.</small></article></section><section class="branch-qr-history"><header><div><span>REAL-TIME CODE PAYMENTS</span><h3>Pembayaran Terbaru</h3></div></header><div id="codePaymentStream">{% for r in recent %}<article><i class="paid"></i><div><b>{{r.payment_no}}</b><small>{{r.member_name}} · {{r.created_at}}</small></div><strong>{{rupiah(r.amount)}}</strong><span class="badge badge-success">PAID</span></article>{% else %}<div class="ai-empty">Belum ada pembayaran kode.</div>{% endfor %}</div></section></div><script>(function(){var last={{recent[0].id if recent else 0}};function poll(){fetch('{{url_for("api_cashier_code_payments")}}',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){if(!d.ok||!d.items.length)return;last=d.items[d.items.length-1].id;var x=d.items[d.items.length-1];showPersistentPaymentNotice(x);}).catch(function(){})}window.showPersistentPaymentNotice=function(x){var old=document.getElementById('persistentPaymentNotice');if(old)old.remove();var el=document.createElement('div');el.id='persistentPaymentNotice';el.className='persistent-payment-notice';el.innerHTML='<i>✓</i><div><span>PEMBAYARAN MASUK</span><b>'+x.amount_text+'</b><small>'+x.member_name+' · '+x.payment_no+'</small></div><button type="button">Tutup</button>';document.body.appendChild(el);el.querySelector('button').onclick=function(){el.remove()}};poll();setInterval(poll,750)})();</script>''',row=row,branch=get_branch_name(bid),recent=recent,rupiah=rupiah)
+    body=render_template_string(r'''<div class="code-pay-suite"><header class="code-pay-hero"><div><span>BRANCH SHORT CODE PAYMENT</span><h2>Kode Bayar {{branch}}</h2><p>Anggota cukup memasukkan kode cabang 3 digit dan nominal. Tidak membutuhkan kamera atau QR scanner.</p></div><b><i></i> AKTIF</b></header><section class="code-pay-layout"><article class="code-display"><span>KODE CABANG</span><strong>{{row.code}}</strong><small>Versi {{row.version_no}} · Dibuat {{row.regenerated_at or row.generated_at}}</small><div class="code-dots"><i></i><i></i><i></i></div><p>Tempel kode ini di meja kasir. Kode tidak berubah sampai kasir melakukan regenerasi.</p></article><article class="code-control"><h3>Regenerasi kode</h3><p>Gunakan hanya jika kode bocor atau perlu diganti. Kode lama langsung tidak berlaku.</p><form method="post"><label>Password akun terminal<input type="password" name="password" required autocomplete="current-password"></label><button class="btn-danger" data-confirm="Ganti kode cabang sekarang? Kode lama akan langsung tidak berlaku.">Generate Kode Baru</button></form><small>Penggantian dibatasi satu kali setiap 5 menit dan direkam di audit log.</small></article></section><section class="branch-qr-history"><header><div><span>REAL-TIME CODE PAYMENTS</span><h3>Pembayaran Terbaru</h3></div></header><div id="codePaymentStream">{% for r in recent %}<article><i class="paid"></i><div><b>{{r.payment_no}}</b><small>{{r.member_name}} · {{r.created_at}}</small></div><strong>{{rupiah(r.amount)}}</strong><span class="badge badge-success">PAID</span></article>{% else %}<div class="ai-empty">Belum ada pembayaran kode.</div>{% endfor %}</div></section></div><script>(function(){
+var stream=document.getElementById('codePaymentStream');
+var last={{recent[0].id if recent else 0}};
+var busy=false;
+var notified=new Set();
+function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function showNotice(x){
+  if(notified.has(Number(x.id)))return;
+  notified.add(Number(x.id));
+  var old=document.getElementById('persistentPaymentNotice');if(old)old.remove();
+  var el=document.createElement('div');el.id='persistentPaymentNotice';el.className='persistent-payment-notice';
+  el.innerHTML='<i>✓</i><div><span>PEMBAYARAN KODE MASUK</span><b>'+esc(x.amount_text)+'</b><small>'+esc(x.member_name)+' · '+esc(x.payment_no)+'</small></div><button type="button">Tutup</button>';
+  document.body.appendChild(el);el.querySelector('button').onclick=function(){el.remove()};
+}
+function addRow(x){
+  var empty=stream.querySelector('.ai-empty');if(empty)empty.remove();
+  if(stream.querySelector('[data-code-payment-id="'+x.id+'"]'))return;
+  var row=document.createElement('article');row.dataset.codePaymentId=x.id;row.className='new-payment';
+  row.innerHTML='<i class="paid"></i><div><b>'+esc(x.payment_no)+'</b><small>'+esc(x.member_name)+' · '+esc(x.created_at)+'</small></div><strong>'+esc(x.amount_text)+'</strong><span class="badge badge-success">PAID</span>';
+  stream.prepend(row);while(stream.querySelectorAll('article').length>40)stream.lastElementChild.remove();
+}
+function poll(){
+  if(busy||document.hidden)return;busy=true;
+  fetch('{{url_for("api_cashier_code_payments")}}?after='+last,{cache:'no-store'})
+   .then(function(r){return r.json()})
+   .then(function(d){if(!d.ok)return;(d.items||[]).forEach(function(x){last=Math.max(last,Number(x.id));addRow(x);showNotice(x)})})
+   .catch(function(){})
+   .finally(function(){busy=false});
+}
+poll();setInterval(poll,1000);
+})();</script>''',row=row,branch=get_branch_name(bid),recent=recent,rupiah=rupiah)
     return render_page('Kode Bayar Cabang',cashier_operator_banner()+body)
 
 @app.route('/wallet/pay-code',methods=['GET','POST'])
@@ -6584,7 +6711,9 @@ def member_pay_code():
                 saldo=conn.execute('SELECT COALESCE(SUM(CASE WHEN tipe="MASUK" THEN nominal ELSE -nominal END),0) saldo FROM saldo_history WHERE member_id=?',[member['id']]).fetchone()['saldo'] or 0
                 if float(saldo)<amount: raise ValueError(f'Saldo tidak cukup. Saldo tersedia {rupiah(saldo)}.')
                 after=float(saldo)-amount; payment_no='K3D-'+datetime.now().strftime('%Y%m%d%H%M%S')+'-'+os.urandom(3).hex().upper(); audit_note=(note+' ' if note else '')+f'IDEM:{idem}'
-                cur=conn.execute('''INSERT INTO branch_code_payments(payment_no,code,branch_id,member_id,amount,status,wallet_before,wallet_after,created_at,ip_address,user_agent,note) VALUES(?,?,?,?,?,'PAID',?,?,?,?,?,?)''',[payment_no,code,profile['branch_id'],member['id'],amount,saldo,after,now_str(),request.remote_addr or '',(request.headers.get('User-Agent') or '')[:250],audit_note])
+                resolved_operator,resolved_session=resolve_branch_payment_operator(profile['branch_id'])
+                cur=conn.execute('''INSERT INTO branch_code_payments(payment_no,code,branch_id,member_id,amount,status,wallet_before,wallet_after,created_at,ip_address,user_agent,cashier_session_id,operator_user_id,note) VALUES(?,?,?,?,?,'PAID',?,?,?,?,?,?,?,?)''',[payment_no,code,profile['branch_id'],member['id'],amount,saldo,after,now_str(),request.remote_addr or '',(request.headers.get('User-Agent') or '')[:250],resolved_session,resolved_operator,audit_note])
+                touch_payment_operator_session(conn,resolved_operator,resolved_session)
                 pid=cur.lastrowid
                 conn.execute('INSERT INTO saldo_history(member_id,tipe,nominal,saldo_sebelum,saldo_setelah,keterangan,reference_id,created_by) VALUES(?,"KELUAR",?,?,?,?,?,?)',[member['id'],amount,saldo,after,f'Kode Bayar {code} - {profile["branch_name"]}',pid,session.get('user_id')])
                 conn.commit(); result={'payment_no':payment_no,'branch_name':profile['branch_name'],'amount':amount,'after':after,'id':pid}
@@ -6607,8 +6736,9 @@ def member_pay_code():
 @role_required('admin','kasir','branch_admin','branch_cashier')
 def api_cashier_code_payments():
     bid=get_branch_id(); after=request.args.get('after',0,type=int)
-    rows=q_all('''SELECT p.id,p.payment_no,p.amount,p.created_at,m.name member_name FROM branch_code_payments p JOIN members m ON m.id=p.member_id WHERE p.branch_id=? AND p.id>? ORDER BY p.id LIMIT 20''',[bid,after])
-    return jsonify({'ok':True,'items':[{'id':r['id'],'payment_no':r['payment_no'],'amount':r['amount'],'amount_text':rupiah(r['amount']),'member_name':r['member_name'],'created_at':r['created_at']} for r in rows]})
+    rows=q_all('''SELECT p.id,p.payment_no,p.amount,p.created_at,m.name member_name FROM branch_code_payments p JOIN members m ON m.id=p.member_id WHERE p.branch_id=? AND p.id>? ORDER BY p.id ASC LIMIT 50''',[bid,after])
+    items=[{'id':r['id'],'payment_no':r['payment_no'],'amount':r['amount'],'amount_text':rupiah(r['amount']),'member_name':r['member_name'],'created_at':r['created_at']} for r in rows]
+    return jsonify({'ok':True,'items':items,'cursor':items[-1]['id'] if items else after})
 
 @app.route('/api/durable-notifications')
 @login_required
@@ -6674,7 +6804,7 @@ def cashier_qr_dynamic():
     iid=request.args.get('intent',type=int)
     if iid: intent=q_one("SELECT * FROM branch_qr_payment_intents WHERE id=? AND branch_id=? AND qr_mode='DYNAMIC'",[iid,bid])
     recent=q_all("SELECT * FROM branch_qr_payment_intents WHERE branch_id=? AND qr_mode='DYNAMIC' ORDER BY id DESC LIMIT 10",[bid])
-    body=render_template_string(r'''<div class="branch-qr-suite"><header class="branch-qr-hero dynamic"><div class="branch-qr-lines"></div><div><span>ONE-TIME AMOUNT QR</span><h2>Generate QR Nominal</h2><p>Buat QR khusus untuk satu nominal. QR ini berbeda tiap transaksi dan tidak terpengaruh tagihan QR statis cabang.</p></div><div class="branch-qr-live"><i></i> SECURE INTENT</div></header><section class="dynamic-qr-layout"><article class="branch-qr-terminal"><div class="branch-qr-title"><div><span>MANUAL AMOUNT</span><h3>Buat Tagihan Baru</h3></div></div><form method="post" class="qr-amount-form"><label>Nominal pembayaran<input type="number" name="amount" min="1000" step="1000" placeholder="Rp 20.000" required autofocus></label><label>Catatan transaksi<input name="note" maxlength="200" placeholder="Contoh: Belanja koperasi"></label><button class="btn-success">Generate QR Sekarang</button></form></article>{% if intent %}<article class="dynamic-qr-result" id="dynamicQR" data-id="{{intent.id}}"><div class="branch-qr-title"><div><span>QR TRANSAKSI</span><h3>{{intent.payment_code}}</h3></div><span class="badge badge-warn" id="dynamicStatus">{{intent.status}}</span></div><img src="{{url_for('dynamic_qr_image',payment_code=intent.payment_code)}}"><b>{{rupiah(intent.amount)}}</b><small>Berlaku sampai {{intent.expires_at}}</small><div id="dynamicPaidResult"></div></article>{% endif %}</section><section class="branch-qr-history"><header><div><span>GENERATED HISTORY</span><h3>QR Nominal Terbaru</h3></div></header><div>{% for r in recent %}<article><i class="{{r.status|lower}}"></i><div><b>{{r.payment_code}}</b><small>{{r.created_at}} · {{r.note or '-'}}</small></div><strong>{{rupiah(r.amount)}}</strong><span class="badge {{'badge-success' if r.status=='PAID' else 'badge-warn' if r.status=='WAITING' else 'badge-gray'}}">{{r.status}}</span></article>{% endfor %}</div></section></div>{% if intent %}<script>(function(){var id={{intent.id}};function poll(){fetch('{{url_for("api_dynamic_qr_status",intent_id=intent.id)}}',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){if(!d.ok)return;document.getElementById('dynamicStatus').textContent=d.status;if(d.status==='PAID'){document.getElementById('dynamicPaidResult').innerHTML='<div class="qr-paid-pop"><i>✓</i><b>Pembayaran Berhasil</b><strong>'+d.member_name+'</strong></div>';}})}poll();setInterval(poll,750)})();</script>{% endif %}''',intent=intent,recent=recent,rupiah=rupiah)
+    body=render_template_string(r'''<div class="branch-qr-suite"><header class="branch-qr-hero dynamic"><div class="branch-qr-lines"></div><div><span>ONE-TIME AMOUNT QR</span><h2>Generate QR Nominal</h2><p>Buat QR khusus untuk satu nominal. QR ini berbeda tiap transaksi dan tidak terpengaruh tagihan QR statis cabang.</p></div><div class="branch-qr-live"><i></i> SECURE INTENT</div></header><section class="dynamic-qr-layout"><article class="branch-qr-terminal"><div class="branch-qr-title"><div><span>MANUAL AMOUNT</span><h3>Buat Tagihan Baru</h3></div></div><form method="post" class="qr-amount-form"><label>Nominal pembayaran<input type="number" name="amount" min="1000" step="1000" placeholder="Rp 20.000" required autofocus></label><label>Catatan transaksi<input name="note" maxlength="200" placeholder="Contoh: Belanja koperasi"></label><button class="btn-success">Generate QR Sekarang</button></form></article>{% if intent %}<article class="dynamic-qr-result" id="dynamicQR" data-id="{{intent.id}}"><div class="branch-qr-title"><div><span>QR TRANSAKSI</span><h3>{{intent.payment_code}}</h3></div><span class="badge badge-warn" id="dynamicStatus">{{intent.status}}</span></div><img src="{{url_for('dynamic_qr_image',payment_code=intent.payment_code)}}"><b>{{rupiah(intent.amount)}}</b><small>Berlaku sampai {{intent.expires_at}}</small><div id="dynamicPaidResult"></div></article>{% endif %}</section><section class="branch-qr-history"><header><div><span>GENERATED HISTORY</span><h3>QR Nominal Terbaru</h3></div></header><div>{% for r in recent %}<article><i class="{{r.status|lower}}"></i><div><b>{{r.payment_code}}</b><small>{{r.created_at}} · {{r.note or '-'}}</small></div><strong>{{rupiah(r.amount)}}</strong><span class="badge {{'badge-success' if r.status=='PAID' else 'badge-warn' if r.status=='WAITING' else 'badge-gray'}}">{{r.status}}</span></article>{% endfor %}</div></section></div>{% if intent %}<script>(function(){var done=false;function poll(){if(done||document.hidden)return;fetch('{{url_for("api_dynamic_qr_status",intent_id=intent.id)}}',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){if(!d.ok)return;document.getElementById('dynamicStatus').textContent=d.status;if(d.status==='PAID'&&!done){done=true;document.getElementById('dynamicPaidResult').innerHTML='<div class="qr-paid-pop"><i>✓</i><b>Pembayaran Berhasil</b><strong>'+d.member_name+'</strong></div>';var el=document.createElement('div');el.id='persistentPaymentNotice';el.className='persistent-payment-notice';el.innerHTML='<i>✓</i><div><span>PEMBAYARAN QR MASUK</span><b>'+d.member_name+'</b><small>Transaksi berhasil dibayar</small></div><button type="button">Tutup</button>';document.body.appendChild(el);el.querySelector('button').onclick=function(){el.remove()}}}).catch(function(){})}poll();setInterval(poll,1000)})();</script>{% endif %}''',intent=intent,recent=recent,rupiah=rupiah)
     return render_page('Generate QR Nominal',cashier_operator_banner()+body)
 
 @app.route('/cashier/qr-dynamic/image/<payment_code>')
@@ -6707,6 +6837,11 @@ def dynamic_qr_pay(payment_code):
             saldo=conn.execute('SELECT COALESCE(SUM(CASE WHEN tipe="MASUK" THEN nominal ELSE -nominal END),0) saldo FROM saldo_history WHERE member_id=?',[member['id']]).fetchone()['saldo'] or 0; amount=float(locked['amount'])
             if float(saldo)<amount: raise ValueError(f'Saldo tidak cukup. Tersedia {rupiah(saldo)}.')
             after=float(saldo)-amount
+            resolved_operator=locked['operator_user_id']; resolved_session=locked['cashier_session_id']
+            if not resolved_operator or not resolved_session:
+                resolved_operator,resolved_session=resolve_branch_payment_operator(locked['branch_id'])
+                conn.execute('UPDATE branch_qr_payment_intents SET operator_user_id=?,cashier_session_id=? WHERE id=?',[resolved_operator,resolved_session,locked['id']])
+            touch_payment_operator_session(conn,resolved_operator,resolved_session)
             conn.execute('INSERT INTO saldo_history(member_id,tipe,nominal,saldo_sebelum,saldo_setelah,keterangan,reference_id,created_by) VALUES(?,"KELUAR",?,?,?,?,?,?)',[member['id'],amount,saldo,after,f'QR Dinamis {locked["payment_code"]}',locked['id'],session.get('user_id')])
             changed=conn.execute("UPDATE branch_qr_payment_intents SET status='PAID',member_id=?,wallet_account_no=(SELECT account_no FROM wallet_accounts WHERE member_id=?),paid_at=? WHERE id=? AND status='WAITING'",[member['id'],member['id'],now_str(),locked['id']]).rowcount
             if changed!=1: raise ValueError('Pembayaran sudah diproses.')
@@ -6730,6 +6865,7 @@ def api_dynamic_qr_status(intent_id):
 @role_required('admin','kasir','branch_admin','branch_cashier')
 def cashier_qr_payment():
     ensure_branch_qr_payment_schema(); bid=get_branch_id(); operator=active_cashier_operator()
+    if operator: exec_sql('UPDATE cashier_operator_sessions SET last_activity_at=? WHERE id=?',[now_str(),operator['id']])
     if not bid:
         flash('Terminal kasir belum memiliki cabang aktif.','error'); return redirect(url_for('dashboard'))
     profile=branch_qr_profile(bid)
@@ -6755,7 +6891,35 @@ def cashier_qr_payment():
     active=q_one("SELECT * FROM branch_qr_payment_intents WHERE branch_id=? AND operator_user_id=? AND status='WAITING' ORDER BY id DESC LIMIT 1",[bid,cashier_operator_id()])
     recent=q_all('''SELECT i.*,m.name member_name FROM branch_qr_payment_intents i LEFT JOIN members m ON m.id=i.member_id WHERE i.branch_id=? ORDER BY i.id DESC LIMIT 20''',[bid])
     pay_url=request.host_url.rstrip('/')+url_for('branch_qr_pay',token=profile['qr_token'])
-    body=render_template_string(r'''<div class="branch-qr-suite static-direct-suite"><header class="branch-qr-hero"><div class="branch-qr-lines"></div><div><span>PERMANENT BRANCH PAYMENT QR</span><h2>QR Statis {{branch_name}}</h2><p>QR permanen cabang. Anggota langsung scan, memasukkan nominal pada smartphone, lalu pembayaran tampil di riwayat secara real-time.</p></div><div class="branch-qr-live"><i></i> LIVE 0.75s</div></header><section class="static-qr-workspace"><article class="static-qr-card"><div class="branch-qr-title"><div><span>QR PERMANEN</span><h3>Siap Dipindai</h3></div><a href="{{url_for('branch_qr_image',branch_id=bid)}}" target="_blank">Cetak QR</a></div><div class="static-qr-frame"><img src="{{url_for('branch_qr_image',branch_id=bid)}}" alt="QR pembayaran statis {{branch_name}}"><i></i><i></i><i></i><i></i></div><b>{{branch_name}}</b><small>QR ini tidak berubah dan tidak perlu aktivasi nominal dari kasir.</small><code>{{pay_url}}</code></article><article class="static-live-panel"><header><div><span>LIVE PAYMENT HISTORY</span><h3>Pembayaran Masuk</h3></div><b id="staticLiveStatus"><i></i> TERHUBUNG</b></header><div id="staticPaymentStream" class="static-payment-stream">{% for r in recent %}{% if r.status=='PAID' %}<article data-id="{{r.id}}"><i></i><div><b>{{r.payment_code}}</b><small>{{r.member_name or 'Anggota'}} · {{r.paid_at or r.created_at}}</small></div><strong>{{rupiah(r.amount)}}</strong></article>{% endif %}{% else %}<div class="static-empty">Belum ada pembayaran masuk.</div>{% endfor %}</div></article></section></div><script>(function(){var stream=document.getElementById('staticPaymentStream'),busy=false,seen=new Set(Array.from(document.querySelectorAll('#staticPaymentStream article[data-id]')).map(function(x){return Number(x.dataset.id)}));function esc(v){return String(v||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}function add(x){var empty=stream.querySelector('.static-empty');if(empty)empty.remove();var a=document.createElement('article');a.className='new-payment';a.dataset.id=x.id;a.innerHTML='<i></i><div><b>'+esc(x.payment_code)+'</b><small>'+esc(x.member_name)+' · '+esc(x.paid_at)+'</small></div><strong>'+esc(x.amount_text)+'</strong>';stream.prepend(a);while(stream.querySelectorAll('article').length>40)stream.lastElementChild.remove();if(window.showPersistentPaymentNotice)window.showPersistentPaymentNotice(x)}function poll(){if(busy||document.hidden)return;busy=true;fetch('{{url_for("api_branch_live_payments")}}?after='+last,{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){if(!d.ok)return;(d.items||[]).forEach(function(x){if(!seen.has(Number(x.id))){seen.add(Number(x.id));add(x)}})}).catch(function(){}).finally(function(){busy=false})}poll();setInterval(poll,750)})();</script>''',bid=bid,branch_name=get_branch_name(bid),recent=recent,pay_url=pay_url,rupiah=rupiah)
+    body=render_template_string(r'''<div class="branch-qr-suite static-direct-suite"><header class="branch-qr-hero"><div class="branch-qr-lines"></div><div><span>PERMANENT BRANCH PAYMENT QR</span><h2>QR Statis {{branch_name}}</h2><p>QR permanen cabang. Anggota langsung scan, memasukkan nominal pada smartphone, lalu pembayaran tampil di riwayat secara real-time.</p></div><div class="branch-qr-live"><i></i> LIVE 0.75s</div></header><section class="static-qr-workspace"><article class="static-qr-card"><div class="branch-qr-title"><div><span>QR PERMANEN</span><h3>Siap Dipindai</h3></div><a href="{{url_for('branch_qr_image',branch_id=bid)}}" target="_blank">Cetak QR</a></div><div class="static-qr-frame"><img src="{{url_for('branch_qr_image',branch_id=bid)}}" alt="QR pembayaran statis {{branch_name}}"><i></i><i></i><i></i><i></i></div><b>{{branch_name}}</b><small>QR ini tidak berubah dan tidak perlu aktivasi nominal dari kasir.</small><code>{{pay_url}}</code></article><article class="static-live-panel"><header><div><span>LIVE PAYMENT HISTORY</span><h3>Pembayaran Masuk</h3></div><b id="staticLiveStatus"><i></i> TERHUBUNG</b></header><div id="staticPaymentStream" class="static-payment-stream">{% for r in recent %}{% if r.status=='PAID' %}<article data-id="{{r.id}}"><i></i><div><b>{{r.payment_code}}</b><small>{{r.member_name or 'Anggota'}} · {{r.paid_at or r.created_at}}</small></div><strong>{{rupiah(r.amount)}}</strong></article>{% endif %}{% else %}<div class="static-empty">Belum ada pembayaran masuk.</div>{% endfor %}</div></article></section></div><script>(function(){
+var stream=document.getElementById('staticPaymentStream');
+var busy=false;
+var initialized=false;
+var seen=new Set(Array.from(document.querySelectorAll('#staticPaymentStream article[data-id]')).map(function(x){return Number(x.dataset.id)}));
+function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function notice(x){
+  var old=document.getElementById('persistentPaymentNotice');if(old)old.remove();
+  var el=document.createElement('div');el.id='persistentPaymentNotice';el.className='persistent-payment-notice';
+  el.innerHTML='<i>✓</i><div><span>PEMBAYARAN QR MASUK</span><b>'+esc(x.amount_text)+'</b><small>'+esc(x.member_name)+' · '+esc(x.payment_code)+'</small></div><button type="button">Tutup</button>';
+  document.body.appendChild(el);el.querySelector('button').onclick=function(){el.remove()};
+}
+function add(x,withNotice){
+  if(seen.has(Number(x.id)))return;seen.add(Number(x.id));
+  var empty=stream.querySelector('.static-empty');if(empty)empty.remove();
+  var a=document.createElement('article');a.className='new-payment';a.dataset.id=x.id;
+  a.innerHTML='<i></i><div><b>'+esc(x.payment_code)+'</b><small>'+esc(x.member_name)+' · '+esc(x.paid_at)+'</small></div><strong>'+esc(x.amount_text)+'</strong>';
+  stream.prepend(a);while(stream.querySelectorAll('article').length>40)stream.lastElementChild.remove();if(withNotice)notice(x);
+}
+function poll(){
+  if(busy||document.hidden)return;busy=true;
+  fetch('{{url_for("api_branch_live_payments")}}',{cache:'no-store'})
+   .then(function(r){return r.json()})
+   .then(function(d){if(!d.ok)return;(d.items||[]).slice().reverse().forEach(function(x){add(x,initialized)});initialized=true})
+   .catch(function(){})
+   .finally(function(){busy=false});
+}
+poll();setInterval(poll,1000);
+})();</script>''',bid=bid,branch_name=get_branch_name(bid),recent=recent,pay_url=pay_url,rupiah=rupiah)
     return render_page('QR Payment Cabang',cashier_operator_banner()+body)
 
 @app.route('/cashier/qr-payment/image/<int:branch_id>')
@@ -6781,6 +6945,12 @@ CSS_DESIGN += r"""
 .branch-code-dashboard{min-width:270px}.branch-code-dashboard>span,.branch-code-dashboard>strong,.branch-code-dashboard>small{display:block}.branch-code-dashboard>span{color:#67e8f9;font-size:8px;font-weight:950;letter-spacing:.18em}.branch-code-dashboard>strong{margin:8px 0;font:950 56px/1 ui-monospace,SFMono-Regular,monospace;letter-spacing:.18em;color:#fff;text-indent:.18em;text-shadow:0 0 24px rgba(103,232,249,.28)}.branch-code-dashboard>small{color:#b8ccda;font-size:8px}.static-qr-workspace{display:grid;grid-template-columns:390px minmax(0,1fr);gap:14px}.static-qr-card,.static-live-panel{overflow:hidden;border:1px solid #d9e4ed;border-radius:18px;background:#fff;box-shadow:0 9px 28px rgba(15,35,52,.06)}.static-qr-card{text-align:center}.static-qr-frame{position:relative;width:270px;height:270px;margin:20px auto 12px;padding:12px;border-radius:25px;background:#fff;box-shadow:0 16px 38px rgba(15,35,52,.13),inset 0 0 0 1px #dbe5ec}.static-qr-frame img{width:100%;height:100%;object-fit:contain}.static-qr-frame i{position:absolute;width:42px;height:42px;border-color:#0f9f97;border-style:solid}.static-qr-frame i:nth-of-type(1){left:2px;top:2px;border-width:4px 0 0 4px;border-radius:17px 0 0}.static-qr-frame i:nth-of-type(2){right:2px;top:2px;border-width:4px 4px 0 0;border-radius:0 17px 0 0}.static-qr-frame i:nth-of-type(3){left:2px;bottom:2px;border-width:0 0 4px 4px;border-radius:0 0 0 17px}.static-qr-frame i:nth-of-type(4){right:2px;bottom:2px;border-width:0 4px 4px 0;border-radius:0 0 17px}.static-qr-card>b,.static-qr-card>small,.static-qr-card>code{display:block}.static-qr-card>b{font-size:15px}.static-qr-card>small{padding:5px 18px;color:#738493;font-size:8px}.static-qr-card>code{margin:9px 16px 17px;padding:8px;border-radius:9px;background:#f1f5f8;font-size:7px;overflow:hidden;text-overflow:ellipsis}.static-live-panel>header{display:flex;justify-content:space-between;align-items:center;padding:17px 18px;border-bottom:1px solid #e5edf3}.static-live-panel header span{color:#0f9f97;font-size:8px;font-weight:950;letter-spacing:.17em}.static-live-panel header h3{margin:4px 0 0}.static-live-panel header>b{display:flex;align-items:center;gap:6px;color:#087e6a;font-size:7px}.static-live-panel header>b i{width:7px;height:7px;border-radius:50%;background:#2dd4bf;box-shadow:0 0 9px #2dd4bf;animation:adminPresencePulse 1.5s infinite}.static-payment-stream{max-height:520px;overflow:auto;overscroll-behavior:contain}.static-payment-stream>article{display:grid;grid-template-columns:10px minmax(0,1fr) auto;gap:10px;align-items:center;padding:13px 17px;border-bottom:1px solid #edf2f6}.static-payment-stream>article>i{width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 8px #10b981}.static-payment-stream article b,.static-payment-stream article small{display:block}.static-payment-stream article small{margin-top:3px;color:#8494a5;font-size:8px}.static-payment-stream article strong{font-size:11px}.static-payment-stream article.new-payment{animation:newPaymentIn .28s ease;background:#edfff8}.static-empty{padding:45px;text-align:center;color:#8b98a5}.persistent-payment-notice{animation:noticeIn .2s ease!important}.persistent-payment-notice:not(.dismissed){display:grid!important}@keyframes newPaymentIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:none}}
 @media(max-width:900px){.static-qr-workspace{grid-template-columns:1fr}.branch-code-dashboard{min-width:0}.branch-qr-dashboard-actions{min-width:0!important}}
 @media(max-width:768px){.branch-code-dashboard>strong{font-size:48px}.static-qr-workspace{padding:0 12px}.static-qr-card,.static-live-panel{border-radius:21px}.static-qr-frame{width:230px;height:230px}.static-payment-stream{max-height:430px}}
+"""
+
+CSS_DESIGN += r"""
+/* LIVE PAYMENT NOTIFICATION FINAL */
+.persistent-payment-notice{display:grid!important;opacity:1!important;visibility:visible!important;pointer-events:auto!important;animation:paymentNoticeIn .2s ease!important}.persistent-payment-notice button{cursor:pointer}.branch-qr-history article.new-payment,.static-payment-stream article.new-payment{animation:newPaymentIn .25s ease;background:#eafff7!important}@keyframes paymentNoticeIn{from{opacity:0;transform:translateY(-12px)}to{opacity:1;transform:none}}
+@media(max-width:768px){.persistent-payment-notice{position:fixed!important;left:10px!important;right:10px!important;top:76px!important;width:auto!important;z-index:100000!important}}
 """
 
 @app.route('/api/branch/live-payments')
@@ -6826,7 +6996,8 @@ def branch_qr_pay(token):
                 if direct_amount<1000: raise ValueError('Nominal minimal Rp1.000.')
                 paycode='QRS-'+datetime.now().strftime('%Y%m%d%H%M%S')+'-'+os.urandom(3).hex().upper()
                 expires=(datetime.now()+timedelta(minutes=10)).strftime('%Y-%m-%d %H:%M:%S')
-                cur=conn.execute('''INSERT INTO branch_qr_payment_intents(payment_code,branch_id,amount,status,note,operator_user_id,cashier_session_id,created_at,expires_at,qr_mode) VALUES(?,?,?,'WAITING','Pembayaran langsung QR statis',NULL,NULL,?,?,'STATIC_DIRECT')''',[paycode,bid,direct_amount,now_str(),expires])
+                resolved_operator,resolved_session=resolve_branch_payment_operator(bid)
+                cur=conn.execute('''INSERT INTO branch_qr_payment_intents(payment_code,branch_id,amount,status,note,operator_user_id,cashier_session_id,created_at,expires_at,qr_mode) VALUES(?,?,?,'WAITING','Pembayaran langsung QR statis',?,?,?,?,'STATIC_DIRECT')''',[paycode,bid,direct_amount,resolved_operator,resolved_session,now_str(),expires])
                 iid=cur.lastrowid
             locked=conn.execute("SELECT * FROM branch_qr_payment_intents WHERE id=? AND branch_id=? AND status='WAITING'",[iid,bid]).fetchone()
             if not locked: raise ValueError('Tagihan sudah dibayar, dibatalkan, atau kedaluwarsa.')
@@ -6835,6 +7006,11 @@ def branch_qr_pay(token):
             amount=float(locked['amount'] or 0)
             if float(saldo)<amount: raise ValueError(f'Saldo wallet tidak cukup. Saldo tersedia {rupiah(saldo)}.')
             after=float(saldo)-amount
+            resolved_operator=locked['operator_user_id']; resolved_session=locked['cashier_session_id']
+            if not resolved_operator or not resolved_session:
+                resolved_operator,resolved_session=resolve_branch_payment_operator(bid)
+                conn.execute('UPDATE branch_qr_payment_intents SET operator_user_id=?,cashier_session_id=? WHERE id=?',[resolved_operator,resolved_session,iid])
+            touch_payment_operator_session(conn,resolved_operator,resolved_session)
             conn.execute('INSERT INTO saldo_history(member_id,tipe,nominal,saldo_sebelum,saldo_setelah,keterangan,reference_id,created_by) VALUES(?,"KELUAR",?,?,?,?,?,?)',[member['id'],amount,saldo,after,f'QR Payment {branch_name} - {locked["payment_code"]}',iid,session.get('user_id')])
             changed=conn.execute("UPDATE branch_qr_payment_intents SET status='PAID',member_id=?,wallet_account_no=(SELECT account_no FROM wallet_accounts WHERE member_id=?),paid_at=? WHERE id=? AND status='WAITING'",[member['id'],member['id'],now_str(),iid]).rowcount
             if changed!=1: raise ValueError('Pembayaran diproses pihak lain. Saldo tidak dikurangi.')
@@ -6849,16 +7025,51 @@ def branch_qr_pay(token):
     body=render_template_string(r'''<div class="member-qr-pay"><header><span>SCAN TO PAY</span><h2>{{branch_name}}</h2><p>Pembayaran langsung dari saldo Koperasi Wallet.</p></header>{% if paid %}<section class="member-pay-success"><i>✓</i><h3>Pembayaran Berhasil</h3><b>{{rupiah(paid.amount)}}</b><small>{{paid.payment_code}} · {{paid.paid_at}}</small><a href="{{url_for('wallet')}}">Lihat Mutasi Wallet</a></section>{% elif intent %}<section class="member-pay-card"><div><span>TAGIHAN AKTIF</span><b>{{rupiah(intent.amount)}}</b><small>{{intent.payment_code}} · {{intent.note or 'Pembayaran koperasi'}}</small></div><div class="member-pay-balance"><span>Saldo Anda</span><b>{{rupiah(balance)}}</b></div><form method="post"><input type="hidden" name="intent_id" value="{{intent.id}}"><button class="btn-success" {{'disabled' if balance<intent.amount else ''}} data-confirm="Bayar {{rupiah(intent.amount)}} ke {{branch_name}}?">Bayar Sekarang</button></form>{% if balance<intent.amount %}<p class="pay-insufficient">Saldo tidak cukup. Silakan isi saldo terlebih dahulu.</p>{% endif %}</section>{% else %}<section class="member-pay-card direct-static-pay"><div><span>QR STATIS CABANG</span><b>Masukkan Nominal</b><small>Konfirmasi nominal sesuai total yang disampaikan kasir.</small></div><div class="member-pay-balance"><span>Saldo Anda</span><b>{{rupiah(balance)}}</b></div><form method="post"><label>Nominal pembayaran<input type="number" name="direct_amount" min="1000" step="1000" placeholder="Rp 20.000" required autofocus></label><button class="btn-success" data-confirm="Lanjutkan pembayaran QR statis?">Lanjutkan Pembayaran</button></form></section>{% endif %}</div>''',branch_name=branch_name,intent=intent,balance=float(balance or 0),member=member,paid=paid,rupiah=rupiah)
     return render_page('Bayar QR Cabang',body)
 
+
+@app.route('/admin/operator-payment-history')
+@login_required
+@role_required('admin','branch_admin','manager')
+def admin_operator_payment_history():
+    ensure_branch_qr_payment_schema(); ensure_payment_code_schema(); user=current_user(); bid=get_branch_id()
+    # Backfill older payment rows when a matching operator session can be determined safely.
+    conn=get_conn()
+    try:
+        pending=conn.execute("SELECT id,branch_id,paid_at FROM branch_qr_payment_intents WHERE status='PAID' AND cashier_session_id IS NULL AND paid_at IS NOT NULL").fetchall()
+        for pay in pending:
+            match=conn.execute('''SELECT id,operator_user_id FROM cashier_operator_sessions WHERE branch_id=? AND login_at<=? AND COALESCE(logout_at,?)>=? ORDER BY login_at DESC LIMIT 1''',[pay['branch_id'],pay['paid_at'],now_str(),pay['paid_at']]).fetchone()
+            if match: conn.execute('UPDATE branch_qr_payment_intents SET operator_user_id=?,cashier_session_id=? WHERE id=?',[match['operator_user_id'],match['id'],pay['id']])
+        pending=conn.execute("SELECT id,branch_id,created_at FROM branch_code_payments WHERE status='PAID' AND cashier_session_id IS NULL").fetchall()
+        for pay in pending:
+            match=conn.execute('''SELECT id,operator_user_id FROM cashier_operator_sessions WHERE branch_id=? AND login_at<=? AND COALESCE(logout_at,?)>=? ORDER BY login_at DESC LIMIT 1''',[pay['branch_id'],pay['created_at'],now_str(),pay['created_at']]).fetchone()
+            if match: conn.execute('UPDATE branch_code_payments SET operator_user_id=?,cashier_session_id=? WHERE id=?',[match['operator_user_id'],match['id'],pay['id']])
+        conn.commit()
+    finally: conn.close()
+    start=request.args.get('start') or today_str(); end=request.args.get('end') or today_str(); params=[start+' 00:00:00',end+' 23:59:59']
+    scope='';
+    if user['role']=='branch_admin': scope=' AND x.branch_id=?'; params.append(bid)
+    sql='''SELECT x.*,u.full_name operator_name,u.username operator_username,m.name member_name,b.name branch_name,cs.login_at session_login,cs.logout_at session_logout FROM (
+      SELECT i.id source_id,'QR' source,i.payment_code reference_no,i.branch_id,i.operator_user_id,i.cashier_session_id,i.member_id,i.amount,i.status,i.created_at,i.paid_at,i.qr_mode mode
+      FROM branch_qr_payment_intents i WHERE i.status='PAID'
+      UNION ALL
+      SELECT p.id source_id,'KODE_3D' source,p.payment_no reference_no,p.branch_id,p.operator_user_id,p.cashier_session_id,p.member_id,p.amount,p.status,p.created_at,p.created_at paid_at,'CODE' mode
+      FROM branch_code_payments p WHERE p.status='PAID'
+    ) x LEFT JOIN users u ON u.id=x.operator_user_id LEFT JOIN members m ON m.id=x.member_id LEFT JOIN koperasi_branches b ON b.id=x.branch_id LEFT JOIN cashier_operator_sessions cs ON cs.id=x.cashier_session_id
+    WHERE x.paid_at BETWEEN ? AND ?'''+scope+' ORDER BY x.paid_at DESC LIMIT 1500'
+    rows=q_all(sql,params)
+    totals={'count':len(rows),'amount':sum(float(r['amount'] or 0) for r in rows),'unassigned':sum(1 for r in rows if not r['operator_user_id'])}
+    body=render_template_string(r'''<div class="cash-admin"><header class="cash-admin-hero"><div><span>ADMIN PAYMENT AUDIT</span><h2>History Pembayaran Operator</h2><p>Semua pembayaran QR dan kode 3 digit tercatat pada operator, sesi kerja, anggota, serta cabang penerima.</p></div></header><section class="cash-admin-kpis"><article><span>Total Record</span><b>{{totals.count}}</b><small>Periode terpilih</small></article><article><span>Total Pembayaran</span><b>{{rupiah(totals.amount)}}</b><small>QR + kode 3 digit</small></article><article><span>Tanpa Operator</span><b>{{totals.unassigned}}</b><small>Perlu ditinjau</small></article></section><section class="cash-admin-card"><div class="cash-admin-head"><div><span>OPERATOR PAYMENT LEDGER</span><h3>Record Pembayaran</h3></div><form method="get" class="rotation-filter"><input type="date" name="start" value="{{start}}"><input type="date" name="end" value="{{end}}"><button>Terapkan</button></form></div><div class="table-wrap"><table><thead><tr><th>Waktu Bayar</th><th>Sumber</th><th>Referensi</th><th>Cabang</th><th>Operator</th><th>ID Sesi</th><th>Anggota</th><th>Nominal</th><th>Status</th></tr></thead><tbody>{% for r in rows %}<tr><td>{{r.paid_at}}</td><td><span class="badge badge-info">{{r.source}}</span></td><td><code>{{r.reference_no}}</code><small>{{r.mode}}</small></td><td>{{r.branch_name or 'PUSAT'}}</td><td><b>{{r.operator_name or r.operator_username or 'BELUM TERHUBUNG'}}</b></td><td>{{r.cashier_session_id or '-'}}</td><td>{{r.member_name or '-'}}</td><td><b>{{rupiah(r.amount)}}</b></td><td><span class="badge badge-success">{{r.status}}</span></td></tr>{% else %}<tr><td colspan="9" class="muted text-center">Belum ada pembayaran.</td></tr>{% endfor %}</tbody></table></div></section></div>''',rows=rows,totals=totals,start=start,end=end,rupiah=rupiah)
+    return render_page('History Pembayaran Operator',body)
+
 @app.route('/cashier/qr-payment/history')
 @login_required
 @role_required('admin','branch_admin','manager','kasir','branch_cashier')
 def branch_qr_payment_history():
     ensure_branch_qr_payment_schema(); user=current_user(); bid=get_branch_id(); start=request.args.get('start') or today_str(); end=request.args.get('end') or today_str(); status=request.args.get('status',''); params=[start+' 00:00:00',end+' 23:59:59']
     sql='''SELECT i.*,COALESCE(b.name,'PUSAT') branch_name,COALESCE(m.name,'-') member_name,COALESCE(u.full_name,u.username,'-') operator_name FROM branch_qr_payment_intents i LEFT JOIN koperasi_branches b ON b.id=i.branch_id LEFT JOIN members m ON m.id=i.member_id LEFT JOIN users u ON u.id=i.operator_user_id WHERE i.created_at BETWEEN ? AND ?'''
-    if user['role']=='branch_admin': sql+=' AND i.branch_id=?'; params.append(bid)
+    if user['role'] in ('branch_admin','branch_cashier','kasir'): sql+=' AND i.branch_id=?'; params.append(bid)
     if status: sql+=' AND i.status=?'; params.append(status)
     rows=q_all(sql+' ORDER BY i.id DESC LIMIT 1000',params)
-    body=render_template_string(r'''<div class="branch-qr-suite"><header class="branch-qr-hero"><div><span>QR PAYMENT LEDGER</span><h2>Riwayat QR Payment</h2><p>Audit tagihan, pembayaran wallet, operator, anggota, cabang, dan waktu penyelesaian.</p></div></header><section class="branch-qr-history"><header><form method="get" class="qr-history-filter"><input type="date" name="start" value="{{start}}"><input type="date" name="end" value="{{end}}"><select name="status"><option value="">Semua status</option>{% for x in ['WAITING','PAID','CANCELLED','EXPIRED'] %}<option value="{{x}}" {{'selected' if status==x else ''}}>{{x}}</option>{% endfor %}</select><button>Terapkan</button></form></header><div class="table-wrap"><table><thead><tr><th>Kode</th><th>Mode QR</th><th>Cabang</th><th>Operator</th><th>Anggota</th><th>Nominal</th><th>Dibuat</th><th>Dibayar</th><th>Status</th></tr></thead><tbody>{% for r in rows %}<tr><td><code>{{r.payment_code}}</code></td><td><span class="badge badge-info">{{r.qr_mode or "STATIC"}}</span></td><td>{{r.branch_name}}</td><td>{{r.operator_name}}</td><td>{{r.member_name}}</td><td><b>{{rupiah(r.amount)}}</b></td><td>{{r.created_at}}</td><td>{{r.paid_at or '-'}}</td><td><span class="badge {{'badge-success' if r.status=='PAID' else 'badge-warn' if r.status=='WAITING' else 'badge-gray'}}">{{r.status}}</span></td></tr>{% else %}<tr><td colspan="9" class="muted text-center">Belum ada transaksi QR.</td></tr>{% endfor %}</tbody></table></div></section></div>''',rows=rows,start=start,end=end,status=status,rupiah=rupiah)
+    body=render_template_string(r'''<div class="branch-qr-suite"><header class="branch-qr-hero"><div><span>QR PAYMENT LEDGER</span><h2>Riwayat QR Payment</h2><p>Audit tagihan, pembayaran wallet, operator, anggota, cabang, dan waktu penyelesaian.</p></div></header><section class="branch-qr-history"><header><form method="get" class="qr-history-filter"><input type="date" name="start" value="{{start}}"><input type="date" name="end" value="{{end}}"><select name="status"><option value="">Semua status</option>{% for x in ['WAITING','PAID','CANCELLED','EXPIRED'] %}<option value="{{x}}" {{'selected' if status==x else ''}}>{{x}}</option>{% endfor %}</select><button>Terapkan</button></form></header><div class="table-wrap"><table><thead><tr><th>Kode</th><th>Mode QR</th><th>Cabang</th><th>Operator</th><th>Sesi</th><th>Anggota</th><th>Nominal</th><th>Dibuat</th><th>Dibayar</th><th>Status</th></tr></thead><tbody>{% for r in rows %}<tr><td><code>{{r.payment_code}}</code></td><td><span class="badge badge-info">{{r.qr_mode or "STATIC"}}</span></td><td>{{r.branch_name}}</td><td>{{r.operator_name}}</td><td>{{r.cashier_session_id or "-"}}</td><td>{{r.member_name}}</td><td><b>{{rupiah(r.amount)}}</b></td><td>{{r.created_at}}</td><td>{{r.paid_at or '-'}}</td><td><span class="badge {{'badge-success' if r.status=='PAID' else 'badge-warn' if r.status=='WAITING' else 'badge-gray'}}">{{r.status}}</span></td></tr>{% else %}<tr><td colspan="10" class="muted text-center">Belum ada transaksi QR.</td></tr>{% endfor %}</tbody></table></div></section></div>''',rows=rows,start=start,end=end,status=status,rupiah=rupiah)
     return render_page('Riwayat QR Payment',body)
 
 CSS_DESIGN += r'''
