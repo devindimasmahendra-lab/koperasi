@@ -4213,7 +4213,7 @@ def render_page(title, body, **ctx):
       var back=document.getElementById('mobileAppBackdrop');
       if(!sheet){{openMobileDrawer(ev);return false;}}
       var open=sheet.getAttribute('aria-hidden')==='true';
-      if(open){sheet.classList.add('open')}else{sheet.classList.remove('open')}
+      if(open){{sheet.classList.add('open')}}else{{sheet.classList.remove('open')}}
       sheet.setAttribute('aria-hidden',open?'false':'true');
       if(back)back.classList.toggle('open',open);
       document.body.classList.toggle('mobile-app-open',open);
