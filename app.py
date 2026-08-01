@@ -20,7 +20,7 @@ from reportlab.lib.units import mm
 
 APP_TITLE = 'Koperasi Enterprise V4 Smart Control'
 APP_SHORT = 'KOPERASI'
-UI_UX_VERSION = '27.5-premium-admin-mobile'
+UI_UX_VERSION = '27.6-user-name-editor'
 DB_NAME = 'koperasi_enterprise_v3.db'
 SECRET_KEY = os.environ.get('KOPERASI_SECRET_KEY', 'dev-only-change-me')
 LOAN_AUTO_APPROVE_LIMIT = 5000000
@@ -93,8 +93,72 @@ def gen_code(prefix):
     return f"{prefix}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
 def get_branch_id():
-    """Return current user's branch_id or None (PUSAT)."""
-    return session.get('branch_id')
+    """Return authoritative branch for the logged-in user; None means central/PUSAT."""
+    uid = session.get('user_id')
+    if uid:
+        row = q_one('SELECT branch_id FROM users WHERE id=? AND active=1', [uid])
+        branch_id = row['branch_id'] if row else None
+        session['branch_id'] = branch_id
+        return int(branch_id) if branch_id else None
+    return None
+
+def branch_sales_scope(alias='s'):
+    """SQL scope for transaction pages. Admin/bendahara may see all; branch roles see only their branch."""
+    user = current_user()
+    branch_id = get_branch_id()
+    if user and user['role'] in ('admin', 'bendahara', 'supervisor'):
+        return '', []
+    if branch_id:
+        return f' AND {alias}.branch_id=?', [branch_id]
+    return f' AND {alias}.branch_id IS NULL', []
+
+def resolve_operational_branch(user=None):
+    # Resolve branch without treating an operational account as PUSAT.
+    # Recovery uses only one unambiguous branch from the user transaction history.
+    user=user or current_user()
+    bid=get_branch_id()
+    if bid:
+        return int(bid), ''
+    if not user or user['role'] not in ('branch_admin','branch_cashier','kasir'):
+        return None, ''
+    candidates=q_all('''SELECT DISTINCT branch_id FROM (
+        SELECT branch_id FROM sales WHERE cashier_id=? AND branch_id IS NOT NULL
+        UNION ALL SELECT stock_branch_id branch_id FROM quick_cashier_queue WHERE created_by=? AND stock_branch_id IS NOT NULL
+    ) ORDER BY branch_id''',[user['id'],user['id']])
+    ids=[int(x['branch_id']) for x in candidates if x['branch_id']]
+    if len(ids)==1:
+        bid=ids[0]
+        exec_sql('UPDATE users SET branch_id=? WHERE id=? AND branch_id IS NULL',[bid,user['id']])
+        session['branch_id']=bid
+        log_action('BRANCH_RECOVERED','users',user['id'],f'Cabang dipulihkan dari transaksi pengguna: {bid}')
+        return bid,'Cabang akun dipulihkan otomatis dari riwayat transaksi yang konsisten.'
+    return None,'Akun belum memiliki cabang. Halaman tetap dibuka dalam mode aman tanpa data PUSAT.'
+
+def require_operational_branch(user=None):
+    # Compatibility wrapper: never redirects. Caller decides safe empty-state behavior.
+    bid,_=resolve_operational_branch(user)
+    return bid
+
+def sale_visible_to_current_user(sale):
+    user=current_user(); bid=get_branch_id()
+    if not sale: return False
+    if user['role'] in ('admin','bendahara','supervisor','manager'): return True
+    return bool(bid and sale['branch_id'] and int(sale['branch_id'])==int(bid))
+
+
+def is_branch_role(user=None):
+    user = user or current_user()
+    return bool(user and user['role'] in ('branch_admin','branch_cashier','kasir'))
+
+def branch_stock_summary(branch_id):
+    if branch_id:
+        return q_one('''SELECT COUNT(*) product_count,
+                        COALESCE(SUM(CASE WHEN COALESCE(pbs.stock,0)<=COALESCE(pbs.min_stock,p.min_stock,0) THEN 1 ELSE 0 END),0) low_count,
+                        COALESCE(SUM(COALESCE(pbs.stock,0)*COALESCE(p.buy_price,0)),0) stock_value
+                        FROM products p LEFT JOIN product_branch_stock pbs ON pbs.product_id=p.id AND pbs.branch_id=? WHERE p.active=1''',[branch_id])
+    return q_one('''SELECT COUNT(*) product_count,COALESCE(SUM(CASE WHEN COALESCE(stock,0)<=COALESCE(min_stock,0) THEN 1 ELSE 0 END),0) low_count,
+                    COALESCE(SUM(COALESCE(stock,0)*COALESCE(buy_price,0)),0) stock_value FROM products WHERE active=1''')
+
 
 def get_branch_name(branch_id=None):
     """Get branch name from id or return 'PUSAT'."""
@@ -166,10 +230,24 @@ def add_timeline(loan_id, status, note='', created_by=None):
     exec_sql('INSERT INTO loan_timeline(loan_id, status, note, created_by) VALUES (?, ?, ?, ?)', [loan_id, status, note, created_by or session.get('user_id')])
 
 def parse_float(v, default=0.0):
+    """Parse numeric input safely, including Indonesian decimal and thousands formats."""
     try:
-        return float(v)
-    except Exception:
-        return default
+        if v is None or isinstance(v, (int, float)):
+            return float(v if v is not None else default)
+        text = str(v).strip().replace('Rp', '').replace('%', '').replace(' ', '')
+        if not text:
+            return float(default)
+        if ',' in text and '.' in text:
+            # The rightmost separator is treated as decimal separator.
+            if text.rfind(',') > text.rfind('.'):
+                text = text.replace('.', '').replace(',', '.')
+            else:
+                text = text.replace(',', '')
+        elif ',' in text:
+            text = text.replace(',', '.')
+        return float(text)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
 
 def current_user():
     if 'user_id' not in session:
@@ -194,14 +272,39 @@ def get_account_id(code):
     return int(row['id']) if row else None
 
 def post_journal(entry_date, description, lines, ref_type=None, ref_id=None, created_by=None):
-    entry_no = gen_code('JU')
-    payload = []
+    # Post one balanced journal atomically; reject invalid or unbalanced entries.
+    if not lines or len(lines) < 2:
+        raise ValueError('Jurnal minimal memiliki dua baris.')
+    clean = []
+    total_debit = total_credit = 0.0
     for line in lines:
-        payload.append((entry_no, entry_date, description, line['account_id'], line.get('debit', 0), line.get('credit', 0), ref_type, ref_id, created_by))
-    exec_sql('''
-        INSERT INTO journal_entries(entry_no, entry_date, description, account_id, debit, credit, ref_type, ref_id, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', payload, many=True)
+        account_id = line.get('account_id')
+        debit = round(max(0.0, parse_float(line.get('debit', 0))), 2)
+        credit = round(max(0.0, parse_float(line.get('credit', 0))), 2)
+        if not account_id or not q_one('SELECT id FROM accounts WHERE id=?', [account_id]):
+            raise ValueError('Akun jurnal tidak valid atau belum tersedia.')
+        if debit > 0 and credit > 0:
+            raise ValueError('Satu baris jurnal tidak boleh berisi debit dan kredit sekaligus.')
+        if debit == 0 and credit == 0:
+            continue
+        clean.append((int(account_id), debit, credit))
+        total_debit += debit; total_credit += credit
+    if len(clean) < 2:
+        raise ValueError('Jurnal tidak memiliki baris bernilai yang cukup.')
+    if abs(total_debit - total_credit) > 0.01:
+        raise ValueError(f'Jurnal tidak seimbang: debit {total_debit:.2f}, kredit {total_credit:.2f}.')
+    entry_no = f"JU-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+    conn = get_conn()
+    try:
+        cur = conn.cursor(); cur.execute('BEGIN IMMEDIATE')
+        cur.executemany('''INSERT INTO journal_entries(entry_no,entry_date,description,account_id,debit,credit,ref_type,ref_id,created_by)
+                           VALUES(?,?,?,?,?,?,?,?,?)''',
+                        [(entry_no, entry_date, description, aid, debit, credit, ref_type, ref_id, created_by) for aid,debit,credit in clean])
+        conn.commit()
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
     return entry_no
 
 def reverse_journal(entry_date, description, original_ref_type, original_ref_id, created_by=None):
@@ -480,6 +583,7 @@ def init_db():
     add_column_if_not_exists('users', 'branch_id', 'INTEGER')
     add_column_if_not_exists('users', 'supplier_id', 'INTEGER')
     add_column_if_not_exists('users', 'profile_photo', 'TEXT')
+    add_column_if_not_exists('sales', 'branch_id', 'INTEGER')
     
     add_column_if_not_exists('quick_cashier_items', 'stock_branch_id', 'INTEGER')
     
@@ -1574,6 +1678,8 @@ def role_home_redirect(user=None):
         return redirect(url_for('settings'))
     if role == 'admin':
         return redirect(url_for('admin_command_center'))
+    if role == 'manager':
+        return redirect(url_for('manager_dashboard'))
     return redirect(url_for('dashboard'))
 
 def role_required(*roles):
@@ -3391,6 +3497,10 @@ body.smartphone-v5:not(.page-login) .credit-detail-page .table-wrap table{min-wi
 @media(max-width:390px){.ap-live span{font-size:7px}.ap-score{display:none}.ap-overview strong{font-size:17px}.ap-flow-grid{grid-template-columns:1fr}.ap-metrics article{flex-basis:205px}.ap-quick b{font-size:8px}}
 @media(prefers-reduced-motion:no-preference){.ap-hero{animation:apEnter .48s ease both}.ap-metrics,.ap-flow,.ap-lower{animation:apEnter .42s ease both}.ap-flow{animation-delay:.06s}.ap-lower{animation-delay:.12s}.ap-quick a,.ap-flow-grid a,.ap-metrics article{transition:transform .18s ease,box-shadow .18s ease}.ap-quick a:active,.ap-flow-grid a:active,.ap-metrics article:active{transform:scale(.97)}@keyframes apEnter{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}}
 
+/* User identity editor V27.6 */
+.profile-name-form{position:relative}.profile-name-summary{grid-column:1/-1;display:grid;gap:3px;padding:14px 16px;border:1px solid #dfe8e2;border-radius:16px;background:linear-gradient(145deg,#f8fbf9,#edf7f1)}.profile-name-summary span{color:#6c7c73;font-size:8px;font-weight:900;letter-spacing:.1em;text-transform:uppercase}.profile-name-summary b{font-size:15px;color:#10231a}.profile-name-summary small{color:#126b4a;font-size:10px}.profile-identity-section .field-note{display:block;margin-top:5px;color:#748279;font-size:8px;line-height:1.45}
+@media(max-width:768px){body.smartphone-v5.page-settings .profile-name-form{grid-template-columns:1fr!important}body.smartphone-v5.page-settings .profile-name-summary{grid-column:1!important;border-radius:15px!important}body.smartphone-v5.page-settings .profile-identity-section input{text-transform:none!important}}
+
 '''
 
 # PROFESSIONAL_UI_FINAL - total redesign retained with corrected system flows
@@ -3471,6 +3581,16 @@ def mobile_app_menu(user, active_url=''):
         add('△', 'Laporan SHU', '/shu/report')
         add('▧', 'Akuntansi', '/accounting')
         add('⚙', 'Pengaturan', '/settings')
+    elif role == 'manager':
+        add('⌂','Executive Monitor','/manager/dashboard')
+        add('⌖','Peta Semua Cabang','/maps')
+        add('▥','Analitik Laporan','/reports')
+        add('◷','Riwayat Penjualan','/sales-history')
+        add('□','Stok Cabang','/manager/inventory')
+        add('≡','Ledger Stok','/stock-history')
+        add('▤','Keuangan Cabang','/manager/finance')
+        add('⇄','Flow Data','/manager/flow')
+        add('⚙','Pengaturan','/settings')
     elif role == 'supervisor':
         add('⌂', 'Dashboard', '/')
         add('▥', 'Laporan', '/reports')
@@ -3553,6 +3673,24 @@ def mobile_app_menu(user, active_url=''):
         add('⚙', 'Pengaturan', '/settings')
     
     return items
+
+CSS_DESIGN += r'''
+/* Stock movement workspace, final namespaced layer */
+.movement-shell{display:grid;gap:14px;max-width:none!important}.movement-header{display:flex;justify-content:space-between;gap:24px;align-items:flex-end;padding:24px;border:1px solid #dfe7e2;border-radius:16px;background:linear-gradient(135deg,#fff,#f1f8f4)}.movement-kicker{display:block;color:#176b4b;font-size:8px;font-weight:900;letter-spacing:.16em}.movement-header h2{margin:5px 0 3px;font-size:24px;letter-spacing:-.04em}.movement-header p,.movement-panel-head p{margin:0;color:#718078;font-size:10px}.movement-header-meta{display:grid;grid-template-columns:auto auto;gap:3px 12px;align-items:center}.movement-header-meta span{color:#718078;font-size:8px;text-transform:uppercase;font-weight:850}.movement-header-meta b{font-size:12px}.movement-header-meta .btn{grid-column:1/-1;margin-top:7px}.movement-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.movement-kpis>div{padding:15px 17px;border:1px solid #dfe7e2;border-radius:12px;background:#fff}.movement-kpis span{display:block;color:#718078;font-size:8px;font-weight:850;text-transform:uppercase}.movement-kpis b{display:block;margin-top:7px;font-size:20px;font-variant-numeric:tabular-nums}.movement-panel{padding:0;border:1px solid #dfe7e2;border-radius:15px;background:#fff;overflow:hidden;box-shadow:0 4px 15px rgba(15,45,34,.035)}.movement-panel-head{display:flex;justify-content:space-between;gap:16px;align-items:center;padding:17px 19px;border-bottom:1px solid #e7ede9}.movement-panel-head h3{margin:4px 0 2px;font-size:15px}.movement-entry form{padding:18px 19px}.movement-header-fields{display:grid;grid-template-columns:260px minmax(0,1fr);gap:12px;padding:14px;border-radius:12px;background:#f5f8f6}.movement-header-fields .form-group{margin:0!important}.movement-items{margin-top:16px;border:1px solid #dfe7e2;border-radius:12px;overflow:hidden}.movement-items-head{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:13px 15px;background:#fbfcfb}.movement-items-head b,.movement-items-head span{display:block}.movement-items-head span{margin-top:2px;color:#7b8981;font-size:8px}.movement-table-wrap{overflow:auto}.movement-entry-table{min-width:960px;width:100%}.movement-entry-table th{top:0}.movement-entry-table td{vertical-align:middle!important}.movement-entry-table .row-number{width:38px;color:#7b8981;font-weight:900;text-align:center}.movement-entry-table select{min-width:300px}.stock-display b,.stock-display small{display:block}.stock-display small{color:#8a968f;font-size:8px}.qty-control{display:flex;align-items:center;min-width:150px;border:1px solid #ccd8d0;border-radius:10px;overflow:hidden;background:#fff}.qty-control input{min-width:90px;border:0!important;box-shadow:none!important}.qty-control span{padding:0 10px;color:#718078;font-size:8px}.cost-input{min-width:135px}.row-subtotal{min-width:110px;text-align:right;font-weight:800;color:#176b4b}.remove-row{width:34px!important;padding:0!important;color:#a23f49!important}.movement-summary{display:flex;justify-content:flex-end;gap:20px;padding:12px 15px;border-top:1px solid #e7ede9;background:#f8faf9;color:#718078;font-size:9px}.movement-summary b{margin-left:5px;color:#21372e}.movement-form-actions{display:flex;justify-content:space-between;gap:18px;align-items:center;padding-top:16px}.movement-filters{display:flex;gap:7px;align-items:center}.movement-filters input{width:230px}.movement-filters select{width:140px}.movement-history{max-height:62vh;overflow:auto}.movement-history table{min-width:980px}.movement-history th{top:0}.movement-history td b,.movement-history td small{display:block}.movement-history td small{margin-top:3px;color:#849189;font-size:8px}.movement-trx{display:inline-flex;padding:5px 8px;border-radius:7px;background:#edf7f1;color:#176b4b;font:800 9px ui-monospace,SFMono-Regular,monospace;text-decoration:none}.movement-status{display:inline-flex;padding:5px 8px;border-radius:999px;font-size:8px;font-weight:900}.movement-status.in{background:#e9f7f0;color:#087557}.movement-status.out{background:#fff0f1;color:#a53643}.movement-status.adjust{background:#fff6dc;color:#8a6416}.movement-empty{padding:34px!important;text-align:center;color:#7b8981}.movement-row{animation:movementRowIn .16s ease}@keyframes movementRowIn{from{opacity:0;transform:translateY(-5px)}to{opacity:1;transform:none}}
+@media(max-width:900px){.movement-header{align-items:flex-start;flex-direction:column}.movement-header-meta{width:100%}.movement-header-fields{grid-template-columns:1fr}.movement-kpis{grid-template-columns:repeat(2,1fr)}.movement-panel-head{align-items:flex-start;flex-direction:column}.movement-filters{width:100%;display:grid;grid-template-columns:1fr 1fr}.movement-filters input,.movement-filters select{width:100%}.movement-form-actions{align-items:stretch;flex-direction:column}.movement-form-actions button{width:100%}}
+@media(max-width:768px){.movement-shell{padding:0 12px}.movement-header{padding:17px;border-radius:18px}.movement-header h2{font-size:21px}.movement-kpis>div{padding:13px}.movement-entry form{padding:14px}.movement-items-head{align-items:flex-start;flex-direction:column}.movement-items-head button{width:100%}.movement-table-wrap{margin:0}.movement-summary{justify-content:flex-start;flex-wrap:wrap}.movement-filters{grid-template-columns:1fr}.movement-panel{border-radius:18px}.movement-history{max-height:none}.movement-entry-table input,.movement-entry-table select{font-size:16px!important}}
+'''
+CSS_DESIGN += r'''
+
+/* Inventory stock workspace redesign: aligned with navy, orange, blue enterprise theme */
+.stock-workspace{--stock-navy:#101828;--stock-blue:#2457d6;--stock-orange:#e35d34;--stock-green:#087e6a;--stock-red:#b42335;--stock-bg:#eef1f4;--stock-soft:#f7f8fa;--stock-line:#d0d5dd;display:grid;gap:16px}
+.stock-hero{position:relative;display:flex;justify-content:space-between;align-items:flex-end;gap:28px;overflow:hidden;padding:26px 28px;border-radius:14px;background:linear-gradient(125deg,#101828,#213b59);color:#fff;box-shadow:0 12px 30px rgba(16,24,40,.14)}
+.stock-hero:after{content:'';position:absolute;right:-64px;top:-92px;width:230px;height:230px;border:42px solid rgba(227,93,52,.19);border-radius:50%}.stock-hero>div{position:relative;z-index:1}.stock-eyebrow{display:block;margin-bottom:6px;color:#f4a184;font-size:9px;font-weight:900;letter-spacing:.17em}.stock-hero h2{margin:0 0 7px;color:#fff;font-size:26px;letter-spacing:-.04em}.stock-hero p{max-width:720px;color:#c5cfdb;font-size:11px}.stock-location{min-width:210px;padding:13px 15px;border:1px solid rgba(255,255,255,.13);border-radius:10px;background:rgba(255,255,255,.07)}.stock-location span,.stock-location b{display:block}.stock-location span{color:#aebbc9;font-size:8px;font-weight:800;text-transform:uppercase;letter-spacing:.1em}.stock-location b{margin:4px 0 10px;font-size:13px}.stock-location .btn{width:100%;background:#fff!important;color:#1c2c40!important;border:0!important}
+.movement-shell{display:grid;gap:14px;max-width:none!important}.movement-header{display:flex;justify-content:space-between;gap:24px;align-items:flex-end;padding:25px 27px;border:0;border-radius:14px;background:linear-gradient(125deg,#101828,#213b59);color:#fff;box-shadow:0 12px 30px rgba(16,24,40,.14)}.movement-header:after{content:'';position:absolute;right:-60px;top:-90px;width:220px;height:220px;border:40px solid rgba(227,93,52,.18);border-radius:50%}.movement-header{position:relative;overflow:hidden}.movement-header>div{position:relative;z-index:1}.movement-kicker{color:#e35d34}.movement-header .movement-kicker{color:#f4a184}.movement-header h2{color:#fff}.movement-header p{color:#c5cfdb}.movement-header-meta span{color:#aebbc9}.movement-header-meta b{color:#fff}.movement-header-meta .btn{background:#fff!important;color:#1c2c40!important;border:0!important}.movement-kpis>div{border-color:#d0d5dd;border-radius:10px}.movement-kpis>div:nth-child(1){border-top:3px solid #2457d6}.movement-kpis>div:nth-child(2){border-top:3px solid #e35d34}.movement-kpis>div:nth-child(3){border-top:3px solid #087e6a}.movement-kpis>div:nth-child(4){border-top:3px solid #b42335}.movement-panel{border-color:#d0d5dd;border-radius:11px;box-shadow:0 2px 8px rgba(16,24,40,.035)}.movement-panel-head{border-color:#e4e7ec;background:#fff}.movement-header-fields{background:#f5f7fa;border:1px solid #e4e7ec}.movement-items{border-color:#d0d5dd;border-radius:10px}.movement-items-head{background:#f8f9fb}.movement-summary{background:#f5f7fa;border-color:#e4e7ec}.row-subtotal,.movement-trx{color:#2457d6}.movement-trx{background:#eef4ff}.qty-control{border-color:#d0d5dd}.movement-form-actions #postMovement{background:#e35d34!important}.movement-form-actions #postMovement:hover{background:#c94d26!important}
+.transfer-layout{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:16px}.transfer-card,.transfer-side{padding:0!important;overflow:hidden}.transfer-card-head,.transfer-side-head{padding:19px 21px;border-bottom:1px solid #e4e7ec}.transfer-card-head h3,.transfer-side-head h3{margin:4px 0 3px}.transfer-card-head p,.transfer-side-head p{color:#667085;font-size:10px}.transfer-form{padding:21px}.transfer-product{margin-bottom:16px}.transfer-route{display:grid;grid-template-columns:minmax(0,1fr) 54px minmax(0,1fr);gap:12px;align-items:end}.transfer-swap{display:grid;place-items:center;width:42px;height:42px;margin:0 auto 15px;padding:0;border:1px solid #d0d5dd!important;border-radius:50%!important;background:#fff!important;color:#2457d6!important;font-size:17px!important}.transfer-swap:hover{background:#eef4ff!important}.transfer-node{padding:14px;border:1px solid #d0d5dd;border-radius:11px;background:#f8f9fb}.transfer-node.origin{border-top:3px solid #e35d34}.transfer-node.target{border-top:3px solid #087e6a}.transfer-stock{display:flex;justify-content:space-between;gap:10px;margin-top:9px;padding-top:9px;border-top:1px dashed #d0d5dd;color:#667085;font-size:10px}.transfer-stock b{color:#101828;font-size:12px}.transfer-qty-row{display:grid;grid-template-columns:minmax(0,240px) minmax(0,1fr);gap:14px;margin-top:16px;align-items:end}.transfer-preview{padding:13px 15px;border:1px solid #c8d8f1;border-radius:10px;background:#eef4ff;color:#244d84;font-size:10px}.transfer-preview b{display:block;margin-top:3px;color:#101828;font-size:13px}.transfer-actions{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-top:18px;padding-top:17px;border-top:1px solid #e4e7ec}.transfer-actions button{min-width:180px;background:#e35d34!important}.transfer-actions button:hover{background:#c94d26!important}.transfer-note{color:#667085;font-size:10px}.transfer-guide{padding:17px 20px}.transfer-guide ol{margin:0;padding-left:18px;color:#667085;font-size:11px}.transfer-guide li{margin:8px 0;padding-left:3px}.transfer-recent{padding:0 20px 18px}.transfer-recent-item{display:grid;grid-template-columns:35px minmax(0,1fr);gap:10px;padding:12px 0;border-bottom:1px solid #edf0f3}.transfer-recent-item:last-child{border-bottom:0}.transfer-recent-icon{display:grid;place-items:center;width:34px;height:34px;border-radius:9px;background:#eef4ff;color:#2457d6}.transfer-recent-item b,.transfer-recent-item small{display:block}.transfer-recent-item b{font-size:11px}.transfer-recent-item small{margin-top:2px;color:#667085;font-size:9px}.transfer-empty{padding:20px;color:#667085;text-align:center;font-size:10px}
+@media(max-width:900px){.transfer-layout{grid-template-columns:1fr}.transfer-route{grid-template-columns:1fr}.transfer-swap{margin:0 auto;transform:rotate(90deg)}.transfer-qty-row{grid-template-columns:1fr}.stock-hero{align-items:flex-start;flex-direction:column}.stock-location{width:100%}}
+@media(max-width:768px){.stock-workspace{padding:0 12px}.stock-hero{padding:20px;border-radius:20px}.stock-hero h2{font-size:22px}.movement-header{margin:0!important;padding:20px;border-radius:20px}.movement-shell{padding:0 12px}.movement-kpis{padding:0!important}.movement-panel{margin:0!important;border-radius:18px}.movement-panel-head{padding:15px}.movement-entry form{padding:14px}.transfer-layout{gap:12px}.transfer-card,.transfer-side{margin:0!important;border-radius:18px!important}.transfer-form{padding:15px}.transfer-route{gap:10px}.transfer-node{padding:12px}.transfer-actions{align-items:stretch;flex-direction:column}.transfer-actions button{width:100%}.movement-filters{grid-template-columns:1fr}}
+'''
 
 def mobile_bottom_navigation(user, active_path=''):
     """Five useful mobile tabs. The full role menu remains available from Aplikasi."""
@@ -3668,22 +3806,25 @@ def render_page(title, body, **ctx):
                 ('logout', url_for('logout'), '🚪', 'Keluar'),
             ])
         elif role == 'bendahara':
-            nav_html += _sidebar_section('Beranda', '🏠', [
-                ('dashboard', url_for('dashboard'), '🏠', 'Dashboard'),
+            nav_html += _sidebar_section('Ringkasan', '▦', [
+                ('dashboard', url_for('dashboard'), '⌂', 'Dashboard Operasional'),
+                ('financial_statements', url_for('financial_statements'), '▥', 'Dashboard Keuangan'),
+                ('reports', url_for('reports'), '▤', 'Pusat Laporan'),
+            ], default_open=True)
+            nav_html += _sidebar_section('Dana Anggota', '◉', [
+                ('savings', url_for('savings'), '◉', 'Simpanan Anggota'),
+                ('loans', url_for('loans'), '◇', 'Daftar Pinjaman'),
+                ('loan_types', url_for('loan_types'), '◆', 'Produk Kredit'),
+                ('verify_loan_payments', url_for('verify_loan_payments'), '✓', 'Verifikasi Angsuran'),
+                ('shu_report', url_for('shu_report'), '△', 'Laporan SHU'),
             ])
-            nav_html += _sidebar_section('Pinjaman', '📋', [
-                ('loans', url_for('loans'), '📋', 'Daftar Pinjaman'),
-                ('loan_types', url_for('loan_types'), '🎯', 'Produk Kredit'),
-                ('verify_loan_payments', url_for('verify_loan_payments'), '✅', 'Verifikasi Angsuran'),
+            nav_html += _sidebar_section('Akuntansi & Kontrol', '▧', [
+                ('accounting', url_for('accounting'), '▧', 'Jurnal & Daftar Akun'),
+                ('payment_accounts', url_for('payment_accounts'), '▣', 'Rekening Pembayaran'),
             ])
-            nav_html += _sidebar_section('Laporan', '📊', [
-                ('reports', url_for('reports'), '📊', 'Laporan'),
-                ('shu_report', url_for('shu_report'), '📈', 'SHU'),
-            ])
-            nav_html += _sidebar_section('Sistem', '⚙️', [
-                ('tutorial', url_for('tutorial'), '📖', 'Panduan'),
-                ('settings', url_for('settings'), '⚙️', 'Pengaturan'),
-                ('logout', url_for('logout'), '🚪', 'Keluar'),
+            nav_html += _sidebar_section('Bantuan & Sistem', '⚙', [
+                ('tutorial', url_for('tutorial'), '?', 'Panduan Penggunaan'),
+                ('settings', url_for('settings'), '⚙', 'Pengaturan'),
             ])
         elif role == 'supplier':
             nav_html += _sidebar_section('Supplier', 'SUP', [
@@ -3704,63 +3845,85 @@ def render_page(title, body, **ctx):
                 ('logout', url_for('logout'), '🚪', 'Keluar'),
             ])
         elif role == 'admin':
-            nav_html += _sidebar_section('Utama', '◆', [
-                ('admin_command_center', url_for('admin_command_center'), '⌁', 'Command Center'),
-                ('dashboard', url_for('dashboard',view='analytics'), '⌁', 'Analitik'),
+            nav_html += _sidebar_section('Dashboard', '▦', [
+                ('admin_command_center', url_for('admin_command_center'), '⌂', 'Command Center'),
+                ('dashboard', url_for('dashboard',view='analytics'), '▦', 'Analitik Operasional'),
+                ('financial_statements', url_for('financial_statements'), '▥', 'Dashboard Keuangan'),
+            ], default_open=True)
+            nav_html += _sidebar_section('Kasir & Penjualan', '▣', [
                 ('quick_cashier', url_for('quick_cashier'), '⚡', 'Kasir Cepat'),
                 ('cashier', url_for('cashier'), '▣', 'Kasir'),
                 ('quick_cashier_queue', url_for('quick_cashier_queue'), '✓', 'Verifikasi Transaksi'),
-            ], default_open=True)
-            nav_html += _sidebar_section('Penjualan', '▦', [
                 ('sales_history', url_for('sales_history'), '◷', 'Riwayat Penjualan'),
                 ('sales_returns', url_for('sales_returns'), '↶', 'Retur Penjualan'),
-                ('daily_report', url_for('daily_report'), '◫', 'Laporan Harian'),
+                ('daily_report', url_for('daily_report'), '▤', 'Laporan Harian'),
             ])
-            nav_html += _sidebar_section('E-Wallet', '◎', [
-                ('ewallet_dashboard', url_for('ewallet_dashboard'), '⌂', 'Control Center'),
+            nav_html += _sidebar_section('Kas, Wallet & Bank', '◎', [
+                ('ewallet_dashboard', url_for('ewallet_dashboard'), '◎', 'Control Center Wallet'),
                 ('topup_approval', url_for('topup_approval'), '✓', 'Approval Topup'),
                 ('ewallet_accounts', url_for('ewallet_accounts'), '◉', 'Direktori Wallet'),
-                ('ewallet_ledger', url_for('ewallet_ledger'), '≡', 'Ledger Transaksi'),
-                ('ewallet_security', url_for('ewallet_security'), '◇', 'Keamanan & Risiko'),
-                ('payment_accounts', url_for('payment_accounts'), '▤', 'Rekening Pembayaran'),
+                ('ewallet_ledger', url_for('ewallet_ledger'), '≡', 'Ledger Wallet'),
+                ('ewallet_security', url_for('ewallet_security'), '◇', 'Keamanan Wallet'),
+                ('payment_accounts', url_for('payment_accounts'), '▣', 'Rekening Pembayaran'),
                 ('ewallet_adjustment', url_for('ewallet_adjustment'), '±', 'Penyesuaian Saldo'),
             ])
-            nav_html += _sidebar_section('Inventori', '◈', [
+            nav_html += _sidebar_section('Persediaan', '□', [
                 ('products', url_for('products'), '□', 'Barang & Stok'),
                 ('stock_movements', url_for('stock_movements'), '⇅', 'Mutasi Stok'),
                 ('stock_transfer', url_for('stock_transfer'), '⇄', 'Transfer Stok'),
                 ('stock_history', url_for('stock_history'), '◷', 'Riwayat Stok'),
                 ('stock_opname', url_for('stock_opname_list'), '✓', 'Stock Opname'),
-                ('purchase_orders', url_for('purchase_orders'), '+', 'Pembelian'),
-                ('purchase_order_history', url_for('purchase_order_history'), 'H', 'History Order'),
-                ('suppliers', url_for('suppliers'), '◇', 'Supplier'),
-                ('supplier_payments', url_for('supplier_payments'), '−', 'Hutang Supplier'),
-                ('categories', url_for('categories'), '⌑', 'Kategori'),
+                ('categories', url_for('categories'), '⌑', 'Kategori Barang'),
                 ('maps', url_for('maps'), '⌖', 'Peta Stok'),
             ])
-            nav_html += _sidebar_section('Anggota & Dana', '◉', [
-                ('members', url_for('members'), '◎', 'Data Anggota'),
-                ('member_import', url_for('import_members'), '⇧', 'Import Anggota'),
-                ('savings', url_for('savings'), '●', 'Simpanan'),
-                ('loans', url_for('loans'), '▤', 'Pinjaman'),
-                ('loan_types', url_for('loan_types'), '⌘', 'Produk Kredit'),
-                ('verify_loan_payments', url_for('verify_loan_payments'), '✓', 'Verifikasi Angsuran'),
-                ('user_approval', url_for('user_approval'), '+', 'Approval Pengguna'),
+            nav_html += _sidebar_section('Pembelian & Supplier', '◇', [
+                ('purchase_orders', url_for('purchase_orders'), '+', 'Pembelian / PO'),
+                ('purchase_order_history', url_for('purchase_order_history'), '◷', 'Riwayat Order'),
+                ('suppliers', url_for('suppliers'), '◇', 'Master Supplier'),
+                ('supplier_payments', url_for('supplier_payments'), '−', 'Pembayaran Supplier'),
             ])
-            nav_html += _sidebar_section('Laporan & Sistem', '▥', [
-                ('innovation_center', url_for('innovation_center'), '◆', 'Pusat Inovasi'),
-                ('operations_plus', url_for('operations_plus'), '▦', 'Pusat Tata Kelola'),
+            nav_html += _sidebar_section('Anggota, Simpanan & Kredit', '◉', [
+                ('members', url_for('members'), '♙', 'Data Anggota'),
+                ('member_import', url_for('import_members'), '⇧', 'Import Anggota'),
+                ('savings', url_for('savings'), '◉', 'Simpanan'),
+                ('loans', url_for('loans'), '◇', 'Pinjaman'),
+                ('loan_types', url_for('loan_types'), '◆', 'Produk Kredit'),
+                ('verify_loan_payments', url_for('verify_loan_payments'), '✓', 'Verifikasi Angsuran'),
                 ('credit_control', url_for('credit_control'), '◈', 'Kontrol Risiko Kredit'),
-                ('reports', url_for('reports'), '▥', 'Pusat Laporan'),
-                ('financial_statements', url_for('financial_statements'), '▧', 'Laporan Keuangan'),
+            ])
+            nav_html += _sidebar_section('Akuntansi & Laporan', '▧', [
+                ('accounting', url_for('accounting'), '▧', 'Jurnal & Daftar Akun'),
+                ('reports', url_for('reports'), '▤', 'Pusat Laporan'),
                 ('shu_report', url_for('shu_report'), '△', 'Laporan SHU'),
-                ('accounting', url_for('accounting'), '≡', 'Akuntansi'),
                 ('audit', url_for('audit'), '⌕', 'Jejak Audit'),
-                ('users', url_for('users'), '⚙', 'Pengguna & Role'),
+            ])
+            nav_html += _sidebar_section('Administrasi Sistem', '⚙', [
+                ('user_approval', url_for('user_approval'), '✓', 'Approval Pengguna'),
+                ('users', url_for('users'), '♟', 'Pengguna & Role'),
                 ('admin_branches', url_for('admin_branches'), '⌂', 'Cabang'),
+                ('operations_plus', url_for('operations_plus'), '▦', 'Pusat Tata Kelola'),
+                ('innovation_center', url_for('innovation_center'), '◆', 'Pusat Inovasi'),
                 ('settings', url_for('settings'), '⚙', 'Pengaturan'),
                 ('tutorial', url_for('tutorial'), '?', 'Panduan'),
-                ('logout', url_for('logout'), '↪', 'Keluar'),
+            ])
+        elif role == 'manager':
+            nav_html += _sidebar_section('Executive Monitor','◇',[
+                ('manager_dashboard',url_for('manager_dashboard'),'⌂','Executive Dashboard'),
+                ('maps',url_for('maps'),'⌖','Peta Semua Cabang'),
+            ],default_open=True)
+            nav_html += _sidebar_section('Keuangan & Analitik','▥',[
+                ('manager_finance',url_for('manager_finance'),'▤','Keuangan per Cabang'),
+                ('reports',url_for('reports'),'▥','Analitik Laporan'),
+                ('sales_history',url_for('sales_history'),'◷','Riwayat Penjualan'),
+            ],default_open=True)
+            nav_html += _sidebar_section('Persediaan & Flow','□',[
+                ('manager_inventory',url_for('manager_inventory'),'□','Stok Semua Cabang'),
+                ('stock_history',url_for('stock_history'),'≡','Ledger Stok'),
+                ('manager_flow',url_for('manager_flow'),'⇄','Flow Data'),
+            ],default_open=True)
+            nav_html += _sidebar_section('Sistem','⚙',[
+                ('settings',url_for('settings'),'⚙','Pengaturan'),
+                ('logout',url_for('logout'),'↪','Keluar'),
             ])
         elif role == 'branch_admin':
             nav_html += _sidebar_section('Beranda', '🏠', [
@@ -3794,10 +3957,10 @@ def render_page(title, body, **ctx):
                 ('financial_statements', url_for('financial_statements'), '📒', 'Laba Rugi & Neraca'),
                 ('shu_report', url_for('shu_report'), '📈', 'Laporan SHU'),
             ])
-            nav_html += _sidebar_section('Sistem', '⚙️', [
+            nav_html += _sidebar_section('Sistem', '⚙', [
                 ('admin_branches', url_for('admin_branches'), '🏢', 'Kelola Cabang'),
                 ('tutorial', url_for('tutorial'), '📖', 'Panduan'),
-                ('settings', url_for('settings'), '⚙️', 'Pengaturan'),
+                ('settings', url_for('settings'), '⚙', 'Pengaturan'),
                 ('logout', url_for('logout'), '🚪', 'Keluar'),
             ])
         nav_html = ''.join(nav_html.splitlines())  # ensure no broken pipe
@@ -4375,6 +4538,15 @@ def render_page(title, body, **ctx):
         mobile_grid = ''.join(grid_parts)
     return render_template_string(base, title=title, body=body, app_title=display_title, app_short=display_short, ui_density=ui_density, notification_seconds=notification_seconds, user=user, q_one=q_one, notif_count=notif_count, nav_html=nav_html, mobile_grid=mobile_grid, mobile_tabs=mobile_tabs, is_menu_visible=is_menu_visible, now=lambda: datetime.now, **ctx)
 
+@app.errorhandler(sqlite3.ProgrammingError)
+def handle_sqlite_programming_error(err):
+    message=str(err)
+    app.logger.exception('SQLite ProgrammingError: %s',message)
+    if 'bindings supplied' in message or 'binding' in message.lower():
+        flash('Terjadi ketidaksesuaian parameter database pada halaman ini. Detail sudah dicatat di log server.','error')
+        return redirect(request.referrer or url_for('dashboard'))
+    return ('Database programming error',500)
+
 # =========================
 # Login Page - Fresh & Clean (Split Layout)
 # =========================
@@ -4720,7 +4892,7 @@ def shu_report():
             note = request.form.get('note','').strip()
             status = request.form.get('status','DRAFT')
             exec_sql('''INSERT INTO shu_periods(year,start_date,end_date,net_profit_snapshot,distributable_profit,reserve_percent,savings_weight,shopping_weight,loan_weight,status,note,created_by,updated_by,updated_at)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         ON CONFLICT(year) DO UPDATE SET start_date=excluded.start_date,end_date=excluded.end_date,net_profit_snapshot=excluded.net_profit_snapshot,distributable_profit=excluded.distributable_profit,reserve_percent=excluded.reserve_percent,savings_weight=excluded.savings_weight,shopping_weight=excluded.shopping_weight,loan_weight=excluded.loan_weight,status=excluded.status,note=excluded.note,updated_by=excluded.updated_by,updated_at=excluded.updated_at''',
                      [year,start_date,end_date,net,distributable,reserve_percent,sw,bw,lw,status,note,session.get('user_id'),session.get('user_id'),now_str()])
             flash('Setting periode SHU berhasil disimpan.', 'success')
@@ -5346,62 +5518,48 @@ def dashboard():
         return role_home_redirect(user)
     if user and user['role']=='admin' and request.args.get('view')!='analytics':
         return redirect(url_for('admin_command_center'))
-    m_count = q_one('SELECT COUNT(*) as n FROM members')['n']
-    p_count = q_one('SELECT COUNT(*) as n FROM products')['n']
-    sale_today = q_one('SELECT COALESCE(SUM(total),0) as x FROM sales WHERE trx_date=? AND status="Posted"', [today_str()])['x']
-    savings_total = q_one("SELECT COALESCE(SUM(CASE WHEN direction='Masuk' THEN amount ELSE -amount END),0) as x FROM savings_transactions")['x']
-    pending_approval = q_one("SELECT COUNT(*) as n FROM approval_requests WHERE status='Pending'")['n']
-    pending_users = q_one("SELECT COUNT(*) as n FROM users WHERE status='PENDING_APPROVAL'")['n']
-    loan_outstanding = q_one('''SELECT COALESCE(SUM(l.total_receivable - COALESCE(p.paid,0)),0) as x FROM loans l LEFT JOIN (SELECT loan_id, SUM(amount) as paid FROM loan_payments GROUP BY loan_id) p ON p.loan_id=l.id WHERE l.status IN ('Berjalan','Menunggu Approval')''')['x']
-    # --- New dashboard metrics ---
-    now = datetime.now()
-    cur_month = now.strftime('%Y-%m')
-    prev_month_dt = (now.replace(day=1) - timedelta(days=1))
-    prev_month = prev_month_dt.strftime('%Y-%m')
-    sale_month = q_one('SELECT COALESCE(SUM(total),0) as x FROM sales WHERE substr(trx_date,1,7)=? AND status="Posted"', [cur_month])['x']
-    sale_prev_month = q_one('SELECT COALESCE(SUM(total),0) as x FROM sales WHERE substr(trx_date,1,7)=? AND status="Posted"', [prev_month])['x']
-    active_loan_count = q_one("SELECT COUNT(*) as n FROM loans WHERE status='Berjalan'")['n']
-    angsuran_month = q_one('SELECT COALESCE(SUM(amount),0) as x FROM loan_payments lp JOIN loans l ON l.id=lp.loan_id WHERE lp.status="VERIFIED" AND substr(lp.payment_date,1,7)=?', [cur_month])['x']
-    low_stock_count = q_one('SELECT COUNT(*) as n FROM products WHERE active=1 AND stock<=min_stock')['n']
-    profit_month = q_one("SELECT COALESCE(SUM(credit)-SUM(debit),0) as x FROM journal_entries j JOIN accounts a ON a.id=j.account_id WHERE a.category='Pendapatan' AND substr(j.entry_date,1,7)=?", [cur_month])['x']
-    expense_month = q_one("SELECT COALESCE(SUM(debit)-SUM(credit),0) as x FROM journal_entries j JOIN accounts a ON a.id=j.account_id WHERE a.category='Beban' AND substr(j.entry_date,1,7)=?", [cur_month])['x']
-    # --- Charts ---
-    sales_month = q_all("SELECT substr(trx_date,1,7) as m, COALESCE(SUM(total),0) as total FROM sales WHERE status='Posted' GROUP BY substr(trx_date,1,7) ORDER BY m DESC LIMIT 6")
-    savings_month = q_all("SELECT substr(trx_date,1,7) as m, COALESCE(SUM(CASE WHEN direction='Masuk' THEN amount ELSE -amount END),0) as total FROM savings_transactions GROUP BY substr(trx_date,1,7) ORDER BY m DESC LIMIT 6")
-    sales_chart = bar_chart_svg(list(reversed([(r['m'][5:7]+'/'+r['m'][:4], float(r['total'])) for r in sales_month])), 'Penjualan 6 Bulan', color='#2563eb')
-    savings_chart = bar_chart_svg(list(reversed([(r['m'][5:7]+'/'+r['m'][:4], float(r['total'])) for r in savings_month])), 'Simpanan 6 Bulan', color='#10b981')
-    # Loan vs payment grouped chart
-    loan_month = q_all("SELECT substr(loan_date,1,7) as m, COALESCE(SUM(total_receivable),0) as total FROM loans WHERE status IN ('Berjalan','Lunas') GROUP BY substr(loan_date,1,7) ORDER BY m DESC LIMIT 6")
-    payment_month = q_all("SELECT substr(payment_date,1,7) as m, COALESCE(SUM(amount),0) as total FROM loan_payments WHERE status='VERIFIED' GROUP BY substr(payment_date,1,7) ORDER BY m DESC LIMIT 6")
-    loan_labels = [(r['m'][5:7]+'/'+r['m'][:4], 0) for r in reversed(loan_month)] if loan_month else []
-    loan_chart = grouped_bar_chart_svg(
-        loan_labels if loan_labels else [('No Data', 0)],
-        [(r['m'][5:7]+'/'+r['m'][:4], float(r['total'])) for r in reversed(payment_month)],
-        'Pinjaman vs Angsuran', label_a='Diberikan', label_b='Diterima',
-        color_a='#f59e0b', color_b='#10b981'
-    )
-    # Top 5 products
-    top_products = q_all('''SELECT p.product_name, COALESCE(SUM(si.subtotal),0) as revenue
-        FROM sales_items si JOIN sales s ON s.id=si.sales_id JOIN products p ON p.id=si.product_id
-        WHERE s.status='Posted' AND substr(s.trx_date,1,7)=?
-        GROUP BY si.product_id ORDER BY revenue DESC LIMIT 5''', [cur_month])
-    top_products_chart = horizontal_bar_chart_svg(
-        [(r['product_name'][:12], float(r['revenue'])) for r in top_products],
-        f'Top 5 Produk {cur_month[5:]}/{cur_month[:4]}', colors=['#2563eb','#10b981','#f59e0b','#ef4444','#8b5cf6']
-    )
-    # Payment method chart
-    pay_method = q_all('''SELECT payment_method, COUNT(*) as cnt, COALESCE(SUM(total),0) as total
-        FROM sales WHERE status='Posted' AND substr(trx_date,1,7)=?
-        GROUP BY payment_method ORDER BY total DESC''', [cur_month])
-    pay_chart = horizontal_bar_chart_svg(
-        [(f"{r['payment_method']} ({r['cnt']})", float(r['total'])) for r in pay_method],
-        f'Komposisi Pembayaran {cur_month[5:]}/{cur_month[:4]}', colors=['#3b82f6','#8b5cf6','#f59e0b']
-    )
-    # Existing tables
-    low_stock = q_all('SELECT barcode, product_name, stock, min_stock FROM products WHERE active=1 AND stock<=min_stock ORDER BY stock ASC LIMIT 5')
-    recent = q_all('SELECT invoice_no, trx_date, total FROM sales WHERE status="Posted" ORDER BY id DESC LIMIT 5')
+    branch_id=get_branch_id(); branch_mode=is_branch_role(user); branch_name=get_branch_name(branch_id)
+    now=datetime.now(); cur_month=now.strftime('%Y-%m'); prev_month=(now.replace(day=1)-timedelta(days=1)).strftime('%Y-%m')
+    if branch_mode:
+        # Branch dashboard: only sales, users, stock and QC belonging to this branch.
+        sales_where='branch_id=?' if branch_id else 'branch_id IS NULL'; sales_params=[branch_id] if branch_id else []
+        stock=branch_stock_summary(branch_id)
+        m_count=q_one('SELECT COUNT(*) n FROM users WHERE branch_id=? AND active=1',[branch_id])['n'] if branch_id else q_one('SELECT COUNT(*) n FROM users WHERE branch_id IS NULL AND active=1')['n']
+        p_count=stock['product_count'] or 0; low_stock_count=stock['low_count'] or 0
+        sale_today=q_one(f'SELECT COALESCE(SUM(total),0) x FROM sales WHERE {sales_where} AND trx_date=? AND status="Posted"',sales_params+[today_str()])['x']
+        sale_month=q_one(f'SELECT COALESCE(SUM(total),0) x FROM sales WHERE {sales_where} AND substr(trx_date,1,7)=? AND status="Posted"',sales_params+[cur_month])['x']
+        sale_prev_month=q_one(f'SELECT COALESCE(SUM(total),0) x FROM sales WHERE {sales_where} AND substr(trx_date,1,7)=? AND status="Posted"',sales_params+[prev_month])['x']
+        pending_approval=0; pending_users=q_one('SELECT COUNT(*) n FROM users WHERE branch_id=? AND status="PENDING_APPROVAL"',[branch_id])['n'] if branch_id else 0
+        savings_total=0; loan_outstanding=0; active_loan_count=0; angsuran_month=0; profit_month=0; expense_month=0
+        sales_month=q_all(f'''SELECT substr(trx_date,1,7) m,COALESCE(SUM(total),0) total FROM sales WHERE {sales_where} AND status='Posted' GROUP BY substr(trx_date,1,7) ORDER BY m DESC LIMIT 6''',sales_params)
+        top_products=q_all(f'''SELECT p.product_name,COALESCE(SUM(si.subtotal),0) revenue FROM sales_items si JOIN sales s ON s.id=si.sales_id JOIN products p ON p.id=si.product_id WHERE {sales_where.replace('branch_id','s.branch_id')} AND s.status='Posted' AND substr(s.trx_date,1,7)=? GROUP BY si.product_id ORDER BY revenue DESC LIMIT 5''',sales_params+[cur_month])
+        pay_method=q_all(f'''SELECT payment_method,COUNT(*) cnt,COALESCE(SUM(total),0) total FROM sales WHERE {sales_where} AND status='Posted' AND substr(trx_date,1,7)=? GROUP BY payment_method ORDER BY total DESC''',sales_params+[cur_month])
+        recent=q_all(f'''SELECT invoice_no,trx_date,total FROM sales WHERE {sales_where} AND status='Posted' ORDER BY id DESC LIMIT 5''',sales_params)
+        if branch_id:
+            low_stock=q_all('''SELECT p.barcode,p.product_name,COALESCE(pbs.stock,0) stock,COALESCE(pbs.min_stock,p.min_stock,0) min_stock FROM products p LEFT JOIN product_branch_stock pbs ON pbs.product_id=p.id AND pbs.branch_id=? WHERE p.active=1 AND COALESCE(pbs.stock,0)<=COALESCE(pbs.min_stock,p.min_stock,0) ORDER BY stock LIMIT 5''',[branch_id])
+        else:
+            low_stock=q_all('SELECT barcode,product_name,stock,min_stock FROM products WHERE active=1 AND stock<=min_stock ORDER BY stock LIMIT 5')
+        savings_month=[]; loan_month=[]; payment_month=[]
+    else:
+        m_count=q_one('SELECT COUNT(*) n FROM members')['n']; p_count=q_one('SELECT COUNT(*) n FROM products')['n']
+        sale_today=q_one('SELECT COALESCE(SUM(total),0) x FROM sales WHERE trx_date=? AND status="Posted"',[today_str()])['x']
+        savings_total=q_one("SELECT COALESCE(SUM(CASE WHEN direction='Masuk' THEN amount ELSE -amount END),0) x FROM savings_transactions")['x']
+        pending_approval=q_one("SELECT COUNT(*) n FROM approval_requests WHERE status='Pending'")['n']; pending_users=q_one("SELECT COUNT(*) n FROM users WHERE status='PENDING_APPROVAL'")['n']
+        loan_outstanding=q_one('''SELECT COALESCE(SUM(l.total_receivable-COALESCE(p.paid,0)),0) x FROM loans l LEFT JOIN (SELECT loan_id,SUM(amount) paid FROM loan_payments GROUP BY loan_id)p ON p.loan_id=l.id WHERE l.status IN ('Berjalan','Menunggu Approval')''')['x']
+        sale_month=q_one('SELECT COALESCE(SUM(total),0) x FROM sales WHERE substr(trx_date,1,7)=? AND status="Posted"',[cur_month])['x']; sale_prev_month=q_one('SELECT COALESCE(SUM(total),0) x FROM sales WHERE substr(trx_date,1,7)=? AND status="Posted"',[prev_month])['x']
+        active_loan_count=q_one("SELECT COUNT(*) n FROM loans WHERE status='Berjalan'")['n']; angsuran_month=q_one('SELECT COALESCE(SUM(amount),0) x FROM loan_payments WHERE status="VERIFIED" AND substr(payment_date,1,7)=?',[cur_month])['x']
+        low_stock_count=q_one('SELECT COUNT(*) n FROM products WHERE active=1 AND stock<=min_stock')['n']; profit_month=q_one("SELECT COALESCE(SUM(credit)-SUM(debit),0) x FROM journal_entries j JOIN accounts a ON a.id=j.account_id WHERE a.category='Pendapatan' AND substr(j.entry_date,1,7)=?",[cur_month])['x']; expense_month=q_one("SELECT COALESCE(SUM(debit)-SUM(credit),0) x FROM journal_entries j JOIN accounts a ON a.id=j.account_id WHERE a.category='Beban' AND substr(j.entry_date,1,7)=?",[cur_month])['x']
+        sales_month=q_all("SELECT substr(trx_date,1,7)m,COALESCE(SUM(total),0)total FROM sales WHERE status='Posted' GROUP BY substr(trx_date,1,7) ORDER BY m DESC LIMIT 6"); savings_month=q_all("SELECT substr(trx_date,1,7)m,COALESCE(SUM(CASE WHEN direction='Masuk' THEN amount ELSE -amount END),0)total FROM savings_transactions GROUP BY substr(trx_date,1,7) ORDER BY m DESC LIMIT 6")
+        loan_month=q_all("SELECT substr(loan_date,1,7)m,COALESCE(SUM(total_receivable),0)total FROM loans WHERE status IN ('Berjalan','Lunas') GROUP BY substr(loan_date,1,7) ORDER BY m DESC LIMIT 6"); payment_month=q_all("SELECT substr(payment_date,1,7)m,COALESCE(SUM(amount),0)total FROM loan_payments WHERE status='VERIFIED' GROUP BY substr(payment_date,1,7) ORDER BY m DESC LIMIT 6")
+        top_products=q_all('''SELECT p.product_name,COALESCE(SUM(si.subtotal),0) revenue FROM sales_items si JOIN sales s ON s.id=si.sales_id JOIN products p ON p.id=si.product_id WHERE s.status='Posted' AND substr(s.trx_date,1,7)=? GROUP BY si.product_id ORDER BY revenue DESC LIMIT 5''',[cur_month]); pay_method=q_all('''SELECT payment_method,COUNT(*)cnt,COALESCE(SUM(total),0)total FROM sales WHERE status='Posted' AND substr(trx_date,1,7)=? GROUP BY payment_method ORDER BY total DESC''',[cur_month]); low_stock=q_all('SELECT barcode,product_name,stock,min_stock FROM products WHERE active=1 AND stock<=min_stock ORDER BY stock LIMIT 5'); recent=q_all('SELECT invoice_no,trx_date,total FROM sales WHERE status="Posted" ORDER BY id DESC LIMIT 5')
+    sales_chart=bar_chart_svg(list(reversed([(r['m'][5:7]+'/'+r['m'][:4],float(r['total'])) for r in sales_month])),'Penjualan 6 Bulan',color='#2563eb')
+    savings_chart=bar_chart_svg(list(reversed([(r['m'][5:7]+'/'+r['m'][:4],float(r['total'])) for r in savings_month])),'Simpanan 6 Bulan',color='#10b981')
+    loan_labels=[(r['m'][5:7]+'/'+r['m'][:4],0) for r in reversed(loan_month)] if loan_month else []
+    loan_chart=grouped_bar_chart_svg(loan_labels or [('No Data',0)],[(r['m'][5:7]+'/'+r['m'][:4],float(r['total'])) for r in reversed(payment_month)],'Pinjaman vs Angsuran',label_a='Diberikan',label_b='Diterima',color_a='#f59e0b',color_b='#10b981')
+    top_products_chart=horizontal_bar_chart_svg([(r['product_name'][:12],float(r['revenue'])) for r in top_products],f'Top 5 Produk {cur_month[5:]}/{cur_month[:4]}',colors=['#2563eb','#10b981','#f59e0b','#ef4444','#8b5cf6'])
+    pay_chart=horizontal_bar_chart_svg([(f"{r['payment_method']} ({r['cnt']})",float(r['total'])) for r in pay_method],f'Komposisi Pembayaran {cur_month[5:]}/{cur_month[:4]}',colors=['#3b82f6','#8b5cf6','#f59e0b'])
     body = render_template_string('''
-    <section class="command-center-v13"><div class="cc-main"><div class="command-kicker">OPERATIONS COMMAND CENTER</div><h2>Kendali operasional hari ini</h2><p>Pantau arus transaksi, validasi pekerjaan, dan kondisi keuangan melalui satu pandangan yang terhubung.</p><div class="command-actions"><a class="primary" href="{{ url_for('quick_cashier') }}">Transaksi Baru</a><a href="{{ url_for('products') }}">Kelola Barang</a><a href="{{ url_for('reports') }}">Buka Laporan</a></div></div><div class="cc-status"><div class="cc-status-head"><span>Status Operasional</span><b class="cc-live">LIVE</b></div><div class="cc-status-grid"><div><strong>{{pending_approval}}</strong><span>Approval</span></div><div><strong>{{pending_users}}</strong><span>User Baru</span></div><div><strong>{{low_stock_count}}</strong><span>Stok Kritis</span></div><div><strong>{{active_loan_count}}</strong><span>Kredit Aktif</span></div></div></div></section>
+    <section class="command-center-v13"><div class="cc-main"><div class="command-kicker">OPERATIONS COMMAND CENTER</div><h2>Kendali operasional {{branch_name if branch_mode else "seluruh koperasi"}}</h2><p>{% if branch_mode %}Data pada halaman ini hanya berasal dari cabang {{branch_name}}, termasuk penjualan, stok, produk kritis, dan aktivitas kasir.{% else %}Pantau arus transaksi, validasi pekerjaan, dan kondisi keuangan melalui satu pandangan yang terhubung.{% endif %}</p><div class="command-actions"><a class="primary" href="{{ url_for('quick_cashier') }}">Transaksi Baru</a><a href="{{ url_for('products') }}">Kelola Barang</a><a href="{{ url_for('reports') }}">Buka Laporan</a></div></div><div class="cc-status"><div class="cc-status-head"><span>Status Operasional</span><b class="cc-live">LIVE</b></div><div class="cc-status-grid"><div><strong>{{pending_approval}}</strong><span>Approval</span></div><div><strong>{{pending_users}}</strong><span>User Baru</span></div><div><strong>{{low_stock_count}}</strong><span>Stok Kritis</span></div><div><strong>{{active_loan_count}}</strong><span>Kredit Aktif</span></div></div></div></section>
     <section class="data-flow-panel"><div class="flow-head"><div><span class="command-kicker">DATA FLOW</span><h3>Alur data operasional</h3></div><span>Input hingga laporan</span></div><div class="flow-track"><a href="{{url_for('members')}}" class="flow-node"><i>01</i><b>Anggota & Master</b><small>{{m_count}} anggota · {{p_count}} barang</small></a><span class="flow-arrow">→</span><a href="{{url_for('quick_cashier')}}" class="flow-node"><i>02</i><b>Transaksi</b><small>{{rupiah(sale_today)}} hari ini</small></a><span class="flow-arrow">→</span><a href="{{url_for('approvals')}}" class="flow-node"><i>03</i><b>Verifikasi</b><small>{{pending_approval}} menunggu</small></a><span class="flow-arrow">→</span><a href="{{url_for('accounting')}}" class="flow-node"><i>04</i><b>Keuangan</b><small>{{rupiah(profit_month-expense_month)}} laba bersih</small></a><span class="flow-arrow">→</span><a href="{{url_for('reports')}}" class="flow-node"><i>05</i><b>Laporan</b><small>Siap dianalisis</small></a></div></section>
     <div class="section-caption"><h3>Ringkasan Kinerja</h3><span>Diperbarui dari data transaksi aktif</span></div>
     <div class="metrics">
@@ -5428,7 +5586,7 @@ def dashboard():
             <div class="value">{{ rupiah(savings_total) }}</div>
         </div>
         <div class="metric">
-            <div class="label">Member / Barang</div>
+            <div class="label">{{"Petugas / Barang Cabang" if branch_mode else "Member / Barang"}}</div>
             <div class="value">{{ m_count }} / {{ p_count }}</div>
         </div>
     </div>
@@ -5441,7 +5599,7 @@ def dashboard():
         <article class="activity-stream"><div class="analytics-card-head"><div><span>AKTIVITAS TERBARU</span><h3>Transaksi masuk</h3></div><a href="{{url_for('sales_history')}}">Lihat semua</a></div><div class="activity-list">{% for r in recent %}<a href="{{url_for('sales_history')}}" class="activity-item"><i>↙</i><div><b>{{r.invoice_no}}</b><small>{{r.trx_date}} · Penjualan</small></div><strong>{{rupiah(r.total)}}</strong><span>›</span></a>{% else %}<div class="analytics-empty">Belum ada transaksi terbaru.</div>{% endfor %}</div></article>
       </div>
     </section>
-    ''', m_count=m_count, p_count=p_count, sale_today=sale_today, sale_month=sale_month, sale_prev_month=sale_prev_month, pending_approval=pending_approval, pending_users=pending_users, savings_total=savings_total, loan_outstanding=loan_outstanding, active_loan_count=active_loan_count, angsuran_month=angsuran_month, low_stock_count=low_stock_count, profit_month=profit_month, expense_month=expense_month, sales_chart=sales_chart, savings_chart=savings_chart, loan_chart=loan_chart, top_products_chart=top_products_chart, pay_chart=pay_chart, low_stock=low_stock, recent=recent, rupiah=rupiah, cur_month=cur_month)
+    ''', m_count=m_count, p_count=p_count, sale_today=sale_today, sale_month=sale_month, sale_prev_month=sale_prev_month, pending_approval=pending_approval, pending_users=pending_users, savings_total=savings_total, loan_outstanding=loan_outstanding, active_loan_count=active_loan_count, angsuran_month=angsuran_month, low_stock_count=low_stock_count, profit_month=profit_month, expense_month=expense_month, sales_chart=sales_chart, savings_chart=savings_chart, loan_chart=loan_chart, top_products_chart=top_products_chart, pay_chart=pay_chart, low_stock=low_stock, recent=recent, rupiah=rupiah, cur_month=cur_month, branch_mode=branch_mode, branch_name=branch_name)
     return render_page('Dashboard', body)
 
 # =========================
@@ -5539,14 +5697,69 @@ def members():
 # =========================
 # Products
 # =========================
+CSS_DESIGN += r"""
+/* Products master redesign: clearer list, edit flow, and stock receiving priority */
+.inventory-hero{position:relative;overflow:hidden;padding:27px 29px!important;border:0!important;border-radius:14px!important;background:linear-gradient(125deg,#101828,#213b59)!important;color:#fff!important;box-shadow:0 12px 30px rgba(16,24,40,.14)!important}.inventory-hero:after{content:'';position:absolute;right:-65px;top:-95px;width:235px;height:235px;border:43px solid rgba(227,93,52,.18);border-radius:50%}.inventory-hero .inventory-toolbar-inner{position:relative;z-index:1}.inventory-hero .inventory-kicker{color:#f4a184!important}.inventory-hero h2{margin:5px 0!important;color:#fff!important;font-size:26px!important;letter-spacing:-.04em!important}.inventory-location{display:flex;align-items:center;gap:7px;color:#c5cfdb;font-size:10px}.inventory-location span{text-transform:uppercase;letter-spacing:.08em}.inventory-location strong{color:#fff}.inventory-hero-actions{display:flex;gap:8px}.inventory-primary-action{background:#e35d34!important}.inventory-primary-action:hover{background:#c94d26!important}.inventory-hero-actions .btn-ghost{background:#fff!important;color:#1c2c40!important;border:0!important}.inventory-commandbar{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px;border:1px solid #d0d5dd;border-radius:10px;background:#fff}.inventory-search-form{display:flex;gap:8px;min-width:0;flex:1}.inventory-search{position:relative;min-width:250px;max-width:520px;flex:1}.inventory-search span{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:#667085}.inventory-search input{padding-left:34px!important}.inventory-secondary-actions{display:flex;gap:7px}.inventory-workspace{grid-template-columns:minmax(330px,390px) minmax(0,1fr)!important;align-items:start!important;gap:16px!important}.inventory-editor{position:sticky;top:16px;border:1px solid #d0d5dd!important;border-radius:11px!important;background:#fff;overflow:hidden}.inventory-editor-head{padding:19px 20px!important;background:#f7f8fa!important;border-bottom:1px solid #e4e7ec!important}.inventory-editor-head h2{margin:4px 0 3px!important;font-size:18px!important}.inventory-editor-head p{color:#667085!important;font-size:10px!important}.inventory-form-panel{padding:18px 20px!important}.inventory-form-panel+.inventory-form-panel{border-top:1px solid #e4e7ec!important}.inventory-section-title{display:flex;align-items:center;gap:10px;margin-bottom:15px}.inventory-section-title>span{display:grid;place-items:center;width:29px;height:29px;border-radius:8px;background:#eef4ff;color:#2457d6;font-size:10px;font-weight:900}.inventory-section-title.stock>span{background:#fff0eb;color:#e35d34}.inventory-section-title b,.inventory-section-title small{display:block}.inventory-section-title b{font-size:13px;color:#101828}.inventory-section-title small{margin-top:2px;color:#667085;font-size:9px}.inventory-stock-context{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:15px}.inventory-stock-context>div{padding:10px 11px;border:1px solid #e4e7ec;border-radius:9px;background:#f8f9fb}.inventory-stock-context>div:first-child{grid-column:1/-1}.inventory-stock-context span,.inventory-stock-context b{display:block}.inventory-stock-context span{color:#667085;font-size:8px;text-transform:uppercase}.inventory-stock-context b{margin-top:3px;color:#101828;font-size:11px}.inventory-editor .btn-success{width:100%;background:#e35d34!important}.inventory-editor .btn-success:hover{background:#c94d26!important}.inventory-master-form form>button{min-width:130px}.inventory-data{border:1px solid #d0d5dd!important;border-radius:11px!important;background:#fff!important;overflow:hidden!important}.inventory-data-head{padding:18px 20px!important;border-bottom:1px solid #e4e7ec!important}.inventory-data-head h2{margin:4px 0 2px!important;font-size:17px!important}.inventory-data-head p{color:#667085;font-size:9px}.inventory-count{display:flex!important;align-items:center!important;gap:8px!important;padding:8px 10px!important;border-radius:9px!important;background:#eef4ff!important;color:#2457d6!important}.inventory-count b,.inventory-count span{display:block}.inventory-count b{font-size:18px}.inventory-count span{font-size:8px;text-transform:uppercase}.inventory-table{margin:0!important;border:0!important;border-radius:0!important}.inventory-table table{min-width:900px}.cell-product b{font-size:12px}.cell-product small{color:#667085!important}.cell-stock b{font-size:12px}.cell-stock small{display:inline-flex!important;margin-top:4px!important;padding:3px 6px;border-radius:999px;font-size:7px!important;font-weight:850}.stock-ok{background:#e9f7f2;color:#087e6a!important}.stock-low{background:#fff0f1;color:#b42335!important}.inventory-action.edit{background:#eef4ff!important;color:#2457d6!important}.inventory-action.edit:hover{background:#2457d6!important;color:#fff!important}.inventory-pagination{padding:0 18px 14px}
+@media(max-width:1100px){.inventory-workspace{grid-template-columns:1fr!important}.inventory-editor{position:static}.inventory-commandbar{align-items:stretch;flex-direction:column}.inventory-secondary-actions{justify-content:flex-end}}
+@media(max-width:768px){.inventory-hero{margin:0 12px 12px!important;padding:20px!important;border-radius:20px!important}.inventory-hero .inventory-toolbar-inner{align-items:flex-start!important;flex-direction:column!important}.inventory-hero h2{font-size:22px!important}.inventory-hero-actions{width:100%}.inventory-hero-actions .btn{flex:1}.inventory-commandbar{margin:0 12px 12px!important;border-radius:18px!important}.inventory-search-form{display:grid;grid-template-columns:1fr 1fr;width:100%}.inventory-search{grid-column:1/-1;min-width:0;max-width:none}.inventory-secondary-actions{display:grid;grid-template-columns:1fr 1fr;width:100%}.inventory-workspace{padding:0 12px!important}.inventory-editor,.inventory-data{margin:0!important;border-radius:18px!important}.inventory-stock-context{grid-template-columns:1fr}.inventory-stock-context>div:first-child{grid-column:auto}.inventory-data-head{align-items:flex-start!important}.inventory-count{flex-direction:column;gap:1px!important}.inventory-table table{min-width:850px!important}}
+"""
+
+CSS_DESIGN += r"""
+/* FINAL PRODUCTS OVERRIDE: prevents legacy page-products rules from covering the redesign */
+body.page-products .main-content{padding-top:0!important;overflow:visible!important}
+body.page-products .main-content>.topbar{position:relative!important;z-index:5!important;margin-bottom:20px!important;background:#fff!important}
+body.page-products .inventory-toolbar.inventory-hero{position:relative!important;z-index:1!important;width:100%!important;max-width:none!important;margin:0 0 14px!important;padding:26px 28px!important;border:0!important;border-radius:14px!important;background:linear-gradient(125deg,#101828 0%,#213b59 100%)!important;box-shadow:0 12px 30px rgba(16,24,40,.14)!important;overflow:hidden!important;backdrop-filter:none!important}
+body.page-products .inventory-toolbar.inventory-hero:after{display:block!important;content:''!important;position:absolute!important;right:-65px!important;top:-95px!important;width:235px!important;height:235px!important;border:43px solid rgba(227,93,52,.18)!important;border-radius:50%!important;background:transparent!important;z-index:0!important}
+body.page-products .inventory-hero .inventory-toolbar-inner{position:relative!important;z-index:2!important;display:flex!important;align-items:center!important;justify-content:space-between!important;gap:22px!important;width:100%!important;max-width:none!important}
+body.page-products .inventory-hero .inventory-toolbar-title{min-width:0!important}
+body.page-products .inventory-hero .inventory-toolbar-title h2{margin:5px 0 6px!important;color:#fff!important;font-size:26px!important;line-height:1.15!important}
+body.page-products .inventory-hero .inventory-kicker{color:#f4a184!important}
+body.page-products .inventory-hero .inventory-location,body.page-products .inventory-hero .inventory-location span{color:#b8c6d5!important}
+body.page-products .inventory-hero .inventory-location strong{color:#fff!important}
+body.page-products .inventory-hero .inventory-hero-actions{display:flex!important;grid-template-columns:none!important;align-items:center!important;justify-content:flex-end!important;gap:8px!important;width:auto!important;flex:0 0 auto!important}
+body.page-products .inventory-hero .inventory-hero-actions .btn{width:auto!important;min-width:150px!important;height:40px!important;min-height:40px!important;padding:9px 15px!important;border-radius:9px!important}
+body.page-products .inventory-hero .inventory-primary-action{background:#e35d34!important;border-color:#e35d34!important;color:#fff!important}
+body.page-products .inventory-hero .inventory-primary-action:hover{background:#c94d26!important;border-color:#c94d26!important}
+body.page-products .inventory-hero .inventory-hero-actions .btn-ghost{background:#fff!important;border-color:#fff!important;color:#1c2c40!important}
+body.page-products .inventory-commandbar{position:relative!important;z-index:1!important;width:100%!important;max-width:none!important;margin:0 0 14px!important}
+body.page-products .inventory-workspace{width:100%!important;max-width:none!important;margin:0!important}
+body.page-products .inventory-editor{top:18px!important}
+@media(max-width:1200px) and (min-width:769px){body.page-products .inventory-hero .inventory-toolbar-inner{align-items:flex-start!important;flex-direction:row!important}body.page-products .inventory-hero .inventory-hero-actions{width:auto!important}}
+@media(max-width:768px){body.page-products .main-content{padding-top:82px!important}body.page-products .main-content>.topbar{display:none!important}body.page-products .inventory-toolbar.inventory-hero{margin:0 12px 12px!important;width:calc(100% - 24px)!important;padding:20px!important;border-radius:20px!important}body.page-products .inventory-hero .inventory-toolbar-inner{display:flex!important;align-items:flex-start!important;flex-direction:column!important}body.page-products .inventory-hero .inventory-toolbar-title h2{font-size:22px!important}body.page-products .inventory-hero .inventory-hero-actions{display:grid!important;grid-template-columns:1fr 1fr!important;width:100%!important}body.page-products .inventory-hero .inventory-hero-actions .btn{width:100%!important;min-width:0!important}body.page-products .inventory-commandbar{margin:0 12px 12px!important;width:calc(100% - 24px)!important}}
+"""
+
+
+CSS_DESIGN += r'''
+.branch-stock-notice{margin:0 0 14px;padding:11px 13px;border:1px solid #bdd8cb;border-left:4px solid #087e6a;border-radius:9px;background:#edf8f2;color:#315f50;font-size:10px}.branch-stock-notice b{color:#173f32}
+'''
+
+CSS_DESIGN += r'''
+.inventory-stock-context .central-stock-audit{grid-column:1/-1;background:#fff8eb;border-color:#f3d39a}.central-stock-audit small{display:block;margin-top:3px;color:#8a6416;font-size:8px}.branch-stock-notice code{padding:2px 5px;border-radius:4px;background:#fff;color:#2457d6}
+'''
 @app.route('/products', methods=['GET', 'POST'])
 @login_required
 @role_required('admin', 'kasir', 'branch_admin', 'branch_cashier')
 def products():
-    edit_id = request.args.get('edit_id', '')
-    edit_row = q_one('SELECT * FROM products WHERE id=?', [edit_id]) if edit_id else None
+    user = current_user()
     branch_id = get_branch_id()
+    if user['role'] in ('branch_admin','branch_cashier') and not branch_id:
+        flash('Akun cabang belum terhubung ke cabang. Atur Cabang pada data pengguna sebelum mengelola stok.', 'error')
+        return redirect(url_for('dashboard'))
     branch_name = get_branch_name(branch_id)
+    edit_id = request.args.get('edit_id', '')
+    if edit_id:
+        if branch_id:
+            edit_row = q_one('''SELECT p.id,p.barcode,p.product_name,p.category,p.unit,p.buy_price,p.sell_price,p.active,p.created_at,
+                                COALESCE(pbs.stock,0) AS stock,
+                                COALESCE(pbs.min_stock,p.min_stock,0) AS min_stock,
+                                COALESCE(p.stock,0) AS central_stock,
+                                COALESCE(p.min_stock,0) AS central_min_stock
+                                FROM products p LEFT JOIN product_branch_stock pbs
+                                ON pbs.product_id=p.id AND pbs.branch_id=? WHERE p.id=?''',[branch_id,edit_id])
+        else:
+            edit_row = q_one('SELECT p.*,p.stock central_stock,p.min_stock central_min_stock FROM products p WHERE p.id=?',[edit_id])
+    else:
+        edit_row = None
     if request.method == 'POST':
         action = request.form.get('action', 'create')
         barcode = request.form.get('barcode', '').strip()
@@ -5560,6 +5773,7 @@ def products():
         active = 1 if request.form.get('active', '1') == '1' else 0
         if action == 'add_stock':
             product_id = int(request.form.get('product_id') or 0)
+            if branch_id: ensure_product_branch_stock(product_id, branch_id)
             qty_in = parse_float(request.form.get('stock_in_qty', 0))
             cost_in = parse_float(request.form.get('stock_in_price', 0))
             note_in = request.form.get('stock_in_note', '').strip()
@@ -5567,10 +5781,15 @@ def products():
             if not prod or qty_in <= 0 or cost_in <= 0:
                 flash('Pilih barang, qty masuk, dan harga beli harus lebih dari 0.', 'error')
             else:
-                add_stock_with_fifo(product_id, qty_in, cost_in, branch_id=branch_id, entry_date=today_str(), movement_type='Tambah Stok Manual', note=note_in or 'Tambah stok baru dari master barang')
-                log_action('ADD_STOCK', 'products', product_id, f'Tambah stok {prod["product_name"]}: {qty_in} @ {cost_in}')
-                flash('Stok baru berhasil ditambahkan dan batch FIFO baru dibuat.', 'success')
-            return redirect(url_for('products', edit_id=product_id))
+                before_stock=get_product_stock(product_id,branch_id)
+                add_stock_with_fifo(product_id,qty_in,cost_in,branch_id=branch_id,entry_date=today_str(),movement_type='Tambah Stok Manual',note=note_in or 'Tambah stok baru dari master barang')
+                after_stock=get_product_stock(product_id,branch_id)
+                expected=round(float(before_stock)+float(qty_in),6)
+                if abs(float(after_stock)-expected)>0.000001:
+                    raise ValueError(f'Validasi stok gagal. Seharusnya {expected:g}, terbaca {after_stock:g}.')
+                log_action('ADD_STOCK','products',product_id,f'Tambah stok {prod["product_name"]}: {qty_in} @ {cost_in}; cabang={branch_id or "PUSAT"}; {before_stock}->{after_stock}')
+                flash(f'Stok {branch_name} berhasil ditambah: {before_stock:g} + {qty_in:g} = {after_stock:g}.','success')
+            return redirect(url_for('products', edit_id=product_id) + '#inventoryEditor')
         if not barcode or not product_name:
             flash('Barcode dan nama barang wajib diisi.', 'error')
         else:
@@ -5585,18 +5804,23 @@ def products():
                     flash('Barang berhasil disimpan. Jika ada stok awal, batch FIFO pertama sudah dibuat.', 'success')
                 else:
                     product_id = int(request.form.get('product_id'))
+                    if branch_id: ensure_product_branch_stock(product_id, branch_id)
                     old_stock = get_product_stock(product_id, branch_id)
-                    exec_sql('UPDATE products SET barcode=?, product_name=?, category=?, unit=?, buy_price=?, sell_price=?, min_stock=?, active=? WHERE id=?', [barcode, product_name, category, unit, buy_price, sell_price, min_stock, active, product_id])
                     if branch_id:
-                        exec_sql('INSERT OR IGNORE INTO product_branch_stock(product_id, branch_id, stock, min_stock) VALUES (?, ?, 0, ?)', [product_id, branch_id, min_stock])
-                        exec_sql('UPDATE product_branch_stock SET min_stock=? WHERE product_id=? AND branch_id=?', [min_stock, product_id, branch_id])
+                        # Master identity/prices are global, but stock limit belongs to this branch.
+                        exec_sql('UPDATE products SET barcode=?,product_name=?,category=?,unit=?,buy_price=?,sell_price=?,active=? WHERE id=?',[barcode,product_name,category,unit,buy_price,sell_price,active,product_id])
+                        exec_sql('UPDATE product_branch_stock SET min_stock=? WHERE product_id=? AND branch_id=?',[min_stock,product_id,branch_id])
+                    else:
+                        exec_sql('UPDATE products SET barcode=?,product_name=?,category=?,unit=?,buy_price=?,sell_price=?,min_stock=?,active=? WHERE id=?',[barcode,product_name,category,unit,buy_price,sell_price,min_stock,active,product_id])
                     diff = stock - old_stock
                     if diff > 0:
                         add_stock_with_fifo(product_id, diff, buy_price, branch_id=branch_id, entry_date=today_str(), movement_type='Tambah Stok Manual', note='Penambahan stok dari edit master barang')
                     elif diff < 0:
                         remove_stock_with_fifo(product_id, abs(diff), branch_id=branch_id, movement_type='Koreksi Stok Manual', note='Pengurangan stok dari edit master barang')
                     log_action('UPDATE', 'products', product_id, f'Update barang {product_name}')
-                    flash('Barang berhasil diupdate. Selisih stok otomatis disesuaikan ke FIFO.', 'success')
+                    refreshed_stock=get_product_stock(product_id,branch_id)
+                    flash(f'Barang berhasil diupdate. Stok {branch_name}: {refreshed_stock:g} {unit}.', 'success')
+                    return redirect(url_for('products',edit_id=product_id) + '#inventoryEditor')
                 return redirect(url_for('products'))
             except sqlite3.IntegrityError:
                 flash('Barcode sudah ada.', 'error')
@@ -5606,7 +5830,7 @@ def products():
     page = request.args.get('page', 1, type=int)
     cats_rows = q_all("SELECT name FROM categories WHERE is_active=1 ORDER BY name ASC")
     if branch_id:
-        base_sql = "SELECT p.*, COALESCE(pbs.stock,0) AS stock, COALESCE(pbs.min_stock,p.min_stock) AS min_stock, CASE WHEN p.active=1 THEN 'Aktif' ELSE 'Nonaktif' END AS stat FROM products p LEFT JOIN product_branch_stock pbs ON pbs.product_id=p.id AND pbs.branch_id=? WHERE 1=1"
+        base_sql = "SELECT p.id,p.barcode,p.product_name,p.category,p.unit,p.buy_price,p.sell_price,p.active,p.created_at, COALESCE(pbs.stock,0) AS stock, COALESCE(pbs.min_stock,p.min_stock,0) AS min_stock, COALESCE(p.stock,0) AS central_stock, CASE WHEN p.active=1 THEN 'Aktif' ELSE 'Nonaktif' END AS stat FROM products p LEFT JOIN product_branch_stock pbs ON pbs.product_id=p.id AND pbs.branch_id=? WHERE 1=1"
         params = [branch_id]
     else:
         base_sql = "SELECT p.*, CASE WHEN p.active=1 THEN 'Aktif' ELSE 'Nonaktif' END AS stat FROM products p WHERE 1=1"
@@ -5619,24 +5843,25 @@ def products():
     rows = p['rows']
     pag_html = render_pagination(p, 'products', {'q': key})
     body = render_template_string('''
-    <section class="inventory-toolbar">
+    <section class="inventory-toolbar inventory-hero">
         <div class="inventory-toolbar-inner">
-            <div class="inventory-toolbar-title"><span class="inventory-kicker">INVENTORY CONTROL</span><h2>Daftar Barang</h2><div class="muted small">Lokasi: <strong>{{ branch_name }}</strong></div></div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-                <form method="get" style="display:flex;gap:8px;width:auto;margin:0;"><input name="q" value="{{ key }}" placeholder="Cari..." style="width:200px;"><button class="btn-ghost" type="submit">Cari</button></form>
-                <a href="{{ url_for('product_barcode_labels') }}" class="btn btn-sm btn-ghost">🏷️ Cetak Barcode</a>
-                <a href="{{ url_for('product_download_template') }}" class="btn btn-sm btn-ghost">📥 Template</a>
-                <a href="{{ url_for('product_import_excel') }}" class="btn btn-sm btn-success">📤 Import Excel</a>
-            </div>
+            <div class="inventory-toolbar-title"><span class="inventory-kicker">INVENTORY CONTROL</span><h2>Daftar Barang</h2><div class="inventory-location"><span>Lokasi aktif</span><strong>{{ branch_name }}</strong></div></div>
+            <div class="inventory-hero-actions"><a href="#inventoryEditor" class="btn inventory-primary-action">{{ 'Kembali ke Form Edit' if edit_row else '+ Tambah Barang' }}</a><a href="{{ url_for('product_import_excel') }}" class="btn btn-ghost">Import Excel</a></div>
         </div>
+    </section>
+    {% if branch_id %}<div class="branch-stock-notice">Stok aktif: <b>{{branch_name}}</b> (Branch ID {{branch_id}}). Angka utama berasal dari <code>product_branch_stock</code>, bukan <code>products.stock</code>.</div>{% endif %}
+    <section class="inventory-commandbar">
+      <form method="get" class="inventory-search-form"><div class="inventory-search"><span>⌕</span><input name="q" value="{{ key }}" placeholder="Cari barcode, nama barang, atau kategori"></div><button class="btn btn-ghost" type="submit">Cari Barang</button>{% if key %}<a href="{{url_for('products')}}" class="btn btn-ghost">Reset</a>{% endif %}</form>
+      <div class="inventory-secondary-actions"><a href="{{ url_for('product_barcode_labels') }}" class="btn btn-sm btn-ghost">Cetak Barcode</a><a href="{{ url_for('product_download_template') }}" class="btn btn-sm btn-ghost">Unduh Template</a></div>
     </section>
     {% if edit_row %}
     <div class="card" style="margin-bottom:16px;">
         <h3>📊 Riwayat Harga Beli (Batch FIFO)</h3>
         <div class="muted small">Setiap kali PO diterima, harga beli tercatat sebagai batch baru. Penjualan mengambil dari batch tertua.</div>
-        {% set batches = q_all('SELECT pb.*, po.po_no FROM product_batches pb LEFT JOIN purchase_orders po ON po.id=pb.po_id WHERE pb.product_id=? AND pb.branch_id IS NULL ORDER BY pb.id DESC LIMIT 20', [edit_row['id']]) %}
-        {% if not batches %}
-            {% set batches = q_all('SELECT pb.*, po.po_no FROM product_batches pb LEFT JOIN purchase_orders po ON po.id=pb.po_id WHERE pb.product_id=? ORDER BY pb.id DESC LIMIT 20', [edit_row['id']]) %}
+        {% if branch_id %}
+          {% set batches = q_all('SELECT pb.*,po.po_no FROM product_batches pb LEFT JOIN purchase_orders po ON po.id=pb.po_id WHERE pb.product_id=? AND pb.branch_id=? ORDER BY pb.id DESC LIMIT 20',[edit_row['id'],branch_id]) %}
+        {% else %}
+          {% set batches = q_all('SELECT pb.*,po.po_no FROM product_batches pb LEFT JOIN purchase_orders po ON po.id=pb.po_id WHERE pb.product_id=? AND pb.branch_id IS NULL ORDER BY pb.id DESC LIMIT 20',[edit_row['id']]) %}
         {% endif %}
         <div class="table-wrap"><table><thead><tr><th>Tanggal</th><th>Batch</th><th>PO</th><th>Qty Masuk</th><th>Sisa</th><th>Harga Beli</th><th>Total</th></tr></thead>
         <tbody>
@@ -5658,7 +5883,22 @@ def products():
     </div>
     {% endif %}
     <div class="inventory-workspace">
-        <aside class="inventory-editor"><div class="inventory-editor-head"><span class="inventory-kicker">DATA MASTER</span><h2>{{ 'Edit Barang' if edit_row else 'Barang Baru' }}</h2><p>Lengkapi data identitas, harga, dan batas stok.</p></div><div class="inventory-form-panel">
+        <aside class="inventory-editor" id="inventoryEditor"><div class="inventory-editor-head"><span class="inventory-kicker">DATA MASTER</span><h2>{{ 'Edit Barang' if edit_row else 'Barang Baru' }}</h2><p>{{ 'Kelola stok terlebih dahulu atau perbarui informasi barang.' if edit_row else 'Lengkapi identitas, harga, dan batas minimum stok.' }}</p></div>
+        {% if edit_row %}
+        <div class="inventory-form-panel" style="border-top:1px solid var(--border);">
+            <div class="inventory-section-title stock"><span>01</span><div><b>Tambah Stok Barang</b><small>Posisi utama untuk penerimaan stok dan pembuatan batch FIFO.</small></div></div>
+            <div class="inventory-stock-context"><div><span>Barang</span><b>{{edit_row.product_name}}</b></div><div><span>Stok {{branch_name}}</span><b>{{edit_row.stock}} {{edit_row.unit or 'pcs'}}</b></div><div><span>Harga terakhir</span><b>{{rupiah(edit_row.buy_price)}}</b></div>{% if branch_id %}<div class="central-stock-audit"><span>Referensi stok PUSAT</span><b>{{edit_row.central_stock}} {{edit_row.unit or 'pcs'}}</b><small>Tidak ikut berubah saat cabang mengedit stok.</small></div>{% endif %}</div>
+            <form method="post">
+                <input type="hidden" name="action" value="add_stock">
+                <input type="hidden" name="product_id" value="{{ edit_row.id }}">
+                <div class="form-group"><label>Qty Masuk</label><input type="number" step="0.001" min="0.001" name="stock_in_qty" required></div>
+                <div class="form-group"><label>Harga Beli Batch Baru</label><input type="number" step="0.01" min="0.01" name="stock_in_price" value="{{ edit_row.buy_price or 0 }}" required></div>
+                <div class="form-group"><label>Catatan</label><input name="stock_in_note" placeholder="Contoh: stok datang supplier / koreksi gudang"></div>
+                <button type="submit" class="btn-success">Simpan Penambahan Stok</button>
+            </form>
+        </div>
+        {% endif %}<div class="inventory-form-panel inventory-master-form">
+            <div class="inventory-section-title"><span>{{ '02' if edit_row else '01' }}</span><div><b>{{ 'Edit Informasi Barang' if edit_row else 'Informasi Barang Baru' }}</b><small>Identitas, kategori, harga, dan pengaturan stok.</small></div></div>
             <form method="post">
                 {% if edit_row %}<input type="hidden" name="action" value="update"><input type="hidden" name="product_id" value="{{ edit_row['id'] }}">{% else %}<input type="hidden" name="action" value="create">{% endif %}
                 <div class="form-group"><label>Barcode</label><input name="barcode" value="{{ edit_row['barcode'] if edit_row else '' }}"></div>
@@ -5673,28 +5913,14 @@ def products():
                 {% if edit_row %}<a href="{{ url_for('products') }}" class="btn btn-ghost" style="margin-top:8px;">Batal</a>{% endif %}
             </form>
         </div>
-        {% if edit_row %}
-        <div class="inventory-form-panel" style="border-top:1px solid var(--border);">
-            <h3>➕ Tambah Stok Baru</h3>
-            <div class="muted small" style="margin-bottom:8px;">Gunakan ini saat barang datang dengan harga beli baru. Sistem membuat batch FIFO baru.</div>
-            <form method="post">
-                <input type="hidden" name="action" value="add_stock">
-                <input type="hidden" name="product_id" value="{{ edit_row.id }}">
-                <div class="form-group"><label>Qty Masuk</label><input type="number" step="0.001" min="0.001" name="stock_in_qty" required></div>
-                <div class="form-group"><label>Harga Beli Batch Baru</label><input type="number" step="0.01" min="0.01" name="stock_in_price" value="{{ edit_row.buy_price or 0 }}" required></div>
-                <div class="form-group"><label>Catatan</label><input name="stock_in_note" placeholder="Contoh: stok datang supplier / koreksi gudang"></div>
-                <button type="submit" class="btn-success">Tambah Stok + Buat FIFO</button>
-            </form>
-        </div>
-        {% endif %}
         </aside>
-        <section class="inventory-data"><div class="inventory-data-head"><div><span class="inventory-kicker">KATALOG AKTIF</span><h2>Database Barang</h2></div><div class="inventory-count">{{ rows|length }} ditampilkan</div></div>
+        <section class="inventory-data"><div class="inventory-data-head"><div><span class="inventory-kicker">KATALOG BARANG</span><h2>Data Persediaan</h2><p>Gunakan tombol edit untuk memperbarui data atau menambah stok barang.</p></div><div class="inventory-count"><b>{{ p.total }}</b><span>Total barang</span></div></div>
             <div class="table-wrap inventory-table"><table><thead><tr><th>Barcode</th><th>Nama</th><th>Beli</th><th>Jual</th><th>Stok {{ branch_name }}</th><th>Min</th><th>Status</th><th>Aksi</th></tr></thead>
-            <tbody>{% for r in rows %}<tr><td class="cell-barcode"><code>{{ r['barcode'] }}</code></td><td class="cell-product"><b>{{ r['product_name'] }}</b><small>{{ r['category'] or 'Umum' }} · {{ r['unit'] or 'pcs' }}</small></td><td class="cell-money">{{ rupiah(r['buy_price']) }}</td><td class="cell-money"><strong>{{ rupiah(r['sell_price']) }}</strong></td><td class="cell-stock"><b>{{ r['stock'] }}</b><small>tersedia</small></td><td class="cell-min">{{ r['min_stock'] }}</td><td class="cell-status"><span class="badge {{ 'badge-success' if r['active'] else 'badge-gray' }}">{{ r['stat'] }}</span></td><td class="cell-actions"><a class="inventory-action edit" href="{{ url_for('products', edit_id=r['id']) }}" title="Edit barang"><span>✎</span><b>Edit</b></a><a href="{{ url_for('product_barcode_labels') }}?barcode={{ r['barcode'] }}" class="inventory-action label" title="Cetak label barcode"><span>▤</span><b>Label</b></a></td></tr>{% else %}<tr><td colspan="8" class="muted text-center">Belum ada barang.</td></tr>{% endfor %}</tbody></table></div>
+            <tbody>{% for r in rows %}<tr><td class="cell-barcode"><code>{{ r['barcode'] }}</code></td><td class="cell-product"><b>{{ r['product_name'] }}</b><small>{{ r['category'] or 'Umum' }} · {{ r['unit'] or 'pcs' }}</small></td><td class="cell-money">{{ rupiah(r['buy_price']) }}</td><td class="cell-money"><strong>{{ rupiah(r['sell_price']) }}</strong></td><td class="cell-stock"><b>{{ r['stock'] }} {{r['unit'] or 'pcs'}}</b><small class="{{'stock-low' if r['stock'] <= r['min_stock'] else 'stock-ok'}}">{{'Stok rendah' if r['stock'] <= r['min_stock'] else 'Stok aman'}}</small></td><td class="cell-min">{{ r['min_stock'] }}</td><td class="cell-status"><span class="badge {{ 'badge-success' if r['active'] else 'badge-gray' }}">{{ r['stat'] }}</span></td><td class="cell-actions"><a class="inventory-action edit" href="{{ url_for('products', edit_id=r['id']) }}#inventoryEditor" title="Edit dan tambah stok"><span>✎</span><b>Edit / Stok</b></a><a href="{{ url_for('product_barcode_labels') }}?barcode={{ r['barcode'] }}" class="inventory-action label" title="Cetak label barcode"><span>▤</span><b>Label</b></a></td></tr>{% else %}<tr><td colspan="8" class="muted text-center">Belum ada barang.</td></tr>{% endfor %}</tbody></table></div>
             {{ pag_html|safe }}
         </div></div>
     </div>
-    ''', rows=rows, key=key, rupiah=rupiah, edit_row=edit_row, pag_html=pag_html, branch_name=branch_name, q_all=q_all, cats_rows=cats_rows)
+    ''', rows=rows, key=key, rupiah=rupiah, edit_row=edit_row, pag_html=pag_html, branch_name=branch_name, q_all=q_all, cats_rows=cats_rows, p=p, branch_id=branch_id)
     return render_page('Barang', body)
 
 # =========================
@@ -5805,6 +6031,15 @@ def product_import_excel():
 # =========================
 # Quick Cashier — Bayar Cepat, Stok Dikurangi Nanti
 # =========================
+CSS_DESIGN += r"""
+/* Unified sales suite and resilient sidebar alignment */
+.sales-suite{display:grid;gap:14px;max-width:none!important}.sales-hero{position:relative;display:flex;justify-content:space-between;align-items:flex-end;gap:22px;overflow:hidden;padding:25px 27px;border-radius:14px;background:linear-gradient(125deg,#101828,#213b59);color:#fff;box-shadow:0 12px 30px rgba(16,24,40,.14)}.sales-hero:after{content:'';position:absolute;right:-60px;top:-92px;width:225px;height:225px;border:42px solid rgba(227,93,52,.18);border-radius:50%}.sales-hero>div,.sales-hero>a{position:relative;z-index:1}.sales-hero>div>span,.sales-kicker{display:block;color:#f4a184;font-size:8px;font-weight:900;letter-spacing:.16em}.sales-hero h2{margin:5px 0 5px;color:#fff;font-size:25px;letter-spacing:-.04em}.sales-hero p{margin:0;max-width:700px;color:#c5cfdb;font-size:10px}.sales-hero>.btn{background:#fff!important;color:#1c2c40!important;border:0!important}.sales-hero-chip{min-width:180px;padding:12px 14px;border:1px solid rgba(255,255,255,.14);border-radius:10px;background:rgba(255,255,255,.07)}.sales-hero-chip small,.sales-hero-chip b{display:block}.sales-hero-chip small{color:#aebbc9;font-size:8px;text-transform:uppercase}.sales-hero-chip b{margin-top:5px;color:#fff;font-size:12px}.sales-main-grid{grid-template-columns:minmax(340px,.85fr) minmax(0,1.15fr)!important;gap:14px!important}.sales-main-grid>[class*=col-]{grid-column:auto!important;min-width:0!important}.sales-main-grid>.col-6>.card,.sales-main-grid>.col-4>.card,.sales-main-grid>.col-8>.card{height:auto;margin:0!important;border:1px solid #d0d5dd!important;border-radius:11px!important;box-shadow:0 2px 8px rgba(16,24,40,.035)!important}.quick-suite .sales-main-grid>.col-6:first-child>.card,.cashier-suite .sales-main-grid>.col-4>.card{border-top:3px solid #2457d6!important}.quick-suite .sales-main-grid>.col-6:last-child>.card,.cashier-suite .sales-main-grid>.col-8>.card{border-top:3px solid #087e6a!important}.quick-suite .keypad{max-width:none!important}.quick-suite .keypad button{height:52px!important;padding:8px!important;border-radius:9px!important;font-size:18px!important}.quick-suite #totalDisplay,.quick-suite #ringkasanTotal{color:#087e6a!important;letter-spacing:-.04em}.quick-suite #totalDisplay{font-size:38px!important}.quick-suite #ringkasanTotal{font-size:34px!important}.quick-suite #paymentInfo{position:sticky;top:14px}.cashier-suite .sales-main-grid{grid-template-columns:360px minmax(0,1fr)!important}.cashier-suite .table-wrap{max-height:65vh!important}.cashier-suite .table-wrap th{top:0!important}.sales-panel{padding:0!important;overflow:hidden!important;border-radius:11px!important}.sales-panel-head{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:17px 19px;border-bottom:1px solid #e4e7ec}.sales-panel-head h3{margin:4px 0 2px;font-size:15px}.sales-panel-head p{margin:0;color:#667085;font-size:9px}.sales-panel .table-wrap{margin:0!important;border:0!important;border-radius:0!important}.sales-panel table{min-width:850px}.sales-panel th{top:0!important}.sales-panel td{vertical-align:middle!important}.sales-panel td form{margin:0!important}.sales-panel td>div{flex-wrap:nowrap!important}.sales-pagination{padding:0 18px 15px}.history-suite .sales-panel-head form{display:flex!important;gap:7px!important;align-items:end!important;margin:0!important}.history-suite .sales-panel-head input{height:38px!important;min-height:38px!important}.returns-suite .sales-panel{border-top:3px solid #e35d34!important}.return-process-suite .sales-panel{border-top:3px solid #e35d34!important}.return-process-suite .table-wrap{max-height:58vh!important}.return-history-suite .sales-panel{border-top:3px solid #2457d6!important}
+/* Sidebar: long labels may shrink, but icons never move or collapse */
+#sidebar .sidebar-section-header{display:grid!important;grid-template-columns:24px minmax(0,1fr) auto 18px!important;column-gap:8px!important;align-items:center!important;min-width:0!important}#sidebar .section-symbol{grid-column:1!important;flex:0 0 auto!important}#sidebar .section-name{grid-column:2!important;display:block!important;min-width:0!important;max-width:100%!important;overflow:hidden!important;text-overflow:ellipsis!important;white-space:nowrap!important}#sidebar .section-count{grid-column:3!important;margin:0!important}#sidebar .section-chevron{grid-column:4!important;margin:0!important}#sidebar .sidebar-section-items a{display:grid!important;grid-template-columns:24px minmax(0,1fr) auto!important;column-gap:8px!important;align-items:center!important;min-width:0!important;overflow:hidden!important}#sidebar .sidebar-section-items .nav-icon{grid-column:1!important;width:24px!important;min-width:24px!important;flex:0 0 24px!important;margin:0!important}#sidebar .sidebar-section-items .nav-label{grid-column:2!important;display:block!important;min-width:0!important;width:100%!important;overflow:hidden!important;text-overflow:ellipsis!important;white-space:nowrap!important}#sidebar .sidebar-notif-badge{grid-column:3!important;margin-left:0!important;flex:0 0 auto!important}.sidebar-compact #sidebar .sidebar-section-header{display:flex!important;justify-content:center!important}.sidebar-compact #sidebar .section-name,.sidebar-compact #sidebar .section-count,.sidebar-compact #sidebar .section-chevron{display:none!important}
+@media(max-width:1100px){.sales-main-grid,.cashier-suite .sales-main-grid{grid-template-columns:1fr!important}.quick-suite #paymentInfo{position:static}.sales-hero{align-items:flex-start}.history-suite .sales-panel-head{align-items:flex-start;flex-direction:column}.history-suite .sales-panel-head form{width:100%;flex-wrap:wrap!important}}
+@media(max-width:768px){.sales-suite{padding:0 12px}.sales-hero{align-items:flex-start;flex-direction:column;padding:19px;border-radius:20px}.sales-hero h2{font-size:22px}.sales-hero-chip{width:100%}.sales-main-grid{padding:0!important}.sales-main-grid>.col-6>.card,.sales-main-grid>.col-4>.card,.sales-main-grid>.col-8>.card,.sales-panel{margin:0!important;border-radius:18px!important}.quick-suite #totalDisplay{font-size:30px!important}.quick-suite .keypad button{height:48px!important}.sales-panel-head{align-items:flex-start;flex-direction:column;padding:15px}.sales-panel-head>.btn{width:100%}.history-suite .sales-panel-head form{display:grid!important;grid-template-columns:1fr 1fr!important}.history-suite .sales-panel-head form>button{grid-column:1/-1}.sales-panel .table-wrap{padding:0!important}.sales-panel table{min-width:760px!important}#sidebar .sidebar-section-header{grid-template-columns:31px minmax(0,1fr) auto 18px!important}#sidebar .sidebar-section-items a{grid-template-columns:24px minmax(0,1fr) auto!important}}
+"""
+
 @app.route('/quick-cashier', methods=['GET', 'POST'])
 @login_required
 @role_required('admin', 'kasir', 'branch_admin', 'branch_cashier')
@@ -5842,14 +6077,18 @@ def quick_cashier():
         else:
             paid = total
         # Simpan ke antrian verifikasi (PENDING) — stok belum dikurangi
-        qid = exec_sql('INSERT INTO quick_cashier_queue(invoice_no, trx_date, total, payment_method, member_id, customer_name, note, status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, "PENDING", ?)',
-            [invoice, today_str(), total, payment_method, member_id, customer_name, note, session.get('user_id')])
+        cashier_branch_id = get_branch_id()
+        qid = exec_sql('INSERT INTO quick_cashier_queue(invoice_no, trx_date, total, payment_method, member_id, customer_name, note, status, created_by, stock_branch_id) VALUES (?, ?, ?, ?, ?, ?, ?, "PENDING", ?, ?)',
+            [invoice, today_str(), total, payment_method, member_id, customer_name, note, session.get('user_id'), cashier_branch_id])
         log_action('QUICK_CASHIER_PENDING', 'quick_cashier_queue', qid, f'Total {total} metode {payment_method} — menunggu verifikasi')
         flash(f'✅ Transaksi antri verifikasi! Invoice: {invoice} — {rupiah(total)}. Status: PENDING. Admin akan verifikasi untuk kurangi stok.', 'success')
         return redirect(url_for('quick_cashier'))
     members_rows = q_all("SELECT id, member_code, name FROM members WHERE status='Aktif' ORDER BY name ASC")
+    cashier_branch_name = get_branch_name(get_branch_id())
     body = render_template_string('''
-    <div class="grid">
+    <div class="sales-suite quick-suite">
+      <header class="sales-hero"><div><span>POINT OF SALE</span><h2>Kasir Cepat</h2><p>Catat pembayaran untuk lokasi <b>{{cashier_branch_name}}</b>. Transaksi terkunci ke persediaan lokasi kasir sebelum stok diverifikasi.</p></div><div class="sales-hero-chip"><small>Mode transaksi</small><b>Input nominal cepat</b></div></header>
+      <div class="grid sales-main-grid">
         <div class="col-6">
             <div class="card" style="text-align:center;">
                 <h2>⚡ Quick Cashier</h2>
@@ -5955,6 +6194,7 @@ def quick_cashier():
                 </ol>
             </div>
         </div>
+      </div>
     </div>
     <script>
     function press(n){ var inp=document.getElementById('totalInput'); var v=inp.value.replace(/[^0-9]/g,''); v=v+n; inp.value=v.replace(/^0+/,'')||'0'; updateDisplay(); }
@@ -5981,12 +6221,18 @@ def quick_cashier():
     }
     document.getElementById('paidInput').addEventListener('input',hitungKembalian);
     </script>
-    ''', members_rows=members_rows, total=0, rupiah=rupiah)
+    ''', members_rows=members_rows, total=0, rupiah=rupiah, cashier_branch_name=cashier_branch_name)
     return render_page('Kasir Cepat', body)
 
 # =========================
 # Quick Cashier Queue — Verifikasi Admin untuk Kurangi Stok
 # =========================
+CSS_DESIGN += r"""
+.qcq-shell{display:grid;gap:14px}.qcq-hero{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;padding:26px 28px;border-radius:14px;background:linear-gradient(125deg,#101828,#213b59);color:#fff;box-shadow:0 12px 30px rgba(16,24,40,.14)}.qcq-hero span{color:#f4a184;font-size:9px;font-weight:900;letter-spacing:.16em}.qcq-hero h2{margin:5px 0;color:#fff;font-size:26px}.qcq-hero p{color:#c5cfdb;font-size:11px}.qcq-hero .btn{background:#fff!important;color:#1c2c40!important}.qcq-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.qcq-kpis>div{padding:16px 18px;border:1px solid #d0d5dd;border-top:3px solid #2457d6;border-radius:10px;background:#fff}.qcq-kpis>div:nth-child(1){border-top-color:#e35d34}.qcq-kpis>div:nth-child(3){border-top-color:#087e6a}.qcq-kpis>div:nth-child(4){border-top-color:#b42335}.qcq-kpis span,.qcq-kpis b{display:block}.qcq-kpis span{color:#667085;font-size:8px;font-weight:850;text-transform:uppercase}.qcq-kpis b{margin-top:7px;font-size:20px}.qcq-filters{display:grid;grid-template-columns:minmax(260px,1fr) 190px 150px auto;gap:8px;padding:12px;border:1px solid #d0d5dd;border-radius:10px;background:#fff}.qcq-shell .card{border-radius:11px!important}.qcq-shell .card h3{font-size:15px!important}.qcq-shell .table-wrap{border-radius:9px!important}.qcq-shell td strong{color:#101828}.qcq-pager{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:13px 2px 0}.qcq-pager>span{color:#667085;font-size:9px}.qcq-pager>div{display:flex;align-items:center;gap:5px}.qcq-page{display:grid;place-items:center;min-width:32px;height:32px;border:1px solid #d0d5dd;border-radius:7px;background:#fff;color:#344054;font-size:10px;font-weight:800}.qcq-page.active{border-color:#2457d6;background:#2457d6;color:#fff}.qcq-pager .disabled{pointer-events:none;opacity:.4}
+@media(max-width:900px){.qcq-kpis{grid-template-columns:repeat(2,1fr)}.qcq-filters{grid-template-columns:1fr 1fr}.qcq-filters input{grid-column:1/-1}}
+@media(max-width:768px){.qcq-shell{padding:0 12px}.qcq-hero{align-items:flex-start;flex-direction:column;padding:20px;border-radius:20px}.qcq-hero h2{font-size:22px}.qcq-kpis{padding:0!important}.qcq-filters{grid-template-columns:1fr}.qcq-filters input{grid-column:auto}.qcq-shell .grid{gap:0!important}.qcq-shell .card{margin-left:0!important;margin-right:0!important}.qcq-pager{align-items:stretch;flex-direction:column}.qcq-pager>div{overflow-x:auto;padding-bottom:3px}}
+"""
+
 @app.route('/quick-cashier/queue', methods=['GET', 'POST'])
 @login_required
 @role_required('admin', 'branch_admin')
@@ -5995,8 +6241,11 @@ def quick_cashier_queue():
         qid = int(request.form.get('qid'))
         action = request.form.get('action')
         queue = q_one('SELECT * FROM quick_cashier_queue WHERE id = ? AND status = "PENDING"', [qid])
+        if queue and current_user()['role']=='branch_admin':
+            current_bid=get_branch_id()
+            if (queue['stock_branch_id'] or None)!=(current_bid or None): queue=None
         if not queue:
-            flash('Antrian tidak ditemukan atau sudah diproses.', 'error')
+            flash('Antrian tidak ditemukan, berbeda cabang, atau sudah diproses.', 'error')
             return redirect(url_for('quick_cashier_queue'))
         
         if action == 'reject':
@@ -6015,21 +6264,56 @@ def quick_cashier_queue():
         
         return redirect(url_for('quick_cashier_queue'))
     
-    # Tampilkan antrian
-    pending = q_all('SELECT q.*, u.full_name as creator_name, m.member_code, m.name as member_name FROM quick_cashier_queue q LEFT JOIN users u ON u.id=q.created_by LEFT JOIN members m ON m.id=q.member_id WHERE q.status = "PENDING" ORDER BY q.id ASC')
-    verified = q_all('SELECT q.*, u.full_name as creator_name, vu.full_name as verifier_name, m.name as member_name FROM quick_cashier_queue q LEFT JOIN users u ON u.id=q.created_by LEFT JOIN users vu ON vu.id=q.verified_by LEFT JOIN members m ON m.id=q.member_id WHERE q.status != "PENDING" ORDER BY q.id DESC LIMIT 50')
+    # Pagination terpisah untuk tabel pending dan riwayat.
+    queue_user=current_user(); queue_branch_id=get_branch_id()
+    queue_scope=''; queue_scope_params=[]
+    if queue_user['role']=='branch_admin':
+        if queue_branch_id: queue_scope=' AND q.stock_branch_id=?'; queue_scope_params=[queue_branch_id]
+        else: queue_scope=' AND q.stock_branch_id IS NULL'
+    p_page = max(1, request.args.get('p_page', 1, type=int))
+    h_page = max(1, request.args.get('h_page', 1, type=int))
+    per_page = request.args.get('per_page', 10, type=int)
+    per_page = per_page if per_page in (10, 20, 50) else 10
+    keyword = (request.args.get('q') or '').strip()
+    status_filter = (request.args.get('status') or '').strip().upper()
+    pending_sql = 'SELECT q.*, u.full_name creator_name, m.member_code, m.name member_name FROM quick_cashier_queue q LEFT JOIN users u ON u.id=q.created_by LEFT JOIN members m ON m.id=q.member_id WHERE q.status="PENDING"'
+    pending_params = list(queue_scope_params)
+    pending_sql += queue_scope
+    if keyword:
+        pending_sql += ' AND (q.invoice_no LIKE ? OR COALESCE(m.name,"") LIKE ? OR COALESCE(u.full_name,"") LIKE ?)'
+        pending_params += [f'%{keyword}%'] * 3
+    pending_sql += ' ORDER BY q.id ASC'
+    pending = paginate_query(pending_sql, pending_params, p_page, per_page)
+    history_sql = 'SELECT q.*, u.full_name creator_name, vu.full_name verifier_name, m.name member_name FROM quick_cashier_queue q LEFT JOIN users u ON u.id=q.created_by LEFT JOIN users vu ON vu.id=q.verified_by LEFT JOIN members m ON m.id=q.member_id WHERE q.status<>"PENDING"'
+    history_params = list(queue_scope_params)
+    history_sql += queue_scope
+    if keyword:
+        history_sql += ' AND (q.invoice_no LIKE ? OR COALESCE(m.name,"") LIKE ? OR COALESCE(u.full_name,"") LIKE ? OR COALESCE(vu.full_name,"") LIKE ?)'
+        history_params += [f'%{keyword}%'] * 4
+    if status_filter in ('VERIFIED','REJECTED'):
+        history_sql += ' AND q.status=?'; history_params.append(status_filter)
+    history_sql += ' ORDER BY q.id DESC'
+    verified = paginate_query(history_sql, history_params, h_page, per_page)
+    if queue_user['role']=='branch_admin':
+        if queue_branch_id:
+            stats=q_one("""SELECT SUM(status='PENDING') pending_count,SUM(status='VERIFIED') verified_count,SUM(status='REJECTED') rejected_count,COALESCE(SUM(CASE WHEN status='PENDING' THEN total ELSE 0 END),0) pending_value FROM quick_cashier_queue WHERE stock_branch_id=?""",[queue_branch_id])
+        else:
+            stats=q_one("""SELECT SUM(status='PENDING') pending_count,SUM(status='VERIFIED') verified_count,SUM(status='REJECTED') rejected_count,COALESCE(SUM(CASE WHEN status='PENDING' THEN total ELSE 0 END),0) pending_value FROM quick_cashier_queue WHERE stock_branch_id IS NULL""")
+    else:
+        stats=q_one("""SELECT SUM(status='PENDING') pending_count,SUM(status='VERIFIED') verified_count,SUM(status='REJECTED') rejected_count,COALESCE(SUM(CASE WHEN status='PENDING' THEN total ELSE 0 END),0) pending_value FROM quick_cashier_queue""")
     
     body = render_template_string('''
-    <div class="card">
-        <div class="kartu"><h2>⏳ Antrian Verifikasi Quick Cashier</h2><div class="muted small">Transaksi pending menunggu verifikasi admin untuk pengurangan stok</div></div>
-    </div>
+    <div class="qcq-shell">
+    <header class="qcq-hero"><div><span>QUICK CASHIER CONTROL</span><h2>Antrian Verifikasi</h2><p>Periksa transaksi, input barang, dan selesaikan pengurangan stok secara terkontrol.</p></div><a class="btn btn-ghost" href="{{url_for('quick_cashier')}}">Buka Quick Cashier</a></header>
+    <div class="qcq-kpis"><div><span>Menunggu</span><b>{{stats.pending_count or 0}}</b></div><div><span>Nilai Antrian</span><b>{{rupiah(stats.pending_value)}}</b></div><div><span>Terverifikasi</span><b>{{stats.verified_count or 0}}</b></div><div><span>Ditolak</span><b>{{stats.rejected_count or 0}}</b></div></div>
+    <form method="get" class="qcq-filters"><input name="q" value="{{keyword}}" placeholder="Cari invoice, member, kasir"><select name="status"><option value="">Semua status riwayat</option><option value="VERIFIED" {{'selected' if status_filter=='VERIFIED' else ''}}>Terverifikasi</option><option value="REJECTED" {{'selected' if status_filter=='REJECTED' else ''}}>Ditolak</option></select><select name="per_page"><option value="10" {{'selected' if per_page==10 else ''}}>10 per halaman</option><option value="20" {{'selected' if per_page==20 else ''}}>20 per halaman</option><option value="50" {{'selected' if per_page==50 else ''}}>50 per halaman</option></select><button class="btn btn-ghost">Terapkan</button></form>
     <div class="grid">
         <div class="col-12">
             <div class="card" style="border-left:4px solid #f59e0b;">
-                <h3>⏳ Menunggu Verifikasi ({{ pending|length }})</h3>
+                <h3>⏳ Menunggu Verifikasi ({{ pending.total }})</h3>
                 <div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Tanggal</th><th>Total</th><th>Metode</th><th>Member</th><th>Kasir</th><th>Aksi</th></tr></thead>
                 <tbody>
-                {% for q in pending %}
+                {% for q in pending.rows %}
                 <tr>
                     <td><strong>{{ q.invoice_no }}</strong></td>
                     <td>{{ q.trx_date }}</td>
@@ -6051,6 +6335,7 @@ def quick_cashier_queue():
                 <tr><td colspan="7" class="muted text-center">✅ Tidak ada antrian pending. Semua sudah diproses.</td></tr>
                 {% endfor %}
                 </tbody></table></div>
+                {% if pending.total_pages > 1 %}<div class="qcq-pager"><span>Halaman {{pending.page}} / {{pending.total_pages}}</span><div><a class="btn btn-sm btn-ghost {{'disabled' if pending.page<=1 else ''}}" href="{{url_for('quick_cashier_queue',p_page=pending.page-1,h_page=verified.page,q=keyword,status=status_filter,per_page=per_page)}}">Sebelumnya</a>{% for n in range(1,pending.total_pages+1) %}{% if n==1 or n==pending.total_pages or (n>=pending.page-2 and n<=pending.page+2) %}<a class="qcq-page {{'active' if n==pending.page else ''}}" href="{{url_for('quick_cashier_queue',p_page=n,h_page=verified.page,q=keyword,status=status_filter,per_page=per_page)}}">{{n}}</a>{% endif %}{% endfor %}<a class="btn btn-sm btn-ghost {{'disabled' if pending.page>=pending.total_pages else ''}}" href="{{url_for('quick_cashier_queue',p_page=pending.page+1,h_page=verified.page,q=keyword,status=status_filter,per_page=per_page)}}">Berikutnya</a></div></div>{% endif %}
             </div>
         </div>
         <div class="col-12">
@@ -6058,7 +6343,7 @@ def quick_cashier_queue():
                 <h3>📜 Riwayat Verifikasi</h3>
                 <div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Total</th><th>Status</th><th>Verifikator</th><th>Terverifikasi</th></tr></thead>
                 <tbody>
-                {% for q in verified %}
+                {% for q in verified.rows %}
                 <tr>
                     <td>{{ q.invoice_no }}</td>
                     <td>{{ rupiah(q.total) }}</td>
@@ -6070,10 +6355,11 @@ def quick_cashier_queue():
                 <tr><td colspan="5" class="muted text-center">Belum ada riwayat.</td></tr>
                 {% endfor %}
                 </tbody></table></div>
+                {% if verified.total_pages > 1 %}<div class="qcq-pager"><span>Halaman {{verified.page}} / {{verified.total_pages}}</span><div><a class="btn btn-sm btn-ghost {{'disabled' if verified.page<=1 else ''}}" href="{{url_for('quick_cashier_queue',p_page=pending.page,h_page=verified.page-1,q=keyword,status=status_filter,per_page=per_page)}}">Sebelumnya</a>{% for n in range(1,verified.total_pages+1) %}{% if n==1 or n==verified.total_pages or (n>=verified.page-2 and n<=verified.page+2) %}<a class="qcq-page {{'active' if n==verified.page else ''}}" href="{{url_for('quick_cashier_queue',p_page=pending.page,h_page=n,q=keyword,status=status_filter,per_page=per_page)}}">{{n}}</a>{% endif %}{% endfor %}<a class="btn btn-sm btn-ghost {{'disabled' if verified.page>=verified.total_pages else ''}}" href="{{url_for('quick_cashier_queue',p_page=pending.page,h_page=verified.page+1,q=keyword,status=status_filter,per_page=per_page)}}">Berikutnya</a></div></div>{% endif %}
             </div>
         </div>
-    </div>
-    ''', pending=pending, verified=verified, rupiah=rupiah)
+    </div></div>
+    ''', pending=pending, verified=verified, stats=stats, keyword=keyword, status_filter=status_filter, per_page=per_page, rupiah=rupiah)
     return render_page('Verifikasi Quick Cashier', body)
 
 def _qc_locations():
@@ -6157,6 +6443,26 @@ def _qc_stock_for_conn(conn, product_id, branch_id):
 # =========================
 # Quick Cashier Verify — Input Barang & Validasi Total
 # =========================
+CSS_DESIGN += r"""
+/* FINAL QUICK CASHIER VERIFY OPTIMIZATION */
+.qc-verify-page{display:grid!important;grid-template-columns:minmax(0,1fr) 360px!important;gap:12px!important;align-items:start!important;max-width:none!important}
+.qc-verify-page>.qc-visible-message,.qc-verify-page>.qc-verify-hero{grid-column:1/-1!important}
+.qc-verify-page>.qc-location-card{grid-column:1!important;grid-row:2!important;margin:0!important;min-height:0!important;padding:14px 16px!important;border-radius:11px!important}
+.qc-verify-page>.qc-kpis{grid-column:2!important;grid-row:2!important;margin:0!important}
+.qc-verify-page>.grid,.qc-verify-page>.qc-location-empty{grid-column:1/-1!important;margin:0!important}
+.qc-verify-hero{min-height:0!important;margin:0!important;padding:18px 20px!important;border:0!important;border-radius:12px!important;background:linear-gradient(125deg,#101828,#213b59)!important;color:#fff!important;box-shadow:0 10px 25px rgba(16,24,40,.12)!important}
+.qc-verify-hero h2{margin:0 0 5px!important;color:#fff!important;font-size:20px!important;letter-spacing:-.03em!important}.qc-verify-hero p{margin:0!important;color:#c5cfdb!important;font-size:10px!important}.qc-verify-hero .btn{background:#fff!important;color:#1c2c40!important;border-color:#fff!important}
+.qc-location-card{display:grid!important;grid-template-columns:180px minmax(0,1fr)!important;gap:14px!important;align-items:center!important;border-left:3px solid #2457d6!important}.qc-location-card h3{margin:0!important;font-size:12px!important}.qc-location-card form{display:grid!important;grid-template-columns:minmax(220px,1fr) auto!important;gap:8px!important;margin:0!important}.qc-location-card select,.qc-location-card button{height:38px!important;min-height:38px!important}
+.qc-kpis{display:grid!important;grid-template-columns:repeat(3,minmax(0,1fr))!important;gap:7px!important}.qc-kpis article{min-width:0!important;min-height:70px!important;padding:11px 12px!important;border:1px solid #d0d5dd!important;border-radius:10px!important;background:#fff!important}.qc-kpis article span{display:block!important;color:#667085!important;font-size:7px!important;font-weight:850!important;text-transform:uppercase!important;letter-spacing:.07em!important}.qc-kpis article b{display:block!important;margin-top:7px!important;color:#101828!important;font-size:13px!important;line-height:1.15!important;overflow-wrap:anywhere!important}.qc-kpis article.ok{border-top:3px solid #087e6a!important}.qc-kpis article.warn{border-top:3px solid #e35d34!important}
+.qc-verify-page>.grid{display:grid!important;grid-template-columns:minmax(320px,390px) minmax(0,1fr)!important;gap:12px!important;align-items:start!important}.qc-verify-page>.grid>.col-5,.qc-verify-page>.grid>.col-7{grid-column:auto!important;min-width:0!important}.qc-verify-page>.grid>.col-5>.card,.qc-verify-page>.grid>.col-7>.card{margin:0!important;padding:15px!important;border-radius:11px!important;box-shadow:none!important}.qc-verify-page>.grid>.col-5>.card{position:sticky!important;top:14px!important;border-top:3px solid #2457d6!important}.qc-verify-page>.grid>.col-7>.card{border-top:3px solid #087e6a!important}
+.qc-verify-page>.grid h3{margin:0 0 11px!important;font-size:13px!important}.qc-search-form{display:grid!important;grid-template-columns:minmax(0,1fr) 74px!important;gap:7px!important;margin-bottom:8px!important;padding:9px!important;border:1px solid #d8e0e8!important;border-radius:10px!important;background:#f7f9fb!important}.qc-search-form input,.qc-search-form button{height:38px!important;min-height:38px!important}.qc-add-form{display:grid!important;grid-template-columns:minmax(0,1fr) 76px!important;gap:7px!important;padding:9px!important;border:1px solid #c8d8f1!important;border-radius:10px!important;background:#eef4ff!important}.qc-add-form input[name=product_query]{grid-column:1/-1!important}.qc-add-form input,.qc-add-form button{height:38px!important;min-height:38px!important}.qc-add-form button{padding:7px 9px!important}.qc-product-results{max-height:265px!important;margin-top:10px!important;padding:0!important;overflow:auto!important;border:1px solid #e4e7ec!important;border-radius:10px!important;background:#fff!important}.qc-product-results h4{position:sticky!important;top:0!important;z-index:2!important;margin:0!important;padding:10px 11px!important;border-bottom:1px solid #e4e7ec!important;background:#f8f9fb!important;color:#667085!important;font-size:8px!important;text-transform:uppercase!important;letter-spacing:.08em!important}.qc-product-row{display:grid!important;grid-template-columns:minmax(0,1fr) 58px 66px!important;gap:7px!important;align-items:center!important;margin:0!important;padding:9px 10px!important;border-bottom:1px solid #edf0f3!important}.qc-product-row:last-child{border-bottom:0!important}.qc-product-row span{min-width:0!important}.qc-product-row b,.qc-product-row small{display:block!important;overflow:hidden!important;text-overflow:ellipsis!important;white-space:nowrap!important}.qc-product-row b{font-size:10px!important}.qc-product-row small{margin-top:2px!important;color:#667085!important;font-size:8px!important}.qc-product-row input,.qc-product-row button{height:32px!important;min-height:32px!important;padding:5px 7px!important}
+.qc-verify-page>.grid>.col-7 .kartu{display:flex!important;justify-content:space-between!important;align-items:center!important;gap:10px!important;margin-bottom:10px!important}.qc-verify-page>.grid>.col-7 .kartu h3{margin:0!important}.qc-verify-page>.grid>.col-7 .kartu form{margin:0!important}.qc-verify-page>.grid>.col-7 .kartu button{min-height:36px!important}.qc-verify-page>.grid>.col-7 .table-wrap{max-height:480px!important;margin:0!important;border-radius:9px!important;overflow:auto!important}.qc-verify-page>.grid>.col-7 table{min-width:610px!important}.qc-verify-page>.grid>.col-7 th{top:0!important}.qc-verify-page>.grid>.col-7 td{vertical-align:middle!important}.qc-verify-page>.grid>.col-7 td form{margin:0!important}
+@media(max-width:1100px){.qc-verify-page{grid-template-columns:1fr!important}.qc-verify-page>.qc-location-card,.qc-verify-page>.qc-kpis{grid-column:1!important;grid-row:auto!important}.qc-verify-page>.grid{grid-template-columns:340px minmax(0,1fr)!important}}
+@media(max-width:850px){.qc-verify-page>.grid{grid-template-columns:1fr!important}.qc-verify-page>.grid>.col-5,.qc-verify-page>.grid>.col-7{grid-column:1!important}.qc-verify-page>.grid>.col-5>.card{position:static!important}.qc-product-results{max-height:230px!important}}
+@media(max-width:768px){.qc-verify-page{padding:0 12px!important;gap:10px!important}.qc-verify-page>.qc-verify-hero,.qc-verify-page>.qc-location-card,.qc-verify-page>.qc-kpis,.qc-verify-page>.grid{margin:0!important}.qc-verify-hero{align-items:flex-start!important;flex-direction:column!important;padding:17px!important;border-radius:18px!important}.qc-location-card{grid-template-columns:1fr!important;padding:13px!important;border-radius:16px!important}.qc-location-card form{grid-template-columns:1fr!important}.qc-kpis{grid-template-columns:repeat(3,minmax(0,1fr))!important;padding:0!important}.qc-kpis article{padding:10px!important}.qc-kpis article b{font-size:11px!important}.qc-verify-page>.grid>.col-5>.card,.qc-verify-page>.grid>.col-7>.card{border-radius:16px!important}.qc-search-form,.qc-add-form{grid-template-columns:1fr!important}.qc-add-form input[name=product_query]{grid-column:auto!important}.qc-product-row{grid-template-columns:minmax(0,1fr) 52px 62px!important}.qc-verify-page>.grid>.col-7 .kartu{align-items:stretch!important;flex-direction:column!important}.qc-verify-page>.grid>.col-7 .kartu button{width:100%!important}}
+@media(max-width:420px){.qc-kpis{grid-template-columns:1fr!important}.qc-product-row{grid-template-columns:minmax(0,1fr) 55px!important}.qc-product-row span{grid-column:1/-1!important}}
+"""
+
 @app.route('/quick-cashier/verify/<int:qid>', methods=['GET', 'POST'])
 @login_required
 @role_required('admin', 'branch_admin')
@@ -6165,8 +6471,19 @@ def quick_cashier_verify(qid):
     if not queue:
         flash('Antrian tidak ditemukan atau sudah diproses.', 'error')
         return redirect(url_for('quick_cashier_queue'))
+    user = current_user()
+    cashier_branch_id = get_branch_id()
     locations=_qc_locations()
-    selected_bid=_qc_selected_branch(queue, request.values.get('stock_branch_id'))
+    # Queue branch is authoritative. Branch staff cannot select another branch.
+    queue_branch_id = _qc_selected_branch(queue)
+    if user['role'] in ('branch_admin','branch_cashier','kasir') and cashier_branch_id:
+        selected_bid = cashier_branch_id
+        locations = [b for b in locations if int(b['id']) == int(cashier_branch_id)]
+        if queue_branch_id and int(queue_branch_id) != int(cashier_branch_id):
+            flash('Antrian ini milik cabang lain dan tidak dapat diproses dari akun ini.', 'error')
+            return redirect(url_for('quick_cashier_queue'))
+    else:
+        selected_bid = queue_branch_id or _qc_selected_branch(queue, request.values.get('stock_branch_id'))
     product_q=(request.values.get('product_q') or '').strip()
     def back(msg='', level='info', bid=None, pq=None):
         if msg: flash(msg, level)
@@ -6178,7 +6495,13 @@ def quick_cashier_verify(qid):
         if not action:
             return back('Aksi tidak terbaca. Klik tombol Tambah, Gunakan Lokasi, atau Verifikasi.', 'error', selected_bid, product_q)
         if action=='set_location':
-            selected_bid=_qc_branch_id_from_value(request.form.get('stock_branch_id'))
+            requested_bid=_qc_branch_id_from_value(request.form.get('stock_branch_id'))
+            if user['role'] in ('branch_admin','branch_cashier','kasir') and cashier_branch_id:
+                selected_bid=cashier_branch_id
+                if requested_bid and int(requested_bid)!=int(cashier_branch_id):
+                    return back('Lokasi stok harus sama dengan cabang akun kasir.', 'error', cashier_branch_id, product_q)
+            else:
+                selected_bid=requested_bid
             if not selected_bid: return back('Pilih lokasi stok terlebih dahulu.', 'error', None, product_q)
             old=_qc_selected_branch(queue)
             if old and old!=selected_bid:
@@ -6235,8 +6558,8 @@ def quick_cashier_verify(qid):
                             pname=conn.execute('SELECT product_name FROM products WHERE id=?',[pid]).fetchone()
                             raise ValueError(f'Stok {pname["product_name"] if pname else pid} di {get_branch_name(selected_bid)} tidak cukup. Tersedia {avail}, dibutuhkan {need}.')
                     invoice=queue['invoice_no']; sale_total=float(queue['total'] or total_items)
-                    sid=conn.execute('''INSERT INTO sales(invoice_no,trx_date,member_id,cashier_id,customer_name,total,paid,change_amount,note,status,payment_method)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "Posted", ?)''',[invoice,queue['trx_date'],queue['member_id'],queue['created_by'],queue['customer_name'] or '',sale_total,sale_total,0,queue['note'] or '',queue['payment_method']]).lastrowid
+                    sid=conn.execute('''INSERT INTO sales(invoice_no,trx_date,member_id,cashier_id,customer_name,total,paid,change_amount,note,status,payment_method,branch_id)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "Posted", ?, ?)''',[invoice,queue['trx_date'],queue['member_id'],queue['created_by'],queue['customer_name'] or '',sale_total,sale_total,0,queue['note'] or '',queue['payment_method'],selected_bid]).lastrowid
                     br=conn.execute('SELECT branch_code FROM koperasi_branches WHERE id=?',[selected_bid]).fetchone()
                     for it in items:
                         conn.execute('INSERT INTO sales_items(sales_id,product_id,barcode,product_name,qty,price,subtotal) VALUES (?, ?, ?, ?, ?, ?, ?)',[sid,it['product_id'],'',it['product_name'],it['qty'],it['price'],it['subtotal']])
@@ -6258,7 +6581,7 @@ def quick_cashier_verify(qid):
                 return back(f'Verifikasi gagal: {e}', 'error', selected_bid, product_q)
         return back(f'Aksi tidak dikenal: {action}', 'error', selected_bid, product_q)
     # Render
-    selected_bid=_qc_selected_branch(queue, request.args.get('stock_branch_id'))
+    selected_bid = cashier_branch_id if user['role'] in ('branch_admin','branch_cashier','kasir') and cashier_branch_id else (_qc_selected_branch(queue) or _qc_selected_branch(queue, request.args.get('stock_branch_id')))
     product_q=(request.args.get('product_q') or '').strip()
     branch_name=get_branch_name(selected_bid) if selected_bid else 'Belum dipilih'
     products=_qc_product_rows(selected_bid, product_q) if selected_bid else []
@@ -6272,7 +6595,7 @@ def quick_cashier_verify(qid):
       <div class="card qc-verify-hero"><div><h2>📦 Verifikasi Barang — {{ queue.invoice_no }}</h2><p>Total bayar: <b>{{ rupiah(queue.total) }}</b> · Lokasi stok: <b>{{ branch_name }}</b> · Item tabel: <b>{{ items|length }}</b></p></div><a href="{{ url_for('quick_cashier_queue') }}" class="btn btn-ghost">← Kembali</a></div>
       <div class="card qc-location-card"><h3>1. Pilih lokasi stok</h3><form method="POST"><input type="hidden" name="action" value="set_location"><select name="stock_branch_id" required><option value="">-- Pilih lokasi stok --</option>{% for b in locations %}<option value="{{b.id}}" {% if selected_bid and b.id==selected_bid %}selected{% endif %}>{{b.name}} ({{b.branch_code}})</option>{% endfor %}</select><button type="submit" class="btn-success">Gunakan Lokasi</button></form></div>
       <div class="qc-kpis"><article><span>Total Barang</span><b>{{ rupiah(total_barang) }}</b></article><article><span>Total Bayar</span><b>{{ rupiah(queue.total) }}</b></article><article class="{{ 'ok' if selisih==0 else 'warn' }}"><span>Selisih</span><b>{% if selisih > 0 %}+ {{ rupiah(abs_selisih) }}{% elif selisih < 0 %}- {{ rupiah(abs_selisih) }}{% else %}Sesuai{% endif %}</b></article></div>
-      {% if selected_bid %}<div class="grid"><div class="col-5"><div class="card"><h3>2. Cari dan tambah barang</h3><form method="GET" class="qc-search-form"><input type="hidden" name="stock_branch_id" value="{{selected_bid}}"><input name="product_q" value="{{product_q}}" placeholder="Ketik nama/barcode barang"><button type="submit" class="btn-ghost">Cari</button></form><form method="POST" class="qc-add-form"><input type="hidden" name="action" value="add_item"><input type="hidden" name="stock_branch_id" value="{{selected_bid}}"><input type="hidden" name="product_q" value="{{product_q}}"><input name="product_query" list="qcProducts" placeholder="Ketik/pilih barang" required><datalist id="qcProducts">{% for p in products %}<option value="{{p.id}} | {{p.barcode}} | {{p.product_name}} | stok {{p.stock}}"></option>{% endfor %}</datalist><input type="number" step="0.001" min="0.001" name="qty" value="1" required><button type="submit" class="btn-success">Tambah Barang</button></form><div class="qc-product-results"><h4>Hasil pencarian</h4>{% for p in products %}<form method="POST" class="qc-product-row"><input type="hidden" name="action" value="add_item"><input type="hidden" name="stock_branch_id" value="{{selected_bid}}"><input type="hidden" name="product_id" value="{{p.id}}"><input type="hidden" name="product_q" value="{{product_q}}"><span><b>{{p.product_name}}</b><small>{{p.barcode}} · {{rupiah(p.sell_price)}} · Stok {{p.stock}}</small></span><input type="number" step="0.001" min="0.001" name="qty" value="1"><button type="submit" class="btn-sm btn-success">Tambah</button></form>{% else %}<p class="muted small">Tidak ada hasil. Coba ketik nama/barcode lain.</p>{% endfor %}</div></div></div><div class="col-7"><div class="card"><div class="kartu"><h3>3. Tabel verifikasi</h3><form method="POST"><input type="hidden" name="action" value="final_verify"><input type="hidden" name="stock_branch_id" value="{{selected_bid}}"><button type="submit" class="btn-success" data-confirm="Verifikasi final dan kurangi stok {{branch_name}}?">Verifikasi & Kurangi Stok</button></form></div><div class="table-wrap"><table><thead><tr><th>Barang</th><th>Qty</th><th>Harga</th><th>Subtotal</th><th>Aksi</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.product_name}}</td><td>{{i.qty}}</td><td>{{rupiah(i.price)}}</td><td>{{rupiah(i.subtotal)}}</td><td><form method="POST"><input type="hidden" name="action" value="remove_item"><input type="hidden" name="stock_branch_id" value="{{selected_bid}}"><input type="hidden" name="item_id" value="{{i.id}}"><button type="submit" class="btn-sm btn-danger">Hapus</button></form></td></tr>{% else %}<tr><td colspan="5" class="muted text-center">Belum ada barang masuk tabel verifikasi.</td></tr>{% endfor %}</tbody></table></div></div></div></div>{% else %}<div class="card qc-location-empty"><h3>Lokasi belum dipilih</h3><p>Pilih lokasi stok dulu agar cari dan tambah barang aktif.</p></div>{% endif %}
+      {% if selected_bid %}<div class="grid"><div class="col-5"><div class="card"><h3>2. Cari & Tambah Barang</h3><form method="GET" class="qc-search-form"><input type="hidden" name="stock_branch_id" value="{{selected_bid}}"><input name="product_q" value="{{product_q}}" placeholder="Cari nama atau scan barcode"><button type="submit" class="btn-ghost">Cari</button></form><form method="POST" class="qc-add-form"><input type="hidden" name="action" value="add_item"><input type="hidden" name="stock_branch_id" value="{{selected_bid}}"><input type="hidden" name="product_q" value="{{product_q}}"><input name="product_query" list="qcProducts" placeholder="Pilih barang dari hasil pencarian" required><datalist id="qcProducts">{% for p in products %}<option value="{{p.id}} | {{p.barcode}} | {{p.product_name}} | stok {{p.stock}}"></option>{% endfor %}</datalist><input type="number" step="0.001" min="0.001" name="qty" value="1" required><button type="submit" class="btn-success">Tambah Barang</button></form><div class="qc-product-results"><h4>Barang Tersedia</h4>{% for p in products %}<form method="POST" class="qc-product-row"><input type="hidden" name="action" value="add_item"><input type="hidden" name="stock_branch_id" value="{{selected_bid}}"><input type="hidden" name="product_id" value="{{p.id}}"><input type="hidden" name="product_q" value="{{product_q}}"><span><b>{{p.product_name}}</b><small>{{p.barcode}} · {{rupiah(p.sell_price)}} · Stok {{p.stock}}</small></span><input type="number" step="0.001" min="0.001" name="qty" value="1"><button type="submit" class="btn-sm btn-success">Tambah</button></form>{% else %}<p class="muted small">Tidak ada hasil. Coba ketik nama/barcode lain.</p>{% endfor %}</div></div></div><div class="col-7"><div class="card"><div class="kartu"><h3>3. Barang yang Diverifikasi</h3><form method="POST"><input type="hidden" name="action" value="final_verify"><input type="hidden" name="stock_branch_id" value="{{selected_bid}}"><button type="submit" class="btn-success" data-confirm="Verifikasi final dan kurangi stok {{branch_name}}?">Verifikasi & Kurangi Stok</button></form></div><div class="table-wrap"><table><thead><tr><th>Barang</th><th>Qty</th><th>Harga</th><th>Subtotal</th><th>Aksi</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.product_name}}</td><td>{{i.qty}}</td><td>{{rupiah(i.price)}}</td><td>{{rupiah(i.subtotal)}}</td><td><form method="POST"><input type="hidden" name="action" value="remove_item"><input type="hidden" name="stock_branch_id" value="{{selected_bid}}"><input type="hidden" name="item_id" value="{{i.id}}"><button type="submit" class="btn-sm btn-danger">Hapus</button></form></td></tr>{% else %}<tr><td colspan="5" class="muted text-center">Belum ada barang masuk tabel verifikasi.</td></tr>{% endfor %}</tbody></table></div></div></div></div>{% else %}<div class="card qc-location-empty"><h3>Lokasi belum dipilih</h3><p>Pilih lokasi stok dulu agar cari dan tambah barang aktif.</p></div>{% endif %}
     </div>
     ''', queue=queue, locations=locations, selected_bid=selected_bid, branch_name=branch_name, products=products, items=items, total_barang=total_barang, selisih=selisih, abs_selisih=abs_selisih, product_q=product_q, qc_msg=qc_msg, qc_level=qc_level, rupiah=rupiah)
     return render_page('Verifikasi Barang', body)
@@ -6281,13 +6604,24 @@ def quick_cashier_verify(qid):
 @login_required
 @role_required('admin', 'kasir', 'branch_admin', 'branch_cashier')
 def cashier():
+    bid = get_branch_id()
+    cart_branch = session.get('cart_branch_id', '__unset__')
+    branch_key = str(bid) if bid else 'PUSAT'
+    if cart_branch != branch_key:
+        save_cart([]); session['cart_branch_id'] = branch_key
     cart = get_cart()
     if request.method == 'POST':
         action = request.form.get('action')
         if action == 'add_item':
             barcode = request.form.get('barcode', '').strip()
             qty = parse_float(request.form.get('qty', 1) or 1)
-            prod = q_one('SELECT id, barcode, product_name, sell_price, stock FROM products WHERE barcode=? AND active=1', [barcode])
+            bid = get_branch_id()
+            if bid:
+                prod = q_one('''SELECT p.id,p.barcode,p.product_name,p.sell_price,COALESCE(pbs.stock,0) stock
+                                FROM products p LEFT JOIN product_branch_stock pbs ON pbs.product_id=p.id AND pbs.branch_id=?
+                                WHERE p.barcode=? AND p.active=1''',[bid,barcode])
+            else:
+                prod = q_one('SELECT id,barcode,product_name,sell_price,COALESCE(stock,0) stock FROM products WHERE barcode=? AND active=1',[barcode])
             if not barcode:
                 flash('Barcode wajib diisi / discan.', 'warning')
             elif not prod:
@@ -6339,8 +6673,14 @@ def cashier():
                 paid = total
             else:
                 paid = total
-            sid = exec_sql('INSERT INTO sales(invoice_no, trx_date, member_id, cashier_id, customer_name, total, paid, change_amount, note, status, payment_method) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "Posted", ?)', [invoice, today_str(), member_id, session.get('user_id'), customer_name, total, paid, change_amount, note, payment_method])
+            # Revalidate every cart line against the current branch immediately before posting.
             bid = get_branch_id()
+            for item in cart:
+                available = get_product_stock(item['product_id'], bid)
+                if available < float(item['qty']):
+                    flash(f"Stok {item['product_name']} di {get_branch_name(bid)} tidak cukup. Tersedia {available}.", 'error')
+                    return redirect(url_for('cashier'))
+            sid = exec_sql('INSERT INTO sales(invoice_no,trx_date,member_id,cashier_id,customer_name,total,paid,change_amount,note,status,payment_method,branch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "Posted", ?, ?)', [invoice,today_str(),member_id,session.get('user_id'),customer_name,total,paid,change_amount,note,payment_method,bid])
             payload = []
             for item in cart:
                 unit_cost = consume_from_batches(item['product_id'], item['qty'], bid)
@@ -6353,9 +6693,12 @@ def cashier():
             flash(f'Transaksi tersimpan. Invoice {invoice}. Kembalian {rupiah(change_amount)}', 'success')
             return redirect(url_for('cashier'))
     members_rows = q_all("SELECT id, member_code, name FROM members WHERE status='Aktif' ORDER BY name ASC")
+    cashier_branch_name=get_branch_name(bid)
     total = sum(float(i['subtotal']) for i in cart)
     body = render_template_string('''
-    <div class="grid">
+    <div class="sales-suite cashier-suite">
+      <header class="sales-hero"><div><span>POINT OF SALE</span><h2>Kasir</h2><p>Lokasi aktif: <b>{{cashier_branch_name}}</b>. Pemindaian dan pengurangan stok hanya memakai persediaan lokasi ini.</p></div><div class="sales-hero-chip"><small>Total keranjang</small><b>{{rupiah(total)}}</b></div></header>
+      <div class="grid sales-main-grid">
         <div class="col-4"><div class="card"><h2>🧾 Kasir</h2>
             <div class="muted small">Scan barcode untuk menambah item</div>
             <hr>
@@ -6385,6 +6728,7 @@ def cashier():
             <div class="table-wrap"><table><thead><tr><th>Barang</th><th>Qty</th><th>Harga</th><th>Subtotal</th></tr></thead>
             <tbody>{% for i in cart %}<tr><td>{{ i['product_name'] }}</td><td>{{ i['qty'] }}</td><td>{{ rupiah(i['price']) }}</td><td>{{ rupiah(i['subtotal']) }}</td></tr>{% else %}<tr><td colspan="4" class="muted text-center">Keranjang kosong.</td></tr>{% endfor %}</tbody></table></div>
         </div></div>
+      </div>
     </div>
     <script>
     function togglePaid(){
@@ -6401,59 +6745,70 @@ def cashier():
         if(!mid){pm.value='tunai';togglePaid();}
     }
     </script>
-    ''', cart=cart, total=total, members_rows=members_rows, rupiah=rupiah)
+    ''', cart=cart, total=total, members_rows=members_rows, rupiah=rupiah, cashier_branch_name=cashier_branch_name)
     return render_page('Kasir', body)
 
 # =========================
 # Sales History
 # =========================
-@app.route('/sales-history', methods=['GET', 'POST'])
+CSS_DESIGN += r"""
+.cashier-history-kpis{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.cashier-history-kpis article{padding:16px 18px;border:1px solid #d0d5dd;border-top:3px solid #2457d6;border-radius:11px;background:#fff}.cashier-history-kpis article:nth-child(2){border-top-color:#087e6a}.cashier-history-kpis article:nth-child(3){border-top-color:#e35d34}.cashier-history-kpis span,.cashier-history-kpis b,.cashier-history-kpis small{display:block}.cashier-history-kpis span{color:#667085;font-size:8px;font-weight:900;text-transform:uppercase}.cashier-history-kpis b{margin:7px 0 3px;font-size:19px}.cashier-history-kpis small{color:#98a2b3;font-size:8px}.cashier-history-head{align-items:flex-end!important}.cashier-history-filter{display:grid;grid-template-columns:minmax(210px,1fr) 150px 135px 135px auto;gap:7px;align-items:end;min-width:min(100%,760px)}.cashier-row-actions{display:flex;align-items:center;gap:5px}.cashier-row-actions form{margin:0}@media(max-width:1100px){.cashier-history-head{align-items:flex-start!important;flex-direction:column!important}.cashier-history-filter{width:100%;grid-template-columns:1fr 1fr}.cashier-history-filter input:first-child{grid-column:1/-1}}@media(max-width:768px){.cashier-history-kpis{grid-template-columns:1fr}.cashier-history-filter{grid-template-columns:1fr}.cashier-history-filter input:first-child{grid-column:auto}}
+"""
+
+CSS_DESIGN += r'''
+.branch-config-warning{display:flex;align-items:center;gap:10px;padding:12px 14px;border:1px solid #f2c98b;border-left:4px solid #e39a2f;border-radius:10px;background:#fff8eb;color:#7a5314}.branch-config-warning b,.branch-config-warning span{display:block}.branch-config-warning b{font-size:10px}.branch-config-warning span{font-size:9px}
+'''
+
+@app.route('/sales-history', methods=['GET','POST'])
 @login_required
-@role_required('admin', 'kasir', 'branch_admin', 'branch_cashier')
+@role_required('admin','kasir','branch_admin','branch_cashier','manager')
 def sales_history():
-    if request.method == 'POST':
-        action = request.form.get('action')
-        if action == 'request_void':
-            sale_id = int(request.form.get('sale_id'))
-            reason = request.form.get('reason', '').strip() or 'Void transaksi'
-            sale = q_one('SELECT * FROM sales WHERE id=?', [sale_id])
-            if not sale:
-                flash('Transaksi tidak ditemukan.', 'error')
-            elif sale['status'] != 'Posted':
-                flash('Transaksi tidak bisa diajukan void.', 'error')
+    user=current_user()
+    bid,branch_warning=resolve_operational_branch(user)
+    branch_mode=user['role'] in ('branch_admin','branch_cashier','kasir')
+    branch_name=get_branch_name(bid) if bid else ('Cabang belum dikonfigurasi' if branch_mode else 'Seluruh Cabang')
+    if request.method=='POST':
+        if user['role']=='manager':
+            flash('Manager hanya memiliki akses monitoring.','warning'); return redirect(url_for('sales_history'))
+        try: sale_id=int(request.form.get('sale_id') or 0)
+        except Exception: sale_id=0
+        sale=q_one('SELECT * FROM sales WHERE id=?',[sale_id])
+        if not sale_visible_to_current_user(sale):
+            flash('Transaksi tidak ditemukan pada cabang akun ini.','error'); return redirect(url_for('sales_history'))
+        if sale['status']!='Posted': flash('Transaksi tidak dapat diajukan void.','error')
+        else:
+            reason=(request.form.get('reason') or 'Void transaksi').strip()[:300]
+            exist=q_one('SELECT id FROM approval_requests WHERE request_type="sales_void" AND ref_table="sales" AND ref_id=? AND status="Pending"',[sale_id])
+            if exist: flash('Void transaksi ini sudah menunggu approval.','warning')
             else:
-                exist = q_one('SELECT id FROM approval_requests WHERE request_type="sales_void" AND ref_table="sales" AND ref_id=? AND status="Pending"', [sale_id])
-                if exist:
-                    flash('Void transaksi ini sudah menunggu approval.', 'warning')
-                else:
-                    aid = exec_sql('INSERT INTO approval_requests(request_type, ref_table, ref_id, status, reason, created_by) VALUES (?, ?, ?, "Pending", ?, ?)', ['sales_void', 'sales', sale_id, reason, session.get('user_id')])
-                    exec_sql('UPDATE sales SET status="VoidRequested" WHERE id=?', [sale_id])
-                    log_action('REQUEST_APPROVAL', 'approval_requests', aid, f'Request void {sale["invoice_no"]}')
-                    flash('Void transaksi diajukan ke admin.', 'warning')
-            return redirect(url_for('sales_history'))
-    start, end = date_range_from_request()
-    page = request.args.get('page', 1, type=int)
-    params = []
-    base_sql = 'SELECT s.*, COALESCE(m.name, s.customer_name, "Umum") as pelanggan, u.full_name as kasir_name FROM sales s LEFT JOIN members m ON m.id=s.member_id LEFT JOIN users u ON u.id=s.cashier_id WHERE 1=1'
-    base_sql, params = add_date_filter(base_sql, 's.trx_date', start, end, params)
-    p = paginate_query(base_sql + ' ORDER BY s.id DESC', params, page)
-    rows = p['rows']
-    pag_html = render_pagination(p, 'sales_history', {'start': start, 'end': end})
-    body = render_template_string('''
-    <div class="card">
-        <div class="kartu"><h2>🛒 Riwayat Penjualan</h2>
-        <form method="get" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;width:auto;">
-            <div><div class="small muted">Dari</div><input type="date" name="start" value="{{ start }}" style="width:140px;"></div>
-            <div><div class="small muted">Sampai</div><input type="date" name="end" value="{{ end }}" style="width:140px;"></div>
-            <button class="btn-ghost" type="submit">Filter</button>
-        </form></div>
-        <div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Tanggal</th><th>Pelanggan</th><th>Total</th><th>Status</th><th>Aksi</th></tr></thead>
-        <tbody>{% for r in rows %}<tr><td>{{ r['invoice_no'] }}</td><td>{{ r['trx_date'] }}</td><td>{{ r['pelanggan'] }}</td><td>{{ rupiah(r['total']) }}</td><td><span class="badge {{ 'badge-success' if r['status']=='Posted' else 'badge-warn' if r['status']=='VoidRequested' else 'badge-danger' }}">{{ r['status'] }}</span></td>
-        <td><div style="display:flex;gap:4px;"><a href="{{ url_for('receipt_pdf', sale_id=r['id']) }}" class="btn btn-sm btn-ghost">Struk</a><a href="https://wa.me/?text=Halo%20{{ r['pelanggan']|urlencode }},%20berikut%20struk%20belanja%20Anda:%20Invoice%20{{ r['invoice_no'] }}%20Total%20{{ rupiah(r['total'])|urlencode }}" target="_blank" class="btn btn-sm btn-ghost" style="color:#25d366;">WA</a>{% if r['status']=='Posted' %}<form method="post" style="display:inline;"><input type="hidden" name="action" value="request_void"><input type="hidden" name="sale_id" value="{{ r['id'] }}"><button class="btn-sm btn-danger" type="submit">Void</button></form>{% endif %}</div></td></tr>{% else %}<tr><td colspan="6" class="muted text-center">Belum ada transaksi.</td></tr>{% endfor %}</tbody></table></div>
-        {{ pag_html|safe }}
-    </div>
-    ''', rows=rows, rupiah=rupiah, start=start, end=end, pag_html=pag_html)
-    return render_page('Riwayat Sales', body)
+                aid=exec_sql('INSERT INTO approval_requests(request_type,ref_table,ref_id,status,reason,created_by) VALUES("sales_void","sales",?,"Pending",?,?)',[sale_id,reason,user['id']])
+                exec_sql('UPDATE sales SET status="VoidRequested" WHERE id=? AND status="Posted"',[sale_id]); log_action('REQUEST_APPROVAL','approval_requests',aid,f'{sale["invoice_no"]}; branch={sale["branch_id"]}')
+                flash('Permintaan void dikirim ke approval.','success')
+        return redirect(url_for('sales_history'))
+    start,end=date_range_from_request(); page=max(1,request.args.get('page',1,type=int)); q=(request.args.get('q') or '').strip(); status=(request.args.get('status') or '').strip()
+    params=[]; sql='''SELECT s.*,COALESCE(m.name,s.customer_name,'Umum') pelanggan,u.full_name kasir_name,COALESCE(b.name,'PUSAT') branch_name
+      FROM sales s LEFT JOIN members m ON m.id=s.member_id LEFT JOIN users u ON u.id=s.cashier_id LEFT JOIN koperasi_branches b ON b.id=s.branch_id WHERE 1=1'''
+    if branch_mode:
+        if bid: sql+=' AND s.branch_id=?'; params.append(bid)
+        else: sql+=' AND 1=0'
+    if q: sql+=' AND (s.invoice_no LIKE ? OR COALESCE(m.name,s.customer_name,"") LIKE ? OR COALESCE(u.full_name,"") LIKE ?)'; params += [f'%{q}%']*3
+    if status in ('Posted','VoidRequested','Void'): sql+=' AND s.status=?'; params.append(status)
+    sql,params=add_date_filter(sql,'s.trx_date',start,end,params)
+    p=paginate_query(sql+' ORDER BY s.id DESC',params,page,20); rows=p['rows']
+    sum_sql='SELECT COUNT(*) n,COALESCE(SUM(total),0) total,COALESCE(SUM(paid),0) paid FROM sales s WHERE s.trx_date BETWEEN ? AND ?'; sum_params=[start,end]
+    if branch_mode:
+        if bid: sum_sql+=' AND s.branch_id=?'; sum_params.append(bid)
+        else: sum_sql+=' AND 1=0'
+    if status in ('Posted','VoidRequested','Void'): sum_sql+=' AND s.status=?'; sum_params.append(status)
+    else: sum_sql+=' AND s.status<>"Void"'
+    summary=q_one(sum_sql,sum_params)
+    pag_html=render_pagination(p,'sales_history',{'start':start,'end':end,'q':q,'status':status})
+    body=render_template_string(r'''
+    <div class="sales-suite history-suite"><header class="sales-hero"><div><span>BRANCH SALES LEDGER</span><h2>Riwayat Transaksi Kasir</h2><p>{% if branch_mode %}Hanya transaksi dari <b>{{branch_name}}</b> yang ditampilkan. Data PUSAT dan cabang lain tidak ikut masuk.{% else %}Monitoring transaksi seluruh cabang dengan identitas lokasi yang jelas.{% endif %}</p></div><div class="sales-hero-chip"><small>Lokasi aktif</small><b>{{branch_name}}</b></div></header>
+    {% if branch_warning %}<div class="branch-config-warning"><b>Konfigurasi cabang</b><span>{{branch_warning}}</span></div>{% endif %}<section class="cashier-history-kpis"><article><span>Total transaksi</span><b>{{summary.n}}</b><small>{{start}} s/d {{end}}</small></article><article><span>Nilai transaksi</span><b>{{rupiah(summary.total)}}</b><small>Sesuai filter lokasi</small></article><article><span>Dana diterima</span><b>{{rupiah(summary.paid)}}</b><small>Pembayaran tercatat</small></article></section>
+    <section class="card sales-panel"><div class="sales-panel-head cashier-history-head"><div><span class="sales-kicker">TRANSACTION STREAM</span><h3>Aktivitas Kasir {{branch_name}}</h3><p>{{p.total}} transaksi ditemukan.</p></div><form method="get" class="cashier-history-filter"><input name="q" value="{{q}}" placeholder="Cari invoice, pelanggan, atau kasir"><select name="status"><option value="">Semua status</option>{% for x in ['Posted','VoidRequested','Void'] %}<option value="{{x}}" {{'selected' if status==x else ''}}>{{x}}</option>{% endfor %}</select><input type="date" name="start" value="{{start}}"><input type="date" name="end" value="{{end}}"><button class="btn btn-ghost">Terapkan</button></form></div><div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Tanggal</th><th>Kasir</th><th>Pelanggan</th><th>Lokasi</th><th>Metode</th><th>Total</th><th>Status</th><th>Aksi</th></tr></thead><tbody>{% for r in rows %}<tr><td><code>{{r.invoice_no}}</code></td><td>{{r.trx_date}}</td><td>{{r.kasir_name or '-'}}</td><td>{{r.pelanggan}}</td><td><span class="badge badge-info">{{r.branch_name}}</span></td><td>{{(r.payment_method or 'tunai')|upper}}</td><td><b>{{rupiah(r.total)}}</b></td><td><span class="badge {{'badge-success' if r.status=='Posted' else 'badge-warn' if r.status=='VoidRequested' else 'badge-danger'}}">{{r.status}}</span></td><td><div class="cashier-row-actions"><a href="{{url_for('receipt_pdf',sale_id=r.id)}}" class="btn btn-sm btn-ghost">Struk</a>{% if r.status=='Posted' and not manager_readonly %}<form method="post"><input type="hidden" name="sale_id" value="{{r.id}}"><input type="hidden" name="reason" value="Void dari riwayat kasir"><button class="btn-sm btn-danger" data-confirm="Ajukan void {{r.invoice_no}}?">Void</button></form>{% endif %}</div></td></tr>{% else %}<tr><td colspan="9" class="muted text-center">Tidak ada transaksi pada cabang dan periode ini.</td></tr>{% endfor %}</tbody></table></div><div class="sales-pagination">{{pag_html|safe}}</div></section></div>
+    ''',rows=rows,p=p,summary=summary,branch_mode=branch_mode,branch_name=branch_name,branch_warning=branch_warning,manager_readonly=(user['role']=='manager'),start=start,end=end,q=q,status=status,pag_html=pag_html,rupiah=rupiah)
+    return render_page('Riwayat Transaksi Kasir',body)
 
 @app.route('/receipt-pdf/<int:sale_id>')
 @login_required
@@ -6461,6 +6816,10 @@ def receipt_pdf(sale_id):
     sale = q_one('SELECT s.*, COALESCE(m.name, s.customer_name, "Umum") as pelanggan, u.full_name as kasir_name FROM sales s LEFT JOIN members m ON m.id=s.member_id LEFT JOIN users u ON u.id=s.cashier_id WHERE s.id=?', [sale_id])
     if not sale:
         flash('Transaksi tidak ditemukan.', 'error')
+        return redirect(url_for('sales_history'))
+    role=current_user()['role']; current_bid=get_branch_id()
+    if role not in ('admin','bendahara','supervisor') and ((sale['branch_id'] or None)!=(current_bid or None)):
+        flash('Struk transaksi cabang lain tidak dapat diakses.', 'error')
         return redirect(url_for('sales_history'))
     items = q_all('SELECT * FROM sales_items WHERE sales_id=?', [sale_id])
 
@@ -6541,35 +6900,22 @@ def receipt_pdf(sale_id):
 @login_required
 @role_required('admin', 'kasir', 'bendahara', 'branch_admin')
 def daily_report():
-    target_date = request.args.get('date', today_str())
-    # Aggregat per metode bayar
-    pay_methods = q_all('''SELECT payment_method, COUNT(*) as cnt, COALESCE(SUM(total),0) as total
-        FROM sales WHERE trx_date=? AND status='Posted'
-        GROUP BY payment_method ORDER BY total DESC''', [target_date])
-    # Detail transaksi
-    rows = q_all('''SELECT s.*, COALESCE(m.name,s.customer_name,'Umum') as pelanggan, u.full_name as kasir_name
-        FROM sales s LEFT JOIN members m ON m.id=s.member_id LEFT JOIN users u ON u.id=s.cashier_id
-        WHERE s.trx_date=? AND s.status='Posted' ORDER BY s.id ASC''', [target_date])
-    total_sales = q_one('SELECT COUNT(*) as n, COALESCE(SUM(total),0) as t, COALESCE(SUM(paid),0) as p FROM sales WHERE trx_date=? AND status="Posted"', [target_date])
-    # Retur hari ini
-    returns = q_all('SELECT r.*, s.invoice_no FROM sales_returns r LEFT JOIN sales s ON s.id=r.sales_id WHERE r.return_date=? ORDER BY r.id DESC', [target_date])
-    total_return = q_one('SELECT COALESCE(SUM(total),0) as x FROM sales_returns WHERE return_date=?', [target_date])['x'] or 0
-    # Top produk hari ini
-    top_products = q_all('''SELECT p.product_name, COALESCE(SUM(si.qty),0) as qty, COALESCE(SUM(si.subtotal),0) as revenue
-        FROM sales_items si JOIN sales s ON s.id=si.sales_id JOIN products p ON p.id=si.product_id
-        WHERE s.trx_date=? AND s.status='Posted'
-        GROUP BY si.product_id ORDER BY revenue DESC LIMIT 5''', [target_date])
-    # Angsuran hari ini
-    loan_pay_today = q_one('SELECT COUNT(*) as n, COALESCE(SUM(amount),0) as t FROM loan_payments WHERE payment_date=? AND status="VERIFIED"', [target_date])
-    # Topup hari ini
-    topup_today = q_one('SELECT COUNT(*) as n, COALESCE(SUM(nominal),0) as t FROM topup_requests WHERE status="APPROVED" AND substr(approved_at,1,10)=?', [target_date])
-    # Quick cashier queue hari ini
-    qc_today = q_all('SELECT * FROM quick_cashier_queue WHERE trx_date=? ORDER BY id ASC', [target_date])
-    net_total = float(total_sales['t'] or 0) - float(total_return)
+    target_date=request.args.get('date',today_str()); user=current_user(); bid=get_branch_id(); scoped=is_branch_role(user)
+    sw=' AND branch_id=?' if scoped and bid else (' AND branch_id IS NULL' if scoped else ''); sp=[bid] if scoped and bid else []
+    pay_methods=q_all(f'''SELECT payment_method,COUNT(*) cnt,COALESCE(SUM(total),0) total FROM sales WHERE trx_date=? AND status='Posted'{sw} GROUP BY payment_method ORDER BY total DESC''',[target_date]+sp)
+    rows=q_all(f'''SELECT s.*,COALESCE(m.name,s.customer_name,'Umum') pelanggan,u.full_name kasir_name FROM sales s LEFT JOIN members m ON m.id=s.member_id LEFT JOIN users u ON u.id=s.cashier_id WHERE s.trx_date=? AND s.status='Posted'{sw.replace('branch_id','s.branch_id')} ORDER BY s.id''',[target_date]+sp)
+    total_sales=q_one(f'''SELECT COUNT(*) n,COALESCE(SUM(total),0)t,COALESCE(SUM(paid),0)p FROM sales WHERE trx_date=? AND status='Posted'{sw}''',[target_date]+sp)
+    returns=q_all(f'''SELECT r.*,s.invoice_no FROM sales_returns r JOIN sales s ON s.id=r.sales_id WHERE r.return_date=?{sw.replace('branch_id','s.branch_id')} ORDER BY r.id DESC''',[target_date]+sp)
+    total_return=sum(float(r['total'] or 0) for r in returns)
+    top_products=q_all(f'''SELECT p.product_name,COALESCE(SUM(si.qty),0)qty,COALESCE(SUM(si.subtotal),0)revenue FROM sales_items si JOIN sales s ON s.id=si.sales_id JOIN products p ON p.id=si.product_id WHERE s.trx_date=? AND s.status='Posted'{sw.replace('branch_id','s.branch_id')} GROUP BY si.product_id ORDER BY revenue DESC LIMIT 5''',[target_date]+sp)
+    loan_pay_today={'n':0,'t':0}; topup_today={'n':0,'t':0}
+    qw=' AND stock_branch_id=?' if scoped and bid else (' AND stock_branch_id IS NULL' if scoped else '')
+    qc_today=q_all(f'SELECT * FROM quick_cashier_queue WHERE trx_date=?{qw} ORDER BY id',[target_date]+sp)
+    net_total=float(total_sales['t'] or 0)-float(total_return); branch_name=get_branch_name(bid)
     body = render_template_string('''
     <div class="card">
         <div class="kartu">
-            <div><h2>📊 Laporan Penjualan Harian</h2><div class="muted small">Rekonsiliasi kasir per hari</div></div>
+            <div><h2>📊 Laporan Penjualan Harian</h2><div class="muted small">Rekonsiliasi kasir per hari · {{branch_name if scoped else "Semua Cabang"}}</div></div>
             <form method="get" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;">
                 <div><label class="small muted">Tanggal</label><input type="date" name="date" value="{{ target_date }}" onchange="this.form.submit()" style="width:160px;"></div>
                 <a href="{{ url_for('daily_report_pdf', date=target_date) }}" class="btn btn-sm">🖨️ PDF</a>
@@ -6640,18 +6986,22 @@ def daily_report():
     {% endif %}
     ''', target_date=target_date, rows=rows, total_sales=total_sales, total_return=total_return, net_total=net_total,
         pay_methods=pay_methods, top_products=top_products, loan_pay_today=loan_pay_today, topup_today=topup_today,
-        qc_today=qc_today, returns=returns, rupiah=rupiah)
+        qc_today=qc_today, returns=returns, rupiah=rupiah, branch_name=branch_name, scoped=scoped)
     return render_page(f'Laporan Harian — {target_date}', body)
 
 @app.route('/daily-report-pdf/<date>')
 @login_required
 @role_required('admin', 'kasir', 'bendahara', 'branch_admin')
 def daily_report_pdf(date):
-    rows = q_all('''SELECT s.*, COALESCE(m.name,s.customer_name,'Umum') as pelanggan, u.full_name as kasir_name
-        FROM sales s LEFT JOIN members m ON m.id=s.member_id LEFT JOIN users u ON u.id=s.cashier_id
-        WHERE s.trx_date=? AND s.status='Posted' ORDER BY s.id ASC''', [date])
-    total_sales = q_one('SELECT COUNT(*) as n, COALESCE(SUM(total),0) as t, COALESCE(SUM(paid),0) as p FROM sales WHERE trx_date=? AND status="Posted"', [date])
-    pay_methods = q_all('''SELECT payment_method, COUNT(*) as cnt, COALESCE(SUM(total),0) as total FROM sales WHERE trx_date=? AND status='Posted' GROUP BY payment_method''', [date])
+    user=current_user()
+    bid,branch_warning=resolve_operational_branch(user)
+    scoped=user['role'] in ('branch_admin','branch_cashier','kasir')
+    clause=(' AND s.branch_id=?' if bid else ' AND 1=0') if scoped else ''
+    bp=[bid] if scoped and bid else []
+    rows=q_all(f'''SELECT s.*,COALESCE(m.name,s.customer_name,'Umum') pelanggan,u.full_name kasir_name FROM sales s LEFT JOIN members m ON m.id=s.member_id LEFT JOIN users u ON u.id=s.cashier_id WHERE s.trx_date=? AND s.status='Posted'{clause} ORDER BY s.id''',[date]+bp)
+    total_sales=q_one(f'''SELECT COUNT(*) n,COALESCE(SUM(s.total),0)t,COALESCE(SUM(s.paid),0)p FROM sales s WHERE s.trx_date=? AND s.status='Posted'{clause}''',[date]+bp)
+    pay_methods=q_all(f'''SELECT s.payment_method,COUNT(*) cnt,COALESCE(SUM(s.total),0) total FROM sales s WHERE s.trx_date=? AND s.status='Posted'{clause} GROUP BY s.payment_method''',[date]+bp)
+    report_branch=get_branch_name(bid) if scoped else 'Semua Cabang'
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     w, h = A4
@@ -6660,7 +7010,7 @@ def daily_report_pdf(date):
     c.drawString(15*mm, y, 'LAPORAN PENJUALAN HARIAN')
     y -= 8*mm
     c.setFont('Helvetica', 10)
-    c.drawString(15*mm, y, f'Tanggal: {date}')
+    c.drawString(15*mm, y, f'Tanggal: {date} | Lokasi: {report_branch}')
     y -= 5*mm
     c.drawString(15*mm, y, f'Total Transaksi: {total_sales["n"]} | Total Penjualan: Rp {float(total_sales["t"]):,.0f} | Diterima: Rp {float(total_sales["p"]):,.0f}')
     y -= 8*mm
@@ -6743,24 +7093,28 @@ def savings():
     return render_page('Simpanan', body)
 
 def compute_loan_terms(principal, admin_fee, rate_monthly, tenor_month, method='FLAT'):
-    """Single source of truth for loan simulation and final calculation."""
-    principal = max(0.0, float(principal or 0))
-    admin_fee = max(0.0, float(admin_fee or 0))
-    rate = max(0.0, float(rate_monthly or 0)) / 100.0
-    tenor = max(1, int(tenor_month or 1))
+    """Single source of truth with bounded, stable flat/annuity calculation."""
+    principal = max(0.0, min(parse_float(principal), 1_000_000_000_000.0))
+    admin_fee = max(0.0, min(parse_float(admin_fee), 1_000_000_000_000.0))
+    rate_percent = max(0.0, min(parse_float(rate_monthly), 100.0))
+    rate = rate_percent / 100.0
+    try: tenor = max(1, min(int(tenor_month or 1), 600))
+    except Exception: tenor = 1
     method = (method or 'FLAT').upper()
+    if method not in ('FLAT', 'ANUITAS'): method = 'FLAT'
     if method == 'ANUITAS' and rate > 0:
-        base_monthly = principal * rate * ((1 + rate) ** tenor) / (((1 + rate) ** tenor) - 1)
-        total_interest = (base_monthly * tenor) - principal
+        # Stable equivalent of P*r*(1+r)^n/((1+r)^n-1), avoids power overflow.
+        discount = (1.0 + rate) ** (-tenor)
+        base_monthly = principal * rate / max(1e-12, 1.0 - discount)
+        total_interest = max(0.0, base_monthly * tenor - principal)
     else:
         total_interest = principal * rate * tenor
     total_receivable = principal + total_interest + admin_fee
     monthly_installment = total_receivable / tenor
-    return {
-        'principal': round(principal, 2), 'admin_fee': round(admin_fee, 2),
-        'total_interest': round(total_interest, 2), 'total_receivable': round(total_receivable, 2),
-        'monthly_installment': round(monthly_installment, 2), 'tenor': tenor, 'method': method
-    }
+    values = [principal, admin_fee, total_interest, total_receivable, monthly_installment]
+    if not all(v == v and abs(v) != float('inf') for v in values):
+        raise ValueError('Hasil perhitungan kredit tidak valid. Periksa bunga dan tenor.')
+    return {'principal':round(principal,2),'admin_fee':round(admin_fee,2),'total_interest':round(total_interest,2),'total_receivable':round(total_receivable,2),'monthly_installment':round(monthly_installment,2),'tenor':tenor,'method':method,'rate_percent':rate_percent}
 
 LOAN_STATUS_META = {
     'SUBMITTED': ('Menunggu Pemeriksaan', 'badge-warn', 25),
@@ -6971,7 +7325,7 @@ def users():
                     flash('Username sudah ada.', 'error')
     rows = q_all('SELECT u.*, b.name as branch_name FROM users u LEFT JOIN koperasi_branches b ON b.id = u.branch_id ORDER BY u.id DESC')
     branches = q_all('SELECT id, branch_code, name FROM koperasi_branches WHERE is_active=1 ORDER BY name')
-    users_body = '''<div class="grid"><div class="col-4"><div class="card"><h2>Tambah User</h2><form method="post"><div class="form-group"><label>Username</label><input name="username" placeholder="Username"></div><div class="form-group"><label>Nama</label><input name="full_name" placeholder="Nama"></div><div class="form-group"><label>Password</label><input type="password" name="password" placeholder="Password"></div><div class="form-group"><label>Role</label><select name="role" id="sel_role" onchange="showBranch()"><option value="admin">admin</option><option value="kasir">kasir</option><option value="bendahara">bendahara</option><option value="supervisor">supervisor</option><option value="branch_admin">Admin Cabang</option><option value="branch_cashier">Kasir Cabang</option></select></div><div class="form-group" id="branch_wrap" style="display:none;"><label>Pilih Cabang</label><select name="branch_id"><option value="">— Tanpa Cabang —</option>{% for b in branches %}<option value="{{ b.id }}">{{ b.branch_code }} — {{ b.name }}</option>{% endfor %}</select></div><button type="submit">Simpan</button></form></div></div><div class="col-8"><div class="card"><h2>Daftar User</h2><div class="table-wrap"><table><thead><tr><th>Username</th><th>Nama</th><th>Role</th><th>Cabang</th><th>Status</th><th>Aksi</th></tr></thead><tbody>{% for r in rows %}<tr><td>{{ r.username }}</td><td>{{ r.full_name }}</td><td><span class="badge badge-info">{{ r.role }}</span></td><td>{{ r.branch_name or '-' }}</td><td><span class="badge {% if r.active %}badge-success{% else %}badge-danger{% endif %}">{% if r.active %}Aktif{% else %}Nonaktif{% endif %}</span></td><td><form method="post" style="margin:0;display:inline;"><input type="hidden" name="action" value="toggle_status"><input type="hidden" name="user_id" value="{{ r.id }}"><button type="submit" class="btn-sm {% if r.active %}btn-danger{% else %}btn-success{% endif %}">{% if r.active %}Nonaktifkan{% else %}Aktifkan{% endif %}</button></form></td></tr>{% else %}<tr><td colspan="6" class="muted text-center">Belum ada user.</td></tr>{% endfor %}</tbody></table></div></div></div></div><script>function showBranch(){var r=document.getElementById('sel_role').value;document.getElementById('branch_wrap').style.display=(r==='branch_admin'||r==='branch_cashier')?'block':'none';}</script>'''
+    users_body = '''<div class="grid"><div class="col-4"><div class="card"><h2>Tambah User</h2><form method="post"><div class="form-group"><label>Username</label><input name="username" placeholder="Username"></div><div class="form-group"><label>Nama</label><input name="full_name" placeholder="Nama"></div><div class="form-group"><label>Password</label><input type="password" name="password" placeholder="Password"></div><div class="form-group"><label>Role</label><select name="role" id="sel_role" onchange="showBranch()"><option value="admin">admin</option><option value="kasir">kasir</option><option value="bendahara">bendahara</option><option value="supervisor">supervisor</option><option value="manager">Manager Monitoring</option><option value="branch_admin">Admin Cabang</option><option value="branch_cashier">Kasir Cabang</option></select></div><div class="form-group" id="branch_wrap" style="display:none;"><label>Pilih Cabang</label><select name="branch_id"><option value="">— Tanpa Cabang —</option>{% for b in branches %}<option value="{{ b.id }}">{{ b.branch_code }} — {{ b.name }}</option>{% endfor %}</select></div><button type="submit">Simpan</button></form></div></div><div class="col-8"><div class="card"><h2>Daftar User</h2><div class="table-wrap"><table><thead><tr><th>Username</th><th>Nama</th><th>Role</th><th>Cabang</th><th>Status</th><th>Aksi</th></tr></thead><tbody>{% for r in rows %}<tr><td>{{ r.username }}</td><td>{{ r.full_name }}</td><td><span class="badge badge-info">{{ r.role }}</span></td><td>{{ r.branch_name or '-' }}</td><td><span class="badge {% if r.active %}badge-success{% else %}badge-danger{% endif %}">{% if r.active %}Aktif{% else %}Nonaktif{% endif %}</span></td><td><form method="post" style="margin:0;display:inline;"><input type="hidden" name="action" value="toggle_status"><input type="hidden" name="user_id" value="{{ r.id }}"><button type="submit" class="btn-sm {% if r.active %}btn-danger{% else %}btn-success{% endif %}">{% if r.active %}Nonaktifkan{% else %}Aktifkan{% endif %}</button></form></td></tr>{% else %}<tr><td colspan="6" class="muted text-center">Belum ada user.</td></tr>{% endfor %}</tbody></table></div></div></div></div><script>function showBranch(){var r=document.getElementById('sel_role').value;document.getElementById('branch_wrap').style.display=(r==='branch_admin'||r==='branch_cashier')?'block':'none';}</script>'''
     body = render_template_string(users_body, rows=rows, branches=branches)
     return render_page('Manajemen Pengguna', body)
 
@@ -7017,7 +7371,7 @@ def approvals():
             if action == 'approve':
                 items = q_all('SELECT * FROM sales_items WHERE sales_id=?', [sale['id']])
                 for it in items:
-                    exec_sql('UPDATE products SET stock = stock + ? WHERE id=?', [it['qty'], it['product_id']])
+                    update_branch_stock(it['product_id'],it['qty'],sale['branch_id'],'add')
                 exec_sql('UPDATE approval_requests SET status="Approved", approved_by=?, approved_at=? WHERE id=?', [session.get('user_id'), now_str(), approval_id])
                 exec_sql('UPDATE sales SET status="Void" WHERE id=?', [sale['id']])
                 log_action('APPROVE', 'approval_requests', approval_id, f'Approve void {sale["invoice_no"]}')
@@ -7055,44 +7409,117 @@ def accounting():
     body = render_template_string('<div class="card"><h2>📒 Akuntansi</h2><div class="grid"><div class="col-4"><h3>Tambah Akun</h3><form method="post"><input type="hidden" name="action" value="add_account"><div class="form-group"><label>Kode</label><input name="account_code" placeholder="Kode"></div><div class="form-group"><label>Nama</label><input name="account_name" placeholder="Nama akun"></div><div class="form-group"><label>Kategori</label><select name="category"><option>Aset</option><option>Kewajiban</option><option>Modal</option><option>Pendapatan</option><option>Beban</option></select></div><div class="form-group"><label>Saldo Normal</label><select name="normal_balance"><option>Debit</option><option>Kredit</option></select></div><button type="submit">Simpan</button></form></div><div class="col-8"><h3>COA</h3><div class="table-wrap"><table><thead><tr><th>Kode</th><th>Nama</th><th>Kategori</th></tr></thead><tbody>{% for a in coa %}<tr><td>{{ a.account_code }}</td><td>{{ a.account_name }}</td><td>{{ a.category }}</td></tr>{% else %}<tr><td colspan="3" class="muted text-center">Belum ada.</td></tr>{% endfor %}</tbody></table></div><hr><h3>Jurnal</h3><div class="table-wrap"><table><thead><tr><th>Tanggal</th><th>Deskripsi</th><th>Akun</th><th>Debit</th><th>Kredit</th></tr></thead><tbody>{% for j in journal %}<tr><td>{{ j.entry_date }}</td><td>{{ j.description }}</td><td>{{ j.account_code }} — {{ j.account_name }}</td><td>{{ rupiah(j.debit) }}</td><td>{{ rupiah(j.credit) }}</td></tr>{% else %}<tr><td colspan="5" class="muted text-center">Belum ada jurnal.</td></tr>{% endfor %}</tbody></table></div></div></div></div>', coa=coa, journal=journal, rupiah=rupiah)
     return render_page('Akuntansi', body)
 
+CSS_DESIGN += r"""
+/* Neural analytics visual language */
+.ai-report-suite{display:grid;gap:14px}.ai-report-hero{position:relative;display:flex;justify-content:space-between;align-items:flex-end;gap:22px;overflow:hidden;padding:28px;border-radius:16px;background:radial-gradient(circle at 82% 22%,rgba(49,130,206,.24),transparent 26%),linear-gradient(125deg,#081321,#142a43);color:#fff;box-shadow:0 18px 45px rgba(8,19,33,.2)}.ai-report-hero:after{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(104,211,194,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(104,211,194,.055) 1px,transparent 1px);background-size:28px 28px;mask-image:linear-gradient(90deg,transparent,#000 35%,#000)}.ai-hairlines{position:absolute;right:0;top:0;width:48%;height:100%;opacity:.8;background:repeating-radial-gradient(ellipse at 100% 0,transparent 0 15px,rgba(94,234,212,.18) 16px 17px,transparent 18px 31px);transform:rotate(-8deg)}.ai-report-copy,.ai-period{position:relative;z-index:2}.ai-report-copy>span,.ai-panel header span{color:#5eead4;font-size:8px;font-weight:900;letter-spacing:.18em}.ai-report-copy h2{margin:6px 0;color:#fff;font-size:28px;letter-spacing:-.045em}.ai-report-copy p{margin:0;color:#b8c8d9;font-size:10px}.ai-period{display:flex;align-items:end;gap:8px;padding:11px;border:1px solid rgba(255,255,255,.12);border-radius:11px;background:rgba(255,255,255,.07);backdrop-filter:blur(12px)}.ai-period label{color:#a8b8ca!important}.ai-period input{display:block;margin-top:4px}.ai-kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.ai-kpis article{position:relative;overflow:hidden;padding:16px;border:1px solid #d8e1ea;border-radius:11px;background:linear-gradient(145deg,#fff,#f8fbfd)}.ai-kpis article:before{content:'';position:absolute;left:0;top:0;width:3px;height:100%;background:linear-gradient(#2457d6,#5eead4)}.ai-kpis span,.ai-kpis b,.ai-kpis small{display:block}.ai-kpis span{color:#667085;font-size:8px;font-weight:900;text-transform:uppercase}.ai-kpis b{margin:8px 0 4px;font-size:19px;letter-spacing:-.04em}.ai-kpis small{color:#98a2b3;font-size:8px}.ai-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.ai-panel{position:relative;overflow:hidden;border:1px solid #d8e1ea;border-radius:13px;background:#fff;box-shadow:0 3px 12px rgba(15,31,48,.04)}.ai-panel:after{content:'';position:absolute;pointer-events:none;right:-40px;top:-40px;width:140px;height:140px;border:1px solid rgba(36,87,214,.07);border-radius:50%;box-shadow:0 0 0 16px rgba(36,87,214,.025),0 0 0 32px rgba(36,87,214,.018)}.ai-panel.ai-wide{grid-column:1/-1}.ai-panel header{position:relative;z-index:1;display:flex;justify-content:space-between;align-items:center;padding:17px 19px;border-bottom:1px solid #e7edf3}.ai-panel header h3{margin:4px 0 0;font-size:15px}.ai-panel header i{padding:5px 8px;border-radius:99px;background:#e8faf6;color:#087e6a;font-size:7px;font-style:normal;font-weight:900}.signal-chart{display:flex;align-items:end;gap:8px;height:260px;padding:30px 20px 18px;overflow-x:auto;background:linear-gradient(180deg,#fbfdff,#fff)}.signal-point{position:relative;display:grid;grid-template-rows:1fr auto;align-items:end;min-width:36px;height:100%;flex:1}.signal-point i{position:relative;height:var(--h);min-height:3px;border-radius:7px 7px 2px 2px;background:linear-gradient(180deg,#5eead4,#2457d6);box-shadow:0 0 18px rgba(36,87,214,.18)}.signal-point i:after{content:'';position:absolute;left:50%;top:-4px;width:8px;height:8px;border:2px solid #fff;border-radius:50%;background:#5eead4;transform:translateX(-50%);box-shadow:0 0 0 3px rgba(94,234,212,.16)}.signal-point span{text-align:center;color:#667085;font-size:7px}.signal-point b{position:absolute;left:50%;bottom:calc(var(--h) + 8px);font-size:7px;white-space:nowrap;transform:translateX(-50%);opacity:0}.signal-point:hover b{opacity:1}.ai-bars{display:grid;gap:14px;padding:18px}.ai-bars p{display:flex;justify-content:space-between;gap:12px;margin:0 0 6px;font-size:9px}.ai-bars p span{color:#667085}.ai-bars>div>i{display:block;height:7px;overflow:hidden;border-radius:99px;background:#edf1f5}.ai-bars em{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,#2457d6,#5eead4)}.product-bars em{background:linear-gradient(90deg,#7c3aed,#ec4899)}.ai-bars small{display:block;margin-top:4px;color:#98a2b3;font-size:7px}.ai-empty{padding:35px;text-align:center;color:#98a2b3}.ai-panel .table-wrap{margin:0;border:0!important;border-radius:0!important;max-height:430px}.transfer-ai-suite .ai-line-hero:before{content:'';position:absolute;right:-30px;bottom:-80px;width:420px;height:250px;background:repeating-radial-gradient(ellipse at 100% 100%,transparent 0 12px,rgba(94,234,212,.11) 13px 14px,transparent 15px 26px);transform:rotate(-10deg)}.ai-audit-card{border-top:3px solid #5eead4!important}
+@media(max-width:1000px){.ai-kpis{grid-template-columns:repeat(2,1fr)}.ai-grid{grid-template-columns:1fr}.ai-panel.ai-wide{grid-column:1}.ai-report-hero{align-items:flex-start;flex-direction:column}.ai-period{width:100%}}
+@media(max-width:768px){.ai-report-suite{padding:0 12px}.ai-report-hero{padding:20px;border-radius:20px}.ai-report-copy h2{font-size:23px}.ai-period{display:grid;grid-template-columns:1fr 1fr}.ai-period button{grid-column:1/-1}.ai-kpis{grid-template-columns:1fr 1fr}.ai-panel{border-radius:18px}.signal-chart{height:220px}.ai-hairlines{width:80%}}
+"""
+
+CSS_DESIGN += r"""
+/* FINAL VISIBLE NEURAL ANALYTICS - strong selectors to prevent legacy CSS override */
+body.page-reports .main-content{background:#f3f6fa!important}
+body.page-reports .ai-report-suite{display:grid!important;gap:16px!important;width:100%!important;max-width:none!important}
+body.page-reports .ai-report-hero{isolation:isolate;position:relative!important;display:flex!important;justify-content:space-between!important;align-items:flex-end!important;gap:24px!important;min-height:230px!important;padding:30px!important;overflow:hidden!important;border:1px solid rgba(92,225,211,.14)!important;border-radius:18px!important;background:radial-gradient(circle at 82% 18%,rgba(37,99,235,.34),transparent 28%),radial-gradient(circle at 58% 115%,rgba(45,212,191,.17),transparent 34%),linear-gradient(135deg,#07111f 0%,#10263d 58%,#18354f 100%)!important;color:#fff!important;box-shadow:0 22px 55px rgba(7,17,31,.24)!important}
+body.page-reports .ai-report-hero:before{content:''!important;position:absolute!important;inset:0!important;z-index:-2!important;background-image:linear-gradient(rgba(94,234,212,.08) 1px,transparent 1px),linear-gradient(90deg,rgba(96,165,250,.07) 1px,transparent 1px)!important;background-size:26px 26px!important;mask-image:linear-gradient(90deg,transparent 8%,#000 42%,#000)!important}
+body.page-reports .ai-report-hero:after{content:''!important;position:absolute!important;right:-95px!important;top:-135px!important;z-index:-1!important;width:460px!important;height:460px!important;border:1px solid rgba(94,234,212,.27)!important;border-radius:50%!important;box-shadow:0 0 0 18px rgba(94,234,212,.08),0 0 0 38px rgba(96,165,250,.055),0 0 0 62px rgba(94,234,212,.035),0 0 85px rgba(37,99,235,.22)!important}
+body.page-reports .ai-hairlines{display:block!important;position:absolute!important;inset:-50px -20px -60px 42%!important;z-index:-1!important;opacity:1!important;background:repeating-radial-gradient(ellipse at 100% 10%,transparent 0 12px,rgba(94,234,212,.24) 13px 14px,transparent 15px 29px)!important;transform:rotate(-9deg)!important;filter:drop-shadow(0 0 7px rgba(45,212,191,.22))!important}
+body.page-reports .ai-report-copy{position:relative!important;z-index:2!important;max-width:650px!important}
+body.page-reports .ai-report-copy:after{content:'';display:block;width:190px;height:1px;margin-top:18px;background:linear-gradient(90deg,#5eead4,rgba(94,234,212,0));box-shadow:0 7px 0 rgba(96,165,250,.28),0 14px 0 rgba(94,234,212,.13)}
+body.page-reports .ai-report-copy>span{color:#67e8f9!important;font-size:9px!important;font-weight:950!important;letter-spacing:.22em!important}
+body.page-reports .ai-report-copy h2{margin:7px 0 7px!important;color:#fff!important;font-size:31px!important;line-height:1.06!important;letter-spacing:-.05em!important}
+body.page-reports .ai-report-copy p{margin:0!important;color:#b8ccdd!important;font-size:11px!important;line-height:1.65!important}
+body.page-reports .ai-report-copy p b{color:#fff!important}
+body.page-reports .ai-period{position:relative!important;z-index:3!important;display:grid!important;grid-template-columns:1fr 1fr!important;gap:9px!important;min-width:340px!important;padding:13px!important;border:1px solid rgba(255,255,255,.16)!important;border-radius:13px!important;background:rgba(255,255,255,.09)!important;box-shadow:inset 0 1px rgba(255,255,255,.08)!important;backdrop-filter:blur(16px)!important}
+body.page-reports .ai-period label{color:#bdd0df!important;font-size:8px!important}
+body.page-reports .ai-period input{width:100%!important;margin-top:5px!important;border-color:rgba(255,255,255,.18)!important;background:rgba(255,255,255,.96)!important}
+body.page-reports .ai-period button{grid-column:1/-1!important;background:linear-gradient(90deg,#2563eb,#0f9f97)!important;border:0!important;box-shadow:0 10px 24px rgba(37,99,235,.25)!important}
+body.page-reports .ai-kpis{display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;gap:11px!important}
+body.page-reports .ai-kpis article{position:relative!important;min-width:0!important;overflow:hidden!important;padding:18px!important;border:1px solid #d9e2ec!important;border-radius:13px!important;background:linear-gradient(145deg,#fff,#f7fbff)!important;box-shadow:0 7px 20px rgba(24,51,74,.045)!important}
+body.page-reports .ai-kpis article:before{content:''!important;position:absolute!important;left:0!important;top:0!important;width:4px!important;height:100%!important;background:linear-gradient(180deg,#2563eb,#2dd4bf)!important}
+body.page-reports .ai-kpis article:after{content:'';position:absolute;right:-26px;top:-30px;width:92px;height:92px;border:1px solid rgba(37,99,235,.08);border-radius:50%;box-shadow:0 0 0 11px rgba(45,212,191,.025)}
+body.page-reports .ai-kpis span{color:#64748b!important;font-size:8px!important;font-weight:950!important;letter-spacing:.09em!important;text-transform:uppercase!important}
+body.page-reports .ai-kpis b{display:block!important;margin:9px 0 4px!important;color:#0f2135!important;font-size:20px!important;line-height:1.1!important;letter-spacing:-.045em!important}
+body.page-reports .ai-kpis small{color:#94a3b8!important;font-size:8px!important}
+body.page-reports .ai-grid{display:grid!important;grid-template-columns:minmax(0,1.2fr) minmax(320px,.8fr)!important;gap:14px!important}
+body.page-reports .ai-panel{position:relative!important;overflow:hidden!important;margin:0!important;padding:0!important;border:1px solid #d9e2ec!important;border-radius:15px!important;background:linear-gradient(180deg,#fff,#fbfdff)!important;box-shadow:0 8px 24px rgba(15,35,52,.05)!important}
+body.page-reports .ai-panel:before{content:'';position:absolute;inset:0;pointer-events:none;background-image:linear-gradient(rgba(37,99,235,.028) 1px,transparent 1px),linear-gradient(90deg,rgba(45,212,191,.025) 1px,transparent 1px);background-size:23px 23px;mask-image:linear-gradient(180deg,#000,transparent 72%)}
+body.page-reports .ai-panel:after{content:''!important;position:absolute!important;right:-50px!important;top:-55px!important;width:170px!important;height:170px!important;border:1px solid rgba(37,99,235,.10)!important;border-radius:50%!important;box-shadow:0 0 0 17px rgba(45,212,191,.028),0 0 0 35px rgba(37,99,235,.018)!important}
+body.page-reports .ai-panel.ai-wide{grid-column:1/-1!important}
+body.page-reports .ai-panel header{position:relative!important;z-index:3!important;display:flex!important;justify-content:space-between!important;align-items:center!important;padding:18px 20px!important;border-bottom:1px solid #e5ecf2!important;background:rgba(255,255,255,.84)!important;backdrop-filter:blur(8px)!important}
+body.page-reports .ai-panel header span{color:#0f9f97!important;font-size:8px!important;font-weight:950!important;letter-spacing:.18em!important}
+body.page-reports .ai-panel header h3{margin:4px 0 0!important;color:#12263b!important;font-size:15px!important}
+body.page-reports .ai-panel header i{padding:5px 8px!important;border-radius:999px!important;background:#e8faf6!important;color:#087e6a!important;font-size:7px!important;font-style:normal!important;font-weight:950!important;box-shadow:0 0 0 4px rgba(45,212,191,.07)!important}
+body.page-reports .signal-chart{position:relative!important;z-index:2!important;display:flex!important;align-items:end!important;gap:9px!important;height:285px!important;padding:36px 21px 18px!important;overflow-x:auto!important;background:linear-gradient(180deg,rgba(245,250,255,.65),rgba(255,255,255,.9))!important}
+body.page-reports .signal-chart:before{content:'';position:absolute;left:20px;right:20px;top:25%;height:1px;background:#e8eef4;box-shadow:0 55px 0 #e8eef4,0 110px 0 #e8eef4,0 165px 0 #e8eef4;z-index:-1}
+body.page-reports .signal-point{position:relative!important;display:grid!important;grid-template-rows:1fr auto!important;align-items:end!important;min-width:38px!important;height:100%!important;flex:1!important}
+body.page-reports .signal-point i{position:relative!important;display:block!important;height:var(--h)!important;min-height:4px!important;border-radius:8px 8px 2px 2px!important;background:linear-gradient(180deg,#5eead4 0%,#38bdf8 40%,#2563eb 100%)!important;box-shadow:0 0 20px rgba(37,99,235,.22)!important}
+body.page-reports .signal-point i:after{content:''!important;position:absolute!important;left:50%!important;top:-5px!important;width:9px!important;height:9px!important;border:2px solid #fff!important;border-radius:50%!important;background:#5eead4!important;transform:translateX(-50%)!important;box-shadow:0 0 0 4px rgba(94,234,212,.15),0 0 14px #5eead4!important}
+body.page-reports .signal-point span{padding-top:7px!important;text-align:center!important;color:#64748b!important;font-size:7px!important;font-weight:800!important}
+body.page-reports .signal-point b{position:absolute!important;left:50%!important;bottom:calc(var(--h) + 10px)!important;z-index:5!important;padding:4px 6px!important;border-radius:5px!important;background:#0f2135!important;color:#fff!important;font-size:7px!important;white-space:nowrap!important;transform:translateX(-50%)!important;opacity:0!important;transition:.18s!important}
+body.page-reports .signal-point:hover b{opacity:1!important}
+body.page-reports .ai-bars{position:relative!important;z-index:2!important;display:grid!important;gap:15px!important;padding:20px!important}
+body.page-reports .ai-bars p{display:flex!important;justify-content:space-between!important;gap:12px!important;margin:0 0 7px!important;font-size:9px!important}
+body.page-reports .ai-bars p b{color:#1d3348!important}.ai-bars p span{color:#64748b!important}
+body.page-reports .ai-bars>div>i{display:block!important;height:8px!important;overflow:hidden!important;border-radius:999px!important;background:#eaf0f5!important;box-shadow:inset 0 1px 2px rgba(15,35,52,.05)!important}
+body.page-reports .ai-bars em{display:block!important;height:100%!important;border-radius:999px!important;background:linear-gradient(90deg,#2563eb,#38bdf8,#5eead4)!important;box-shadow:0 0 12px rgba(45,212,191,.18)!important}
+body.page-reports .product-bars em{background:linear-gradient(90deg,#6d28d9,#a855f7,#ec4899)!important}
+body.page-reports .ai-bars small{display:block!important;margin-top:5px!important;color:#94a3b8!important;font-size:7px!important}
+body.page-reports .ai-panel .table-wrap{position:relative!important;z-index:2!important;margin:0!important;border:0!important;border-radius:0!important;max-height:430px!important}
+body.page-reports .ai-panel table{min-width:850px!important}
+@media(max-width:1050px){body.page-reports .ai-grid{grid-template-columns:1fr!important}body.page-reports .ai-panel.ai-wide{grid-column:1!important}body.page-reports .ai-report-hero{align-items:flex-start!important;flex-direction:column!important}body.page-reports .ai-period{width:100%!important;min-width:0!important}}
+@media(max-width:768px){body.page-reports .ai-report-suite{padding:0 12px!important}body.page-reports .ai-report-hero{min-height:0!important;padding:20px!important;border-radius:21px!important}body.page-reports .ai-report-copy h2{font-size:24px!important}body.page-reports .ai-hairlines{inset:0 -120px 0 20%!important}body.page-reports .ai-kpis{grid-template-columns:1fr 1fr!important}body.page-reports .ai-kpis article{padding:14px!important}body.page-reports .ai-kpis b{font-size:15px!important}body.page-reports .ai-panel{border-radius:19px!important}body.page-reports .signal-chart{height:235px!important}}
+"""
+
+CSS_DESIGN += r"""
+/* Dashboard Analitik & Aktivitas follows the same neural visual family */
+body.page-dashboard .analytics-studio{position:relative!important;overflow:hidden!important;margin-top:22px!important;padding:22px!important;border:1px solid #d9e2ec!important;border-radius:20px!important;background:radial-gradient(circle at 92% 0,rgba(37,99,235,.13),transparent 25%),linear-gradient(145deg,#f9fcff,#f4f8fb)!important;box-shadow:0 13px 34px rgba(18,42,61,.06)!important}
+body.page-dashboard .analytics-studio:before{content:'';position:absolute;right:-90px;top:-150px;width:420px;height:420px;border:1px solid rgba(37,99,235,.09);border-radius:50%;box-shadow:0 0 0 18px rgba(45,212,191,.035),0 0 0 42px rgba(37,99,235,.025)}
+body.page-dashboard .analytics-studio:after{content:'';position:absolute;right:-35px;top:-35px;width:48%;height:260px;background:repeating-radial-gradient(ellipse at 100% 0,transparent 0 13px,rgba(15,159,151,.12) 14px 15px,transparent 16px 29px);transform:rotate(-8deg);pointer-events:none}
+body.page-dashboard .analytics-head,body.page-dashboard .analytics-layout{position:relative;z-index:2}
+body.page-dashboard .analytics-head>div:first-child>span{color:#0f9f97!important;letter-spacing:.19em!important}
+body.page-dashboard .analytics-head h2{font-size:24px!important;color:#10273b!important}
+body.page-dashboard .analytics-card,body.page-dashboard .activity-stream{position:relative!important;overflow:hidden!important;border-color:#d9e2ec!important;background:rgba(255,255,255,.94)!important;box-shadow:0 8px 26px rgba(18,42,61,.055)!important}
+body.page-dashboard .analytics-card:after,body.page-dashboard .activity-stream:after{content:'';position:absolute;right:-35px;top:-42px;width:120px;height:120px;border:1px solid rgba(37,99,235,.07);border-radius:50%;box-shadow:0 0 0 13px rgba(45,212,191,.025)}
+body.page-dashboard .analytics-card-head,body.page-dashboard .analytics-chart,body.page-dashboard .activity-list{position:relative;z-index:2}
+body.page-dashboard .analytics-card-head span{color:#0f9f97!important}
+body.page-dashboard .activity-item>i{background:linear-gradient(145deg,#e9f5ff,#e7faf5)!important;color:#2563eb!important;box-shadow:0 0 0 4px rgba(45,212,191,.06)!important}
+"""
+
 @app.route('/reports')
 @login_required
-@role_required('admin', 'bendahara', 'supervisor', 'branch_admin')
+@role_required('admin','bendahara','supervisor','branch_admin','manager')
 def reports():
-    start, end = date_range_from_request()
-    params = []
-    sql = 'SELECT invoice_no, trx_date, total, paid, change_amount, note FROM sales WHERE status="Posted"'
-    sql, params = add_date_filter(sql, 'trx_date', start, end, params)
-    sql += ' ORDER BY id DESC LIMIT 300'
-    sales_rows = q_all(sql, params)
-    params = []
-    sql = 'SELECT s.trx_no, s.trx_date, m.member_code, m.name, s.saving_type, s.direction, s.amount FROM savings_transactions s LEFT JOIN members m ON m.id=s.member_id WHERE 1=1'
-    sql, params = add_date_filter(sql, 's.trx_date', start, end, params)
-    sql += ' ORDER BY s.id DESC LIMIT 300'
-    savings_rows = q_all(sql, params)
-    loan_rows = q_all('SELECT l.loan_no, m.member_code, m.name, l.loan_date, l.total_receivable, COALESCE((SELECT SUM(amount) FROM loan_payments lp WHERE lp.loan_id=l.id),0) as paid, l.status FROM loans l LEFT JOIN members m ON m.id=l.member_id ORDER BY l.id DESC LIMIT 300')
-    body = render_template_string('''
-    <div class="card">
-        <div class="kartu"><h2>📊 Laporan</h2>
-        <form method="get" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;width:auto;">
-            <div><div class="small muted">Dari</div><input type="date" name="start" value="{{ start }}" style="width:140px;"></div>
-            <div><div class="small muted">Sampai</div><input type="date" name="end" value="{{ end }}" style="width:140px;"></div>
-            <button class="btn-ghost" type="submit">Filter</button>
-            <a href="{{ url_for('export_report', start=start, end=end) }}" class="btn btn-sm">📥 Excel</a>
-        </form></div>
-        <h3>Penjualan</h3><div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Total</th></tr></thead><tbody>{% for r in sales_rows %}<tr><td>{{ r.invoice_no }}</td><td>{{ rupiah(r.total) }}</td></tr>{% else %}<tr><td colspan="2" class="muted text-center">Belum ada.</td></tr>{% endfor %}</tbody></table></div>
-        <hr><h3>Pinjaman</h3><div class="table-wrap"><table><thead><tr><th>No</th><th>Member</th><th>Total</th><th>Terbayar</th><th>Status</th></tr></thead><tbody>{% for r in loan_rows %}<tr><td>{{ r.loan_no }}</td><td>{{ r.member_code }} — {{ r.name }}</td><td>{{ rupiah(r.total_receivable) }}</td><td>{{ rupiah(r.paid) }}</td><td><span class="badge badge-info">{{ r.status }}</span></td></tr>{% else %}<tr><td colspan="5" class="muted text-center">Belum ada.</td></tr>{% endfor %}</tbody></table></div>
-    </div>
-    ''', sales_rows=sales_rows, savings_rows=savings_rows, loan_rows=loan_rows, rupiah=rupiah, start=start, end=end)
-    return render_page('Laporan', body)
+    start,end=date_range_from_request(); user=current_user(); bid=get_branch_id(); scoped=is_branch_role(user); location=get_branch_name(bid) if scoped else 'Seluruh Cabang'
+    where=' AND s.branch_id=?' if scoped and bid else (' AND s.branch_id IS NULL' if scoped else ''); bp=[bid] if scoped and bid else []
+    sales_rows=q_all(f'''SELECT s.invoice_no,s.trx_date,s.total,s.paid,s.change_amount,s.payment_method,COALESCE(m.name,s.customer_name,'Umum') pelanggan,COALESCE(b.name,'PUSAT') branch_name FROM sales s LEFT JOIN members m ON m.id=s.member_id LEFT JOIN koperasi_branches b ON b.id=s.branch_id WHERE s.status='Posted' AND s.trx_date BETWEEN ? AND ?{where} ORDER BY s.id DESC LIMIT 500''',[start,end]+bp)
+    kpi=q_one(f'''SELECT COUNT(*) trx,COALESCE(SUM(s.total),0) revenue,COALESCE(AVG(s.total),0) avg_ticket,COALESCE(SUM(s.paid),0) received FROM sales s WHERE s.status='Posted' AND s.trx_date BETWEEN ? AND ?{where}''',[start,end]+bp)
+    returns=q_one(f'''SELECT COUNT(*) n,COALESCE(SUM(r.total),0) total FROM sales_returns r JOIN sales s ON s.id=r.sales_id WHERE r.return_date BETWEEN ? AND ?{where}''',[start,end]+bp)
+    daily=q_all(f'''SELECT s.trx_date label,COALESCE(SUM(s.total),0) total FROM sales s WHERE s.status='Posted' AND s.trx_date BETWEEN ? AND ?{where} GROUP BY s.trx_date ORDER BY s.trx_date''',[start,end]+bp)
+    methods=q_all(f'''SELECT COALESCE(s.payment_method,'tunai') label,COUNT(*) n,COALESCE(SUM(s.total),0) total FROM sales s WHERE s.status='Posted' AND s.trx_date BETWEEN ? AND ?{where} GROUP BY s.payment_method ORDER BY total DESC''',[start,end]+bp)
+    products=q_all(f'''SELECT p.product_name label,COALESCE(SUM(si.qty),0) qty,COALESCE(SUM(si.subtotal),0) total FROM sales_items si JOIN sales s ON s.id=si.sales_id JOIN products p ON p.id=si.product_id WHERE s.status='Posted' AND s.trx_date BETWEEN ? AND ?{where} GROUP BY si.product_id ORDER BY total DESC LIMIT 8''',[start,end]+bp)
+    net=float(kpi['revenue'] or 0)-float(returns['total'] or 0); chart_max=max([float(x['total'] or 0) for x in daily]+[1]); method_max=max([float(x['total'] or 0) for x in methods]+[1]); product_max=max([float(x['total'] or 0) for x in products]+[1])
+    body=render_template_string(r'''
+    <div class="ai-report-suite neural-visible"><header class="ai-report-hero"><div class="ai-hairlines"></div><div class="ai-report-copy"><span>NEURAL BUSINESS INTELLIGENCE</span><h2>Analitik Penjualan</h2><p>Signal transaksi, performa produk, arus pembayaran, dan retur untuk <b>{{location}}</b>.</p></div><form method="get" class="ai-period"><label>Dari<input type="date" name="start" value="{{start}}"></label><label>Sampai<input type="date" name="end" value="{{end}}"></label><button>Terapkan</button></form></header>
+    <section class="ai-kpis"><article><span>Revenue</span><b>{{rupiah(kpi.revenue)}}</b><small>{{kpi.trx}} transaksi</small></article><article><span>Penjualan Bersih</span><b>{{rupiah(net)}}</b><small>Setelah retur</small></article><article><span>Rata-rata Transaksi</span><b>{{rupiah(kpi.avg_ticket)}}</b><small>Average ticket</small></article><article><span>Retur</span><b>{{rupiah(returns.total)}}</b><small>{{returns.n}} transaksi retur</small></article></section>
+    <section class="ai-grid"><article class="ai-panel ai-wide"><header><div><span>REVENUE SIGNAL</span><h3>Gerak Penjualan Harian</h3></div><i>LIVE DATA</i></header><div class="signal-chart">{% for x in daily %}<div class="signal-point" style="--h:{{(x.total/chart_max*100)|round}}%"><b>{{rupiah(x.total)}}</b><i></i><span>{{x.label[5:]}}</span></div>{% else %}<div class="ai-empty">Belum ada data pada periode ini.</div>{% endfor %}</div></article>
+    <article class="ai-panel"><header><div><span>PAYMENT MATRIX</span><h3>Metode Pembayaran</h3></div></header><div class="ai-bars">{% for x in methods %}<div><p><b>{{x.label|upper}}</b><span>{{rupiah(x.total)}}</span></p><i><em style="width:{{x.total/method_max*100}}%"></em></i><small>{{x.n}} transaksi</small></div>{% else %}<div class="ai-empty">Belum ada data.</div>{% endfor %}</div></article>
+    <article class="ai-panel"><header><div><span>PRODUCT INTELLIGENCE</span><h3>Produk Terkuat</h3></div></header><div class="ai-bars product-bars">{% for x in products %}<div><p><b>{{x.label}}</b><span>{{rupiah(x.total)}}</span></p><i><em style="width:{{x.total/product_max*100}}%"></em></i><small>{{x.qty}} unit</small></div>{% else %}<div class="ai-empty">Belum ada data.</div>{% endfor %}</div></article>
+    <article class="ai-panel ai-wide"><header><div><span>TRANSACTION STREAM</span><h3>Aktivitas Terbaru</h3></div><a href="{{url_for('export_report',start=start,end=end)}}">Export Excel</a></header><div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Tanggal</th><th>Lokasi</th><th>Pelanggan</th><th>Metode</th><th>Total</th></tr></thead><tbody>{% for r in sales_rows %}<tr><td><code>{{r.invoice_no}}</code></td><td>{{r.trx_date}}</td><td><span class="badge badge-info">{{r.branch_name}}</span></td><td>{{r.pelanggan}}</td><td>{{r.payment_method or 'tunai'}}</td><td><b>{{rupiah(r.total)}}</b></td></tr>{% else %}<tr><td colspan="6" class="ai-empty">Belum ada transaksi.</td></tr>{% endfor %}</tbody></table></div></article></section></div>
+    ''',start=start,end=end,location=location,kpi=kpi,returns=returns,net=net,daily=daily,methods=methods,products=products,sales_rows=sales_rows,chart_max=chart_max,method_max=method_max,product_max=product_max,rupiah=rupiah)
+    return render_page('Analitik Laporan',body)
 
 @app.route('/export-report')
 @login_required
 @role_required('admin', 'bendahara', 'supervisor', 'branch_admin')
 def export_report():
     start, end = date_range_from_request()
-    params=[]; sql='SELECT invoice_no, trx_date, total, paid, change_amount, note FROM sales WHERE 1=1'
-    sql, params = add_date_filter(sql, 'trx_date', start, end, params)
+    params=[]; sql='SELECT invoice_no,trx_date,total,paid,change_amount,note,branch_id FROM sales WHERE 1=1'
+    user=current_user(); bid=get_branch_id()
+    if is_branch_role(user):
+        if bid: sql+=' AND branch_id=?'; params.append(bid)
+        else: sql+=' AND branch_id IS NULL'
+    sql,params=add_date_filter(sql,'trx_date',start,end,params)
     sales=[dict(r) for r in q_all(sql, params)]
     members=[dict(r) for r in q_all('SELECT member_code, name, phone, address, join_date, status FROM members ORDER BY id DESC')]
     return to_excel({'member': members, 'penjualan': sales}, 'koperasi_enterprise_report.xlsx')
@@ -7150,7 +7577,30 @@ def settings():
     user = current_user()
     if request.method == 'POST':
         action = request.form.get('action')
-        if action == 'update_profile_photo':
+        if action == 'update_profile_name':
+            full_name = ' '.join((request.form.get('full_name') or '').strip().split())
+            username = (request.form.get('username') or '').strip().lower()
+            if len(full_name) < 2 or len(full_name) > 80:
+                flash('Nama lengkap harus 2 sampai 80 karakter.', 'error')
+                return redirect(url_for('settings') + '#profile-identity')
+            if len(username) < 3 or len(username) > 30:
+                flash('Username harus 3 sampai 30 karakter.', 'error')
+                return redirect(url_for('settings') + '#profile-identity')
+            if not all(ch.isalnum() or ch in '._-' for ch in username):
+                flash('Username hanya boleh berisi huruf, angka, titik, garis bawah, atau tanda minus.', 'error')
+                return redirect(url_for('settings') + '#profile-identity')
+            duplicate = q_one('SELECT id FROM users WHERE LOWER(username)=LOWER(?) AND id<>?', [username, user['id']])
+            if duplicate:
+                flash('Username sudah digunakan oleh akun lain.', 'error')
+                return redirect(url_for('settings') + '#profile-identity')
+            old_name = user['full_name'] or user['username']
+            old_username = user['username']
+            exec_sql('UPDATE users SET full_name=?, username=? WHERE id=?', [full_name, username, user['id']])
+            session['username'] = username
+            log_action('UPDATE_PROFILE_NAME', 'users', user['id'], f'{old_name} ({old_username}) -> {full_name} ({username})')
+            flash('Nama dan username berhasil diperbarui.', 'success')
+            return redirect(url_for('settings') + '#profile-identity')
+        elif action == 'update_profile_photo':
             photo = request.files.get('profile_photo')
             if not photo or not photo.filename:
                 flash('Pilih foto profil terlebih dahulu.', 'error')
@@ -7238,7 +7688,7 @@ def settings():
             return redirect(url_for('settings')+'#financial-policy')
         elif action == 'save_menu_visibility' and user['role'] == 'admin':
             target_role = request.form.get('target_role', '')
-            valid_roles = {'kasir', 'bendahara', 'user', 'supervisor', 'branch_admin', 'branch_cashier'}
+            valid_roles = {'kasir','bendahara','user','supervisor','manager','branch_admin','branch_cashier'}
             if target_role not in valid_roles:
                 flash('Role tidak valid.', 'error')
                 return redirect(url_for('settings'))
@@ -7253,7 +7703,7 @@ def settings():
     
     menu_editor = ''
     if user['role'] == 'admin':
-        roles = ['kasir', 'bendahara', 'user', 'supervisor', 'branch_admin', 'branch_cashier']
+        roles = ['kasir','bendahara','user','supervisor','manager','branch_admin','branch_cashier']
         editor_parts = ['<div class="role-access-list">']
         for role in roles:
             role_label = role.replace('_', ' ').title()
@@ -7286,7 +7736,7 @@ def settings():
       <div class="smh-profile">{% if user.profile_photo %}<img src="{{ url_for('profile_photo', user_id=user.id) }}" alt="Foto profil {{ user.full_name or user.username }}">{% else %}<span>{{ (user.full_name or user.username or 'U')[0]|upper }}</span>{% endif %}<div><small>AKUN AKTIF</small><h2>{{ user.full_name or user.username }}</h2><p>{{ user.role|replace('_',' ')|title }}</p></div></div>
       <div class="smh-actions"><a href="#account-security">Ubah Password</a><form method="POST" action="{{ url_for('logout') }}"><button type="submit" data-confirm="Keluar dari aplikasi sekarang?">Keluar</button></form></div>
     </div>
-    <div class="settings-mobile-tabs" aria-label="Navigasi pengaturan"><a href="#profile-photo" class="active">Foto</a><a href="#account-security">Akun</a>{% if user.role == 'admin' %}<a href="#general-preferences">Umum</a><a href="#financial-policy">Finansial</a>{% endif %}<a href="#data-management">Backup</a>{% if user.role == 'admin' %}<a href="#role-access">Akses</a>{% endif %}</div>
+    <div class="settings-mobile-tabs" aria-label="Navigasi pengaturan"><a href="#profile-identity" class="active">Profil</a><a href="#profile-photo">Foto</a><a href="#account-security">Keamanan</a>{% if user.role == 'admin' %}<a href="#general-preferences">Umum</a><a href="#financial-policy">Finansial</a>{% endif %}<a href="#data-management">Backup</a>{% if user.role == 'admin' %}<a href="#role-access">Akses</a>{% endif %}</div>
     <div class="settings-shell">
       <aside class="settings-nav-panel">
         <span class="settings-kicker">SYSTEM PREFERENCES</span><h2>Pengaturan</h2><p>Konfigurasi identitas, tampilan, kebijakan finansial, keamanan, dan akses aplikasi.</p>
@@ -7294,6 +7744,7 @@ def settings():
       </aside>
       <div class="settings-content">
         {% if user.role == 'admin' %}<section id="general-preferences" class="settings-section"><div class="settings-section-head"><span>01</span><div><h2>Umum & Tampilan</h2><p>Atur identitas aplikasi, kepadatan antarmuka, jumlah data, dan interval notifikasi.</p></div></div><form method="post" class="settings-form settings-form-grid"><input type="hidden" name="action" value="save_general_preferences"><div class="form-group"><label>Nama Organisasi</label><input name="organization_name" value="{{cfg.organization_name}}" maxlength="80" required></div><div class="form-group"><label>Nama Singkat</label><input name="organization_short" value="{{cfg.organization_short}}" maxlength="20" required></div><div class="form-group"><label>Kepadatan Tampilan</label><select name="ui_density"><option value="compact" {% if cfg.ui_density=='compact' %}selected{% endif %}>Ringkas</option><option value="comfortable" {% if cfg.ui_density=='comfortable' %}selected{% endif %}>Nyaman</option><option value="spacious" {% if cfg.ui_density=='spacious' %}selected{% endif %}>Lapang</option></select></div><div class="form-group"><label>Data per Halaman</label><select name="per_page">{% for n in [10,20,30,50,100] %}<option value="{{n}}" {% if cfg.per_page|int==n %}selected{% endif %}>{{n}} baris</option>{% endfor %}</select></div><div class="form-group"><label>Refresh Notifikasi</label><select name="notification_seconds">{% for n in [10,20,30,60,120,300] %}<option value="{{n}}" {% if cfg.notification_seconds|int==n %}selected{% endif %}>{{n}} detik</option>{% endfor %}</select></div><div class="settings-form-actions"><button type="submit">Simpan Preferensi</button></div></form></section>{% endif %}
+        <section id="profile-identity" class="settings-section profile-identity-section"><div class="settings-section-head"><span>✎</span><div><h2>Identitas Akun</h2><p>Ubah nama yang tampil dan username untuk login.</p></div></div><form method="post" class="settings-form profile-name-form"><input type="hidden" name="action" value="update_profile_name"><div class="form-group"><label>Nama Lengkap</label><input name="full_name" value="{{ user.full_name or '' }}" minlength="2" maxlength="80" autocomplete="name" required><small class="field-note">Nama ini ditampilkan pada topbar, dashboard, dan menu akun.</small></div><div class="form-group"><label>Username Login</label><input name="username" value="{{ user.username }}" minlength="3" maxlength="30" pattern="[A-Za-z0-9._-]+" autocomplete="username" autocapitalize="none" spellcheck="false" required><small class="field-note">Gunakan huruf, angka, titik, garis bawah, atau tanda minus.</small></div><div class="profile-name-summary"><span>Pratinjau</span><b id="profileNamePreview">{{ user.full_name or user.username }}</b><small id="profileUsernamePreview">@{{ user.username }}</small></div><div class="settings-form-actions"><button type="submit" class="btn btn-success">Simpan Identitas</button></div></form></section>
         <section id="profile-photo" class="settings-section profile-photo-section"><div class="settings-section-head"><span>👤</span><div><h2>Foto Profil</h2><p>Gunakan foto JPG, PNG, atau WEBP. Ukuran maksimum 5 MB.</p></div></div><div class="profile-photo-editor"><div class="profile-photo-preview">{% if user.profile_photo %}<img id="profilePhotoPreview" src="{{ url_for('profile_photo', user_id=user.id) }}" alt="Foto profil saat ini">{% else %}<span id="profilePhotoFallback">{{ (user.full_name or user.username or 'U')[0]|upper }}</span><img id="profilePhotoPreview" alt="Pratinjau foto profil" hidden>{% endif %}</div><div class="profile-photo-controls"><form method="post" enctype="multipart/form-data" class="profile-photo-form"><input type="hidden" name="action" value="update_profile_photo"><label class="profile-file-picker"><b>Pilih Foto Baru</b><small>JPG, PNG, WEBP · Maks. 5 MB</small><input id="profilePhotoInput" type="file" name="profile_photo" accept="image/jpeg,image/png,image/webp" required></label><button type="submit" class="btn btn-success">Simpan Foto</button></form>{% if user.profile_photo %}<form method="post" class="remove-photo-form"><input type="hidden" name="action" value="remove_profile_photo"><button type="submit" class="btn btn-danger" data-confirm="Hapus foto profil sekarang?">Hapus Foto</button></form>{% endif %}</div></div></section>
         <section id="account-security" class="settings-section"><div class="settings-section-head"><span>{{'02' if user.role=='admin' else '01'}}</span><div><h2>Keamanan Akun</h2><p>Perbarui kata sandi akun yang sedang digunakan.</p></div></div><form method="post" class="settings-form"><input type="hidden" name="action" value="change_password"><div class="form-group"><label>Password Lama</label><input type="password" name="old_password" placeholder="Masukkan password saat ini" autocomplete="current-password" required></div><div class="form-group"><label>Password Baru</label><input type="password" name="new_password" placeholder="Minimal 4 karakter" minlength="4" autocomplete="new-password" required></div><div class="settings-form-actions"><button type="submit">Simpan Password</button></div></form></section>
         {% if user.role == 'admin' %}<section id="financial-policy" class="settings-section"><div class="settings-section-head"><span>03</span><div><h2>Kebijakan Finansial</h2><p>Atur batas persetujuan dan denda. Perubahan tercatat pada jejak audit.</p></div></div><form method="post" class="settings-form settings-form-grid"><input type="hidden" name="action" value="save_financial_policy"><div class="form-group"><label>Batas Otomatis Kredit</label><input type="number" name="loan_auto_approve_limit" min="0" step="100000" value="{{cfg.loan_auto_approve_limit}}"></div><div class="form-group"><label>Batas Persetujuan Jurnal</label><input type="number" name="manual_journal_approve_limit" min="0" step="100000" value="{{cfg.manual_journal_approve_limit}}"></div><div class="form-group"><label>Denda Keterlambatan</label><div class="input-suffix"><input type="number" name="late_penalty_percent" min="0" max="0.1" step="0.001" value="{{cfg.late_penalty_percent}}"><span>desimal</span></div><small class="field-note">Contoh: 0,005 berarti 0,5% per periode.</small></div><div class="settings-form-actions"><button type="submit">Simpan Kebijakan</button></div></form></section>{% endif %}
@@ -7301,7 +7752,7 @@ def settings():
         {% if user.role == 'admin' %}<section id="role-access" class="settings-section role-access-section"><div class="settings-section-head"><span>05</span><div><h2>Hak Akses Menu</h2><p>Tentukan menu yang tampil untuk setiap peran pengguna.</p></div></div>{{ menu_editor|safe }}</section>{% endif %}
       </div>
     </div>
-    <script>(function(){var input=document.getElementById('profilePhotoInput'),preview=document.getElementById('profilePhotoPreview'),fallback=document.getElementById('profilePhotoFallback');if(!input||!preview)return;input.addEventListener('change',function(){var f=this.files&&this.files[0];if(!f)return;if(f.size>5*1024*1024){alert('Ukuran foto maksimal 5 MB.');this.value='';return;}if(!/^image[/](jpeg|png|webp)$/.test(f.type)){alert('Format foto harus JPG, PNG, atau WEBP.');this.value='';return;}var url=URL.createObjectURL(f);preview.src=url;preview.hidden=false;if(fallback)fallback.style.display='none';});})();</script>
+    <script>(function(){var input=document.getElementById('profilePhotoInput'),preview=document.getElementById('profilePhotoPreview'),fallback=document.getElementById('profilePhotoFallback');if(input&&preview)input.addEventListener('change',function(){var f=this.files&&this.files[0];if(!f)return;if(f.size>5*1024*1024){alert('Ukuran foto maksimal 5 MB.');this.value='';return;}if(!/^image[/](jpeg|png|webp)$/.test(f.type)){alert('Format foto harus JPG, PNG, atau WEBP.');this.value='';return;}var url=URL.createObjectURL(f);preview.src=url;preview.hidden=false;if(fallback)fallback.style.display='none';});var name=document.querySelector('[name=full_name]'),uname=document.querySelector('[name=username]'),nameOut=document.getElementById('profileNamePreview'),userOut=document.getElementById('profileUsernamePreview');function syncName(){if(nameOut&&name)nameOut.textContent=name.value.trim()||'Nama pengguna';if(userOut&&uname)userOut.textContent='@'+(uname.value.trim().toLowerCase()||'username');}if(name)name.addEventListener('input',syncName);if(uname)uname.addEventListener('input',syncName);syncName();})();</script>
     """, db_name=DB_NAME, locks=locks, menu_editor=menu_editor, user=user, cfg=general_settings)
     return render_page('Pengaturan', body)
 
@@ -7319,33 +7770,75 @@ def download_db():
 # Loan Types, Apply, Pay, Verify, Detail, Calculate, Contract PDF
 # (Kept concise - essential loan management)
 # =========================
+CSS_DESIGN += r'''
+/* Credit product management */
+.credit-products-suite{display:grid;gap:14px}.credit-products-hero{position:relative;display:flex;justify-content:space-between;align-items:flex-end;gap:22px;overflow:hidden;padding:25px 27px;border-radius:14px;background:linear-gradient(125deg,#101828,#213b59);color:#fff;box-shadow:0 12px 30px rgba(16,24,40,.14)}.credit-products-hero:after{content:'';position:absolute;right:-60px;top:-92px;width:225px;height:225px;border:42px solid rgba(227,93,52,.18);border-radius:50%}.credit-products-hero>div{position:relative;z-index:1}.credit-products-hero span,.credit-kicker{display:block;color:#f4a184;font-size:8px;font-weight:900;letter-spacing:.16em}.credit-products-hero h2{margin:5px 0;color:#fff;font-size:25px}.credit-products-hero p{margin:0;color:#c5cfdb;font-size:10px}.credit-hero-stat{min-width:190px;padding:12px 14px;border:1px solid rgba(255,255,255,.14);border-radius:10px;background:rgba(255,255,255,.07)}.credit-hero-stat small,.credit-hero-stat b{display:block}.credit-hero-stat small{color:#aebbc9;font-size:8px}.credit-hero-stat b{margin-top:5px;font-size:14px}.credit-products-layout{display:grid;grid-template-columns:390px minmax(0,1fr);gap:14px;align-items:start}.credit-product-form,.credit-product-list{padding:0!important;overflow:hidden!important;border-radius:11px!important}.credit-product-form{position:sticky;top:14px;border-top:3px solid #2457d6!important}.credit-product-list{border-top:3px solid #087e6a!important}.credit-panel-head{padding:17px 19px;border-bottom:1px solid #e4e7ec}.credit-panel-head h3{margin:4px 0 2px;font-size:15px}.credit-panel-head p{margin:0;color:#667085;font-size:9px}.credit-form-body{padding:17px 19px}.credit-field-row{display:grid;grid-template-columns:1fr 1fr;gap:9px}.credit-input-wrap{position:relative}.credit-input-wrap input{padding-right:48px!important}.credit-input-wrap i{position:absolute;right:12px;top:50%;transform:translateY(-50%);color:#667085;font-size:9px;font-style:normal;font-weight:800}.credit-help{display:block;margin-top:4px;color:#667085;font-size:8px;line-height:1.45}.credit-preview{display:grid;grid-template-columns:repeat(2,1fr);gap:7px;margin:13px 0;padding:11px;border:1px solid #c8d8f1;border-radius:10px;background:#eef4ff}.credit-preview div{padding:8px;border-radius:8px;background:rgba(255,255,255,.7)}.credit-preview span,.credit-preview b{display:block}.credit-preview span{color:#667085;font-size:7px;text-transform:uppercase}.credit-preview b{margin-top:4px;color:#101828;font-size:11px}.credit-form-actions{display:flex;gap:8px}.credit-form-actions button{flex:1;background:#e35d34!important}.credit-product-list .table-wrap{margin:0!important;border:0!important;border-radius:0!important}.credit-product-list table{min-width:860px}.credit-product-list th{top:0!important}.credit-name b,.credit-name small{display:block}.credit-name small{margin-top:3px;color:#667085;font-size:8px}.credit-rate{color:#2457d6;font-weight:850}.credit-method{display:inline-flex;padding:5px 7px;border-radius:999px;background:#eef4ff;color:#2457d6;font-size:8px;font-weight:850}.credit-empty{padding:36px!important;text-align:center;color:#667085}.credit-list-count{float:right;padding:5px 8px;border-radius:999px;background:#eef4ff;color:#2457d6;font-size:8px;font-weight:850}
+@media(max-width:1050px){.credit-products-layout{grid-template-columns:1fr}.credit-product-form{position:static}.credit-form-body form{display:grid;grid-template-columns:1fr 1fr;gap:0 10px}.credit-form-body form>.form-group:first-of-type,.credit-form-body form>.form-group:nth-of-type(2),.credit-preview,.credit-form-actions{grid-column:1/-1}}
+@media(max-width:768px){.credit-products-suite{padding:0 12px}.credit-products-hero{align-items:flex-start;flex-direction:column;padding:19px;border-radius:20px}.credit-products-hero h2{font-size:22px}.credit-hero-stat{width:100%}.credit-product-form,.credit-product-list{margin:0!important;border-radius:18px!important}.credit-form-body form{display:block}.credit-field-row{grid-template-columns:1fr}.credit-preview{grid-template-columns:1fr 1fr}.credit-panel-head{padding:15px}.credit-form-body{padding:15px}}
+'''
+
 @app.route('/admin/loan-types', methods=['GET', 'POST'])
 @login_required
 @role_required('admin', 'bendahara')
 def loan_types():
-    if request.method == 'POST':
-        action = request.form.get('action')
-        if action == 'create':
-            name = request.form.get('name', '').strip()
-            description = request.form.get('description', '').strip()
-            interest_rate_monthly = parse_float(request.form.get('interest_rate_monthly', 1.5))
-            admin_fee_fixed = parse_float(request.form.get('admin_fee_fixed', 0))
-            admin_fee_percent = parse_float(request.form.get('admin_fee_percent', 0))
-            min_tenor = int(request.form.get('min_tenor', 1))
-            max_tenor = int(request.form.get('max_tenor', 36))
-            max_amount = parse_float(request.form.get('max_amount', 25000000))
-            metode_bunga = request.form.get('metode_bunga', 'FLAT')
-            exec_sql('INSERT INTO loan_types(name, description, interest_rate_monthly, admin_fee_fixed, admin_fee_percent, min_tenor, max_tenor, max_amount, metode_bunga, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)', [name, description, interest_rate_monthly, admin_fee_fixed, admin_fee_percent, min_tenor, max_tenor, max_amount, metode_bunga])
-            flash('Jenis pinjaman ditambahkan.', 'success')
-        elif action == 'toggle':
-            lid = int(request.form.get('lid'))
-            current = q_one('SELECT is_active FROM loan_types WHERE id = ?', [lid])
-            exec_sql('UPDATE loan_types SET is_active = ? WHERE id = ?', [0 if current['is_active'] else 1, lid])
-            flash('Status diubah.', 'success')
-        return redirect(url_for('loan_types'))
-    types = q_all('SELECT * FROM loan_types ORDER BY id DESC')
-    body = render_template_string("""<div class="card"><div class="grid"><div class="col-4"><h3>Tambah Produk Kredit</h3><form method="POST"><input type="hidden" name="action" value="create"><div class="form-group"><label>Nama</label><input name="name" required></div><div class="form-group"><label>Bunga per Bulan (%)</label><input type="number" name="interest_rate_monthly" value="1.5"></div><div class="form-group"><label>Biaya Administrasi</label><div class="grid"><div class="col-6"><input type="number" name="admin_fee_fixed" value="0" placeholder="Fix"></div><div class="col-6"><input type="number" name="admin_fee_percent" value="0" placeholder="%"></div></div></div><div class="form-group"><label>Metode Bunga</label><select name="metode_bunga"><option value="FLAT">Flat</option><option value="ANUITAS">Anuitas</option></select></div><div class="form-group"><label>Tenor</label><div class="grid"><div class="col-6"><input type="number" name="min_tenor" value="1" placeholder="Min"></div><div class="col-6"><input type="number" name="max_tenor" value="36" placeholder="Maks"></div></div></div><div class="form-group"><label>Plafon Maksimal</label><input type="number" name="max_amount" value="25000000"></div><button type="submit">Simpan</button></form></div><div class="col-8"><h3>Daftar Produk Kredit</h3><div class="table-wrap"><table><thead><tr><th>Nama</th><th>Bunga</th><th>Metode</th><th>Tenor</th><th>Maks</th><th>Status</th><th>Aksi</th></tr></thead><tbody>{% for t in types %}<tr><td>{{ t.name }}</td><td>{{ t.interest_rate_monthly }}%</td><td>{{ t.metode_bunga or 'FLAT' }}</td><td>{{ t.min_tenor }}-{{ t.max_tenor }}</td><td>{{ rupiah(t.max_amount) }}</td><td><span class="badge {% if t.is_active %}badge-success{% else %}badge-gray{% endif %}">{% if t.is_active %}Aktif{% else %}Nonaktif{% endif %}</span></td><td><form method="POST" style="margin:0;"><input type="hidden" name="action" value="toggle"><input type="hidden" name="lid" value="{{ t.id }}"><button class="btn-sm btn-ghost">{% if t.is_active %}Nonaktifkan{% else %}Aktifkan{% endif %}</button></form></td></tr>{% else %}<tr><td colspan="7" class="muted text-center">Belum ada.</td></tr>{% endfor %}</tbody></table></div></div></div></div>""", types=types, rupiah=rupiah)
-    return render_page('Produk Kredit', '<div class="credit-page credit-products-page">'+body+'</div>')
+    form_data={}
+    if request.method=='POST':
+        action=(request.form.get('action') or '').strip()
+        if action=='create':
+            form_data=request.form.to_dict(); errors=[]
+            name=(request.form.get('name') or '').strip(); description=(request.form.get('description') or '').strip()
+            rate=parse_float(request.form.get('interest_rate_monthly'),-1)
+            admin_fixed=parse_float(request.form.get('admin_fee_fixed'),-1)
+            admin_pct=parse_float(request.form.get('admin_fee_percent'),-1)
+            try: min_tenor=int(request.form.get('min_tenor') or 0); max_tenor=int(request.form.get('max_tenor') or 0)
+            except Exception: min_tenor=max_tenor=0
+            max_amount=parse_float(request.form.get('max_amount'),-1)
+            method=(request.form.get('metode_bunga') or 'FLAT').upper()
+            if len(name)<3: errors.append('Nama produk minimal 3 karakter.')
+            if not 0 <= rate <= 100: errors.append('Bunga bulanan harus antara 0 sampai 100 persen.')
+            if not 0 <= admin_fixed <= 1_000_000_000: errors.append('Biaya administrasi tetap tidak valid.')
+            if not 0 <= admin_pct <= 100: errors.append('Biaya administrasi persen harus antara 0 sampai 100.')
+            if min_tenor<1 or max_tenor<1 or min_tenor>max_tenor or max_tenor>600: errors.append('Tenor minimal dan maksimal tidak valid.')
+            if max_amount<=0 or max_amount>1_000_000_000_000: errors.append('Plafon maksimal tidak valid.')
+            if method not in ('FLAT','ANUITAS'): errors.append('Metode bunga tidak dikenal.')
+            duplicate=q_one('SELECT id FROM loan_types WHERE LOWER(name)=LOWER(?)',[name]) if name else None
+            if duplicate: errors.append('Nama produk kredit sudah digunakan.')
+            if errors:
+                for msg in errors: flash(msg,'error')
+            else:
+                exec_sql('INSERT INTO loan_types(name,description,interest_rate_monthly,admin_fee_fixed,admin_fee_percent,min_tenor,max_tenor,max_amount,metode_bunga,is_active) VALUES(?,?,?,?,?,?,?,?,?,1)',[name,description,round(rate,6),round(admin_fixed,2),round(admin_pct,6),min_tenor,max_tenor,round(max_amount,2),method])
+                flash(f'Produk kredit {name} berhasil ditambahkan.','success'); return redirect(url_for('loan_types'))
+        elif action=='toggle':
+            try: lid=int(request.form.get('lid') or 0)
+            except Exception: lid=0
+            current=q_one('SELECT is_active,name FROM loan_types WHERE id=?',[lid])
+            if current:
+                exec_sql('UPDATE loan_types SET is_active=? WHERE id=?',[0 if current['is_active'] else 1,lid]); flash(f'Status {current["name"]} diubah.','success')
+            else: flash('Produk kredit tidak ditemukan.','error')
+            return redirect(url_for('loan_types'))
+    types=q_all('SELECT * FROM loan_types ORDER BY is_active DESC,id DESC')
+    active_count=sum(1 for x in types if x['is_active'])
+    body=render_template_string(r'''
+    <div class="credit-products-suite">
+      <header class="credit-products-hero"><div><span>CREDIT PRODUCT CONTROL</span><h2>Produk Kredit</h2><p>Atur bunga bulanan, biaya administrasi, tenor, metode perhitungan, dan plafon pinjaman secara aman.</p></div><div class="credit-hero-stat"><small>Produk aktif</small><b>{{active_count}} dari {{types|length}} produk</b></div></header>
+      <div class="credit-products-layout">
+        <section class="card credit-product-form"><div class="credit-panel-head"><span class="credit-kicker">PRODUK BARU</span><h3>Tambah Produk Kredit</h3><p>Gunakan titik atau koma untuk angka desimal, misalnya 1.5 atau 1,5.</p></div><div class="credit-form-body"><form method="post" id="creditProductForm"><input type="hidden" name="action" value="create">
+          <div class="form-group"><label>Nama Produk</label><input name="name" value="{{form_data.get('name','')}}" maxlength="80" placeholder="Contoh: Kredit Reguler" required></div>
+          <div class="form-group"><label>Deskripsi</label><textarea name="description" placeholder="Tujuan dan ketentuan singkat produk">{{form_data.get('description','')}}</textarea></div>
+          <div class="form-group"><label>Bunga per Bulan</label><div class="credit-input-wrap"><input type="text" inputmode="decimal" name="interest_rate_monthly" id="creditRate" value="{{form_data.get('interest_rate_monthly','1,5')}}" placeholder="1,5" required><i>% / bulan</i></div><small class="credit-help">Menerima 1.5 atau 1,5. Nilai valid 0 sampai 100%.</small></div>
+          <div class="form-group"><label>Metode Bunga</label><select name="metode_bunga" id="creditMethod"><option value="FLAT" {{'selected' if form_data.get('metode_bunga','FLAT')=='FLAT' else ''}}>Flat</option><option value="ANUITAS" {{'selected' if form_data.get('metode_bunga')=='ANUITAS' else ''}}>Anuitas</option></select><small class="credit-help">Flat menghitung bunga dari pokok awal. Anuitas menghitung angsuran tetap dengan porsi bunga menurun.</small></div>
+          <div class="form-group"><label>Biaya Administrasi</label><div class="credit-field-row"><div class="credit-input-wrap"><input type="text" inputmode="decimal" name="admin_fee_fixed" value="{{form_data.get('admin_fee_fixed','0')}}" placeholder="0"><i>Rp</i></div><div class="credit-input-wrap"><input type="text" inputmode="decimal" name="admin_fee_percent" value="{{form_data.get('admin_fee_percent','0')}}" placeholder="0"><i>%</i></div></div></div>
+          <div class="form-group"><label>Rentang Tenor</label><div class="credit-field-row"><div class="credit-input-wrap"><input type="number" name="min_tenor" id="creditMinTenor" min="1" max="600" value="{{form_data.get('min_tenor','1')}}" required><i>min</i></div><div class="credit-input-wrap"><input type="number" name="max_tenor" id="creditMaxTenor" min="1" max="600" value="{{form_data.get('max_tenor','36')}}" required><i>maks</i></div></div></div>
+          <div class="form-group"><label>Plafon Maksimal</label><div class="credit-input-wrap"><input type="text" inputmode="numeric" name="max_amount" id="creditMaxAmount" value="{{form_data.get('max_amount','25000000')}}" required><i>Rp</i></div></div>
+          <div class="credit-preview"><div><span>Contoh bunga / bulan</span><b id="previewRate">1,5%</b></div><div><span>Tenor tersedia</span><b id="previewTenor">1 - 36 bulan</b></div><div><span>Metode</span><b id="previewMethod">Flat</b></div><div><span>Plafon</span><b id="previewAmount">Rp 25.000.000</b></div></div>
+          <div class="credit-form-actions"><button type="submit">Simpan Produk Kredit</button></div>
+        </form></div></section>
+        <section class="card credit-product-list"><div class="credit-panel-head"><span class="credit-list-count">{{types|length}} produk</span><span class="credit-kicker">DAFTAR PRODUK</span><h3>Konfigurasi Kredit</h3><p>Produk aktif dapat dipilih anggota saat mengajukan kredit.</p></div><div class="table-wrap"><table><thead><tr><th>Produk</th><th>Bunga / Bulan</th><th>Metode</th><th>Tenor</th><th>Biaya Admin</th><th>Plafon</th><th>Status</th><th>Aksi</th></tr></thead><tbody>{% for t in types %}<tr><td class="credit-name"><b>{{t.name}}</b><small>{{t.description or 'Tanpa deskripsi'}}</small></td><td class="credit-rate">{{'%g'|format(t.interest_rate_monthly)}}%</td><td><span class="credit-method">{{t.metode_bunga or 'FLAT'}}</span></td><td>{{t.min_tenor}} - {{t.max_tenor}} bln</td><td><b>{{rupiah(t.admin_fee_fixed)}}</b><small>{{'%g'|format(t.admin_fee_percent)}}%</small></td><td>{{rupiah(t.max_amount)}}</td><td><span class="badge {{'badge-success' if t.is_active else 'badge-gray'}}">{{'Aktif' if t.is_active else 'Nonaktif'}}</span></td><td><form method="post"><input type="hidden" name="action" value="toggle"><input type="hidden" name="lid" value="{{t.id}}"><button class="btn btn-sm btn-ghost">{{'Nonaktifkan' if t.is_active else 'Aktifkan'}}</button></form></td></tr>{% else %}<tr><td colspan="8" class="credit-empty">Belum ada produk kredit.</td></tr>{% endfor %}</tbody></table></div></section>
+      </div>
+    </div>
+    <script>(function(){const rate=document.getElementById('creditRate'),min=document.getElementById('creditMinTenor'),max=document.getElementById('creditMaxTenor'),method=document.getElementById('creditMethod'),amount=document.getElementById('creditMaxAmount');function num(v){v=String(v||'').trim().replace(/\s/g,'');if(v.includes(',')&&v.includes('.')){if(v.lastIndexOf(',')>v.lastIndexOf('.'))v=v.replace(/\./g,'').replace(',','.');else v=v.replace(/,/g,'')}else v=v.replace(',','.');return Number(v)||0}function refresh(){document.getElementById('previewRate').textContent=num(rate.value).toLocaleString('id-ID',{maximumFractionDigits:6})+'%';document.getElementById('previewTenor').textContent=(min.value||1)+' - '+(max.value||1)+' bulan';document.getElementById('previewMethod').textContent=method.options[method.selectedIndex].text;document.getElementById('previewAmount').textContent='Rp '+Math.round(num(amount.value)).toLocaleString('id-ID')}[rate,min,max,method,amount].forEach(x=>x.addEventListener('input',refresh));method.addEventListener('change',refresh);document.getElementById('creditProductForm').addEventListener('submit',function(e){if(num(rate.value)<0||num(rate.value)>100){e.preventDefault();alert('Bunga bulanan harus antara 0 sampai 100 persen.');rate.focus();return}if(Number(min.value)>Number(max.value)){e.preventDefault();alert('Tenor minimum tidak boleh melebihi tenor maksimum.');min.focus()}});refresh()})();</script>
+    ''',types=types,active_count=active_count,form_data=form_data,rupiah=rupiah)
+    return render_page('Produk Kredit',body)
 
 @app.route('/loans/apply', methods=['GET', 'POST'])
 @login_required
@@ -7780,15 +8273,29 @@ def verify_loan_payments():
              AND lp.verified_at IS NULL
              AND NOT EXISTS (SELECT 1 FROM loan_schedules ls WHERE ls.payment_id=lp.id))
       ORDER BY recovered_queue DESC, COALESCE(lp.submitted_at,lp.created_at) ASC, lp.id ASC''')
-    recent_payments=q_all('''SELECT lp.*,l.loan_no,m.member_code,m.name,u.full_name submitter,
+    # Riwayat pembayaran memakai server-side pagination agar tetap ringan saat data banyak.
+    history_page=max(1,request.args.get('page',1,type=int))
+    per_page=request.args.get('per_page',10,type=int)
+    per_page=per_page if per_page in (10,20,50) else 10
+    history_q=(request.args.get('q') or '').strip()
+    history_status=(request.args.get('status') or '').strip().upper()
+    history_sql='''SELECT lp.*,l.loan_no,m.member_code,m.name,u.full_name submitter,vu.full_name verifier_name,
       CASE WHEN EXISTS(SELECT 1 FROM loan_schedules ls WHERE ls.payment_id=lp.id) THEN 1 ELSE 0 END AS has_schedule_link
-      FROM loan_payments lp LEFT JOIN loans l ON l.id=lp.loan_id LEFT JOIN members m ON m.id=l.member_id LEFT JOIN users u ON u.id=lp.created_by
-      ORDER BY lp.id DESC LIMIT 12''')
+      FROM loan_payments lp LEFT JOIN loans l ON l.id=lp.loan_id LEFT JOIN members m ON m.id=l.member_id
+      LEFT JOIN users u ON u.id=lp.created_by LEFT JOIN users vu ON vu.id=lp.verified_by WHERE 1=1'''
+    history_params=[]
+    if history_q:
+        history_sql+=' AND (COALESCE(lp.client_reference,"") LIKE ? OR COALESCE(l.loan_no,"") LIKE ? OR COALESCE(m.name,"") LIKE ? OR COALESCE(m.member_code,"") LIKE ?)'
+        history_params += [f'%{history_q}%']*4
+    if history_status in ('PENDING_VERIFICATION','VERIFIED','RETURNED','REJECTED'):
+        history_sql+=' AND UPPER(TRIM(COALESCE(lp.status,"")))=?'; history_params.append(history_status)
+    history_sql+=' ORDER BY lp.id DESC'
+    recent_payments=paginate_query(history_sql,history_params,history_page,per_page)
     pending_amount=sum(float(x['amount'] or 0) for x in pending); missing_proof=sum(1 for x in pending if x['payment_method']=='transfer' and not x['transfer_proof'])
     body=render_template_string(r'''
     <div class="verification-workspace verification-v2">
       <header class="verification-hero verification-v2-hero">
-        <div><span>PAYMENT CONTROL</span><h2>Verifikasi Angsuran</h2><p>Data masuk dari pembayaran anggota yang statusnya pending atau perlu dipulihkan dari status salah.</p><a class="btn btn-ghost" href="{{url_for('repair_loan_schedule_now')}}">Sinkron Jadwal</a></div>
+        <div><span>PAYMENT CONTROL</span><h2>Verifikasi Angsuran</h2><p>Periksa bukti pembayaran, setujui angsuran, dan pantau riwayat pembayaran dalam satu dashboard.</p><a class="btn btn-ghost" href="{{url_for('repair_loan_schedule_now')}}">Sinkron Jadwal</a></div>
         <div class="verification-summary"><article><small>Menunggu</small><b>{{pending|length}}</b></article><article><small>Total nominal</small><b>{{rupiah(pending_amount)}}</b></article><article class="{{'attention' if missing_proof else ''}}"><small>Bukti kosong</small><b>{{missing_proof}}</b></article></div>
       </header>
       {% if pending %}
@@ -7808,13 +8315,19 @@ def verify_loan_payments():
       {% else %}
       <div class="verification-empty verification-empty-v2"><i>✓</i><h3>Belum ada antrian baru</h3><p>Jika anggota baru mengirim bukti tetapi tetap tidak muncul, cek tabel riwayat terakhir di bawah ini.</p></div>
       {% endif %}
-      <section class="recent-payment-panel"><header><h3>Riwayat pembayaran terakhir</h3><span>Untuk cek status data yang sudah masuk</span></header><div class="rpt-head"><span>Ref</span><span>Anggota</span><span>Kredit</span><span>Status</span><span>Jadwal</span><span>Waktu</span></div>{% for r in recent_payments %}<div class="rpt-row"><b>{{r.client_reference or ('PAY-' ~ r.id)}}</b><span>{{r.name or '-'}}</span><span>{{r.loan_no or '-'}}</span><em class="status-{{(r.status or 'none')|lower|replace('_','-')}}">{{r.status or '-'}}</em><span>{{'Sudah dialokasi' if r.has_schedule_link else 'Belum dialokasi'}}</span><small>{{r.submitted_at or r.created_at or '-'}}</small></div>{% endfor %}</section>
+      <section class="recent-payment-panel">
+        <header class="recent-payment-head"><div><span>PAYMENT HISTORY</span><h3>Riwayat Pembayaran Terakhir</h3><p>Telusuri pembayaran berdasarkan referensi, anggota, nomor kredit, atau status.</p></div><b>{{recent_payments.total}} pembayaran</b></header>
+        <form method="get" class="payment-history-filter"><div class="payment-history-search"><span>⌕</span><input name="q" value="{{history_q}}" placeholder="Cari referensi, anggota, atau nomor kredit"></div><select name="status"><option value="">Semua status</option><option value="PENDING_VERIFICATION" {{'selected' if history_status=='PENDING_VERIFICATION' else ''}}>Menunggu Verifikasi</option><option value="VERIFIED" {{'selected' if history_status=='VERIFIED' else ''}}>Terverifikasi</option><option value="RETURNED" {{'selected' if history_status=='RETURNED' else ''}}>Dikembalikan</option><option value="REJECTED" {{'selected' if history_status=='REJECTED' else ''}}>Ditolak</option></select><select name="per_page"><option value="10" {{'selected' if per_page==10 else ''}}>10 per halaman</option><option value="20" {{'selected' if per_page==20 else ''}}>20 per halaman</option><option value="50" {{'selected' if per_page==50 else ''}}>50 per halaman</option></select><button class="btn btn-ghost">Terapkan</button>{% if history_q or history_status or per_page!=10 %}<a href="{{url_for('verify_loan_payments')}}" class="btn btn-ghost">Reset</a>{% endif %}</form>
+        <div class="payment-history-table"><div class="rpt-head"><span>Referensi</span><span>Anggota</span><span>Kredit</span><span>Nominal</span><span>Status</span><span>Verifikator</span><span>Waktu</span></div>{% for r in recent_payments.rows %}<div class="rpt-row"><div><b>{{r.client_reference or ('PAY-' ~ r.id)}}</b><small>{{(r.payment_method or '-')|upper}}</small></div><div><b>{{r.name or '-'}}</b><small>{{r.member_code or '-'}}</small></div><span>{{r.loan_no or '-'}}</span><strong>{{rupiah(r.amount)}}</strong><em class="status-{{(r.status or 'none')|lower|replace('_','-')}}">{{r.status or '-'}}</em><div><span>{{r.verifier_name or '-'}}</span><small>{{'Sudah dialokasi' if r.has_schedule_link else 'Belum dialokasi'}}</small></div><small>{{r.verified_at or r.submitted_at or r.created_at or '-'}}</small></div>{% else %}<div class="payment-history-empty"><b>Riwayat tidak ditemukan</b><span>Ubah kata pencarian atau filter status.</span></div>{% endfor %}</div>
+        {% if recent_payments.total_pages>1 %}<nav class="payment-history-pagination"><span>Menampilkan {{recent_payments.start}}-{{recent_payments.end}} dari {{recent_payments.total}} data</span><div><a class="btn btn-sm btn-ghost {{'disabled' if recent_payments.page<=1 else ''}}" href="{{url_for('verify_loan_payments',page=recent_payments.page-1,q=history_q,status=history_status,per_page=per_page)}}">Sebelumnya</a>{% for n in range(1,recent_payments.total_pages+1) %}{% if n==1 or n==recent_payments.total_pages or (n>=recent_payments.page-2 and n<=recent_payments.page+2) %}<a class="payment-page-number {{'active' if n==recent_payments.page else ''}}" href="{{url_for('verify_loan_payments',page=n,q=history_q,status=history_status,per_page=per_page)}}">{{n}}</a>{% elif n==2 and recent_payments.page>4 or n==recent_payments.total_pages-1 and recent_payments.page<recent_payments.total_pages-3 %}<span>…</span>{% endif %}{% endfor %}<a class="btn btn-sm btn-ghost {{'disabled' if recent_payments.page>=recent_payments.total_pages else ''}}" href="{{url_for('verify_loan_payments',page=recent_payments.page+1,q=history_q,status=history_status,per_page=per_page)}}">Berikutnya</a></div></nav>{% endif %}
+      </section>
     </div>
     <style>
     .verification-v2{max-width:1240px;margin:0 auto}.verification-v2-hero{align-items:center}.verification-table-card,.recent-payment-panel{background:#fff;border:1px solid #dfe8e2;border-radius:20px;box-shadow:0 14px 40px rgba(16,45,37,.06);overflow:hidden;margin-top:16px}.vt-head,.vt-row{display:grid;grid-template-columns:1.25fr 1.7fr 1.25fr 1.65fr 2.1fr;gap:0;align-items:stretch}.vt-head{background:#f5faf7;color:#64746c;font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:.08em}.vt-head span{padding:13px 14px;border-right:1px solid #e6eee9}.vt-row{border-top:1px solid #edf1ee}.vt-row>div{padding:14px;border-right:1px solid #edf1ee;min-width:0}.vt-row b{display:block;color:#10231a;font-size:12px;line-height:1.25}.vt-row small{display:block;color:#64746c;font-size:10px;line-height:1.45;margin-top:4px}.vt-ref em,.vt-amount i{display:inline-flex;margin-top:7px;padding:4px 8px;border-radius:999px;background:#fff4ed;color:#b45309;font-size:9px;font-style:normal;font-weight:800}.vt-amount i.safe{background:#eaf7f1;color:#0f7a55}.vt-amount i.risk{background:#fff3f4;color:#a94f5a}.vt-proof a{display:inline-flex;margin-top:8px;text-decoration:none;font-size:11px;font-weight:800;color:#0f7a55}.vt-proof strong{display:inline-block;margin-top:8px;color:#a94f5a;font-size:11px}.vt-action textarea{width:100%;min-height:54px;resize:vertical;font-size:12px;border:1px solid #dfe8e2;border-radius:12px;padding:9px}.vt-action div{display:flex;gap:8px;margin-top:8px}.vt-action button{flex:1;min-height:38px;border-radius:12px}.recent-payment-panel{margin-top:18px}.recent-payment-panel header{display:flex;align-items:center;justify-content:space-between;padding:15px 18px;border-bottom:1px solid #edf1ee}.recent-payment-panel h3{margin:0;font-size:15px}.recent-payment-panel header span{font-size:11px;color:#64746c}.rpt-head,.rpt-row{display:grid;grid-template-columns:1.25fr 1.45fr 1.25fr .95fr 1fr 1.25fr;align-items:center}.rpt-head{background:#f8fbf9;color:#64746c;font-size:10px;font-weight:900;text-transform:uppercase}.rpt-head span,.rpt-row>*{padding:10px 12px;border-right:1px solid #edf1ee}.rpt-row{border-top:1px solid #edf1ee;font-size:11px}.rpt-row b{font-size:11px}.rpt-row span,.rpt-row small{color:#64746c}.rpt-row em{font-style:normal;font-weight:900;border-radius:999px;text-align:center;margin:0 8px;padding:4px 8px;background:#edf1ee;color:#10231a}.rpt-row em.status-pending-verification{background:#fff4ed;color:#b45309}.rpt-row em.status-verified{background:#eaf7f1;color:#0f7a55}.rpt-row em.status-returned,.rpt-row em.status-rejected{background:#fff3f4;color:#a94f5a}@media(max-width:900px){.vt-head{display:none}.vt-row{grid-template-columns:1fr}.vt-row>div{border-right:0}.rpt-head{display:none}.rpt-row{grid-template-columns:1fr}.rpt-row>*{border-right:0;padding:7px 12px}.recent-payment-panel header{display:block}}
+    .verification-v2{max-width:none!important}.verification-v2-hero{padding:24px 26px!important;border-radius:14px!important;background:linear-gradient(125deg,#101828,#213b59)!important;color:#fff!important;box-shadow:0 12px 30px rgba(16,24,40,.14)!important}.verification-v2-hero>div>span{color:#f4a184!important}.verification-v2-hero h2{color:#fff!important}.verification-v2-hero p{color:#c5cfdb!important}.verification-v2-hero .btn{background:#fff!important;color:#1c2c40!important;border:0!important}.verification-summary article{border:1px solid rgba(255,255,255,.14)!important;background:rgba(255,255,255,.08)!important}.verification-summary small{color:#c5cfdb!important}.verification-summary b{color:#fff!important}.verification-table-card{border-radius:11px!important;box-shadow:0 2px 8px rgba(16,24,40,.04)!important}.recent-payment-panel{border-radius:11px!important;box-shadow:0 2px 8px rgba(16,24,40,.04)!important}.recent-payment-head{padding:17px 19px!important}.recent-payment-head>div>span{display:block;color:#e35d34;font-size:8px;font-weight:900;letter-spacing:.15em}.recent-payment-head h3{margin:4px 0 2px!important}.recent-payment-head p{margin:0;color:#667085;font-size:9px}.recent-payment-head>b{padding:6px 9px;border-radius:999px;background:#eef4ff;color:#2457d6;font-size:9px}.payment-history-filter{display:grid;grid-template-columns:minmax(260px,1fr) 180px 145px auto auto;gap:8px;padding:12px 18px;border-bottom:1px solid #e4e7ec;background:#f8f9fb}.payment-history-search{position:relative}.payment-history-search>span{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:#667085}.payment-history-search input{padding-left:34px!important}.payment-history-table{overflow:auto}.rpt-head,.rpt-row{grid-template-columns:1.1fr 1.35fr 1fr 1fr 1.05fr 1.15fr 1.3fr!important;min-width:1000px}.rpt-row>div b,.rpt-row>div small{display:block}.rpt-row strong{color:#101828;font-size:11px}.payment-history-empty{display:grid;place-items:center;gap:4px;padding:34px;color:#667085}.payment-history-empty b{color:#344054}.payment-history-pagination{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:13px 18px;border-top:1px solid #e4e7ec;background:#f8f9fb}.payment-history-pagination>span{color:#667085;font-size:9px}.payment-history-pagination>div{display:flex;align-items:center;gap:5px}.payment-page-number{display:grid;place-items:center;min-width:32px;height:32px;padding:0 7px;border:1px solid #d0d5dd;border-radius:7px;background:#fff;color:#344054;font-size:10px;font-weight:800}.payment-page-number.active{border-color:#2457d6;background:#2457d6;color:#fff}.payment-history-pagination .disabled{pointer-events:none;opacity:.4}@media(max-width:1050px){.payment-history-filter{grid-template-columns:1fr 1fr 1fr}.payment-history-search{grid-column:1/-1}}@media(max-width:768px){.verification-v2{padding:0 12px!important}.verification-v2-hero{padding:19px!important;border-radius:20px!important}.recent-payment-panel,.verification-table-card{margin-left:0!important;margin-right:0!important;border-radius:18px!important}.payment-history-filter{grid-template-columns:1fr}.payment-history-search{grid-column:auto}.payment-history-pagination{align-items:stretch;flex-direction:column}.payment-history-pagination>div{overflow-x:auto;padding-bottom:3px}.recent-payment-head{align-items:flex-start!important;flex-direction:column!important}}
     </style>
     <script>document.querySelectorAll('.verify-return-btn').forEach(function(btn){btn.addEventListener('click',function(ev){var form=btn.closest('form'),note=form.querySelector('textarea[name="verification_note"]');if(!note||note.value.trim().length<5){ev.preventDefault();note.focus();note.setCustomValidity('Alasan pengembalian minimal 5 karakter.');note.reportValidity();setTimeout(function(){note.setCustomValidity('');},1000);return false;}btn.dataset.confirm='Kembalikan pembayaran kepada anggota untuk diperbaiki?';});});</script>
-    ''',pending=pending,pending_amount=pending_amount,missing_proof=missing_proof,rupiah=rupiah,recent_payments=recent_payments)
+    ''',pending=pending,pending_amount=pending_amount,missing_proof=missing_proof,rupiah=rupiah,recent_payments=recent_payments,history_q=history_q,history_status=history_status,per_page=per_page)
     return render_page('Verifikasi Angsuran','<div class="credit-page credit-verification-page">'+body+'</div>')
 
 
@@ -7920,45 +8433,200 @@ def loan_contract_pdf(loan_id):
 @login_required
 @role_required('admin', 'kasir', 'branch_admin', 'branch_cashier')
 def stock_movements():
+    # Mutasi stok multi-barang dalam satu nomor transaksi dan satu database transaction.
+    branch_id = get_branch_id()
+    branch_name = get_branch_name(branch_id)
     if request.method == 'POST':
         action = request.form.get('action')
         if action == 'add_movement':
-            product_id = int(request.form.get('product_id') or 0)
-            movement_type = request.form.get('movement_type', 'Masuk')
-            qty = parse_float(request.form.get('qty', 0) or 0)
-            unit_cost = parse_float(request.form.get('unit_cost', 0) or 0)
-            note = request.form.get('note', '').strip()
-            if product_id <= 0 or qty <= 0 or price <= 0:
-                flash('Pilih barang, qty > 0, dan harga beli > 0.', 'error')
+            movement_type = (request.form.get('movement_type') or 'Masuk').strip()
+            note = (request.form.get('note') or '').strip()
+            product_ids = request.form.getlist('product_id[]') or request.form.getlist('product_id')
+            qtys = request.form.getlist('qty[]') or request.form.getlist('qty')
+            costs = request.form.getlist('unit_cost[]') or request.form.getlist('unit_cost')
+            allowed_types = {'Masuk', 'Keluar', 'Opname'}
+            if movement_type not in allowed_types:
+                flash('Jenis mutasi tidak valid.', 'error')
                 return redirect(url_for('stock_movements'))
-            product = q_one('SELECT * FROM products WHERE id=?', [product_id])
-            if not product:
-                flash('Barang tidak ditemukan.', 'error')
+            if movement_type == 'Opname' and not note:
+                flash('Catatan/alasan wajib untuk adjustment stok.', 'error')
                 return redirect(url_for('stock_movements'))
-            new_stock = float(product['stock']) + (qty if movement_type == 'Masuk' else -qty)
-            if movement_type != 'Masuk' and new_stock < 0:
-                flash('Stok tidak cukup.', 'error')
+            clean_items = []
+            seen = set()
+            for idx, raw_pid in enumerate(product_ids):
+                try:
+                    pid = int(raw_pid or 0)
+                except Exception:
+                    pid = 0
+                qty = parse_float(qtys[idx] if idx < len(qtys) else 0)
+                cost = parse_float(costs[idx] if idx < len(costs) else 0)
+                if pid <= 0 and qty <= 0:
+                    continue
+                if pid <= 0 or qty <= 0:
+                    flash(f'Baris {idx + 1}: barang dan qty lebih dari nol wajib diisi.', 'error')
+                    return redirect(url_for('stock_movements'))
+                if pid in seen:
+                    flash(f'Baris {idx + 1}: barang yang sama tidak boleh dimasukkan dua kali.', 'error')
+                    return redirect(url_for('stock_movements'))
+                if movement_type == 'Masuk' and cost <= 0:
+                    flash(f'Baris {idx + 1}: harga satuan wajib lebih dari nol untuk stok masuk.', 'error')
+                    return redirect(url_for('stock_movements'))
+                seen.add(pid)
+                clean_items.append({'product_id': pid, 'qty': qty, 'cost': cost, 'row': idx + 1})
+            if not clean_items:
+                flash('Tambahkan minimal satu barang pada mutasi stok.', 'error')
                 return redirect(url_for('stock_movements'))
-            mid = exec_sql('INSERT INTO stock_movements(product_id, movement_type, qty, unit_cost, note, created_by) VALUES (?, ?, ?, ?, ?, ?)', [product_id, movement_type, qty, unit_cost, note, session.get('user_id')])
-            bid = get_branch_id()
-            if movement_type == 'Masuk':
-                update_branch_stock(product_id, qty, bid, 'add')
-            elif movement_type == 'Keluar':
-                update_branch_stock(product_id, qty, bid, 'subtract')
-            else:
-                # Opname — set to specific qty
-                if not bid:
-                    exec_sql('UPDATE products SET stock=? WHERE id=?', [new_stock, product_id])
-                else:
-                    exec_sql('UPDATE product_branch_stock SET stock=? WHERE product_id=? AND branch_id=?', [new_stock, product_id, bid])
-            log_action('CREATE', 'stock_movements', mid, f'{movement_type} {qty} {product["product_name"]}')
-            bid_name = get_branch_name(bid)
-            log_stock_history(product_id, qty, f'Mutasi: {movement_type}', origin=bid_name, destination=bid_name, reference_type='stock_movements', reference_id=mid, note=note)
-            flash('Mutasi stok berhasil.', 'success')
-            return redirect(url_for('stock_movements'))
-    products_rows = q_all("SELECT id, barcode, product_name, stock FROM products WHERE active=1 ORDER BY product_name ASC")
-    rows = q_all('SELECT sm.*, p.barcode, p.product_name FROM stock_movements sm LEFT JOIN products p ON p.id=sm.product_id ORDER BY sm.id DESC LIMIT 300')
-    body = render_template_string('''<div class="grid"><div class="col-4"><div class="card"><h2>📥 Mutasi Stok</h2><form method="post"><input type="hidden" name="action" value="add_movement"><div class="form-group"><label>Barang</label><select name="product_id" required><option value="">— Pilih —</option>{% for p in products_rows %}<option value="{{ p['id'] }}">{{ p['barcode'] }} — {{ p['product_name'] }} (Stok: {{ p['stock'] }})</option>{% endfor %}</select></div><div class="form-group"><label>Jenis</label><select name="movement_type"><option value="Masuk">📥 Masuk</option><option value="Keluar">📤 Keluar</option><option value="Opname">📝 Opname</option></select></div><div class="form-group"><label>Qty</label><input type="number" name="qty" step="0.01" min="0.01"></div><div class="form-group"><label>Harga Satuan</label><input type="number" name="unit_cost"></div><div class="form-group"><label>Catatan</label><textarea name="note" style="min-height:50px;"></textarea></div><button type="submit">Simpan</button></form></div></div><div class="col-8"><div class="card"><h2>Riwayat Mutasi</h2><div class="table-wrap"><table><thead><tr><th>Tgl</th><th>Barang</th><th>Jenis</th><th>Qty</th><th>Harga</th><th>Catatan</th></tr></thead><tbody>{% for r in rows %}<tr><td>{{ r['created_at'][:16] }}</td><td>{{ r['barcode'] }} — {{ r['product_name'] }}</td><td><span class="badge {{ 'badge-success' if r['movement_type']=='Masuk' else 'badge-warn' if r['movement_type']=='Opname' else 'badge-danger' }}">{{ r['movement_type'] }}</span></td><td>{{ r['qty'] }}</td><td>{% if r['unit_cost'] %}{{ rupiah(r['unit_cost']) }}{% else %}-{% endif %}</td><td>{{ r['note'] or '-' }}</td></tr>{% else %}<tr><td colspan="6" class="muted text-center">Belum ada mutasi.</td></tr>{% endfor %}</tbody></table></div></div></div></div>''', products_rows=products_rows, rows=rows, rupiah=rupiah)
+
+            # Seluruh validasi dilakukan sebelum perubahan stok agar kegagalan tidak membuat posting parsial.
+            ids = [x['product_id'] for x in clean_items]
+            placeholders = ','.join('?' for _ in ids)
+            products_map = {int(r['id']): r for r in q_all(f'SELECT * FROM products WHERE active=1 AND id IN ({placeholders})', ids)}
+            for item in clean_items:
+                prod = products_map.get(item['product_id'])
+                if not prod:
+                    flash(f'Baris {item["row"]}: barang tidak ditemukan atau nonaktif.', 'error')
+                    return redirect(url_for('stock_movements'))
+                available = get_product_stock(item['product_id'], branch_id)
+                if movement_type in ('Keluar', 'Opname') and available < item['qty']:
+                    flash(f'Stok {prod["product_name"]} tidak cukup. Tersedia {available:g}, diminta {item["qty"]:g}.', 'error')
+                    return redirect(url_for('stock_movements'))
+
+            group_no = gen_code('MTS')
+            conn = get_conn()
+            try:
+                cur = conn.cursor()
+                cur.execute('BEGIN IMMEDIATE')
+                for item in clean_items:
+                    pid, qty, unit_cost = item['product_id'], item['qty'], item['cost']
+                    prod = products_map[pid]
+                    if branch_id:
+                        stock_row = cur.execute('SELECT stock FROM product_branch_stock WHERE product_id=? AND branch_id=?', [pid, branch_id]).fetchone()
+                        before = float(stock_row['stock'] or 0) if stock_row else 0.0
+                    else:
+                        stock_row = cur.execute('SELECT stock FROM products WHERE id=?', [pid]).fetchone()
+                        before = float(stock_row['stock'] or 0) if stock_row else 0.0
+                    direction_in = movement_type == 'Masuk'
+                    after = before + qty if direction_in else before - qty
+                    if after < -0.000001:
+                        raise ValueError(f'Stok {prod["product_name"]} berubah dan tidak lagi mencukupi.')
+
+                    if direction_in:
+                        if branch_id:
+                            cur.execute('''INSERT INTO product_branch_stock(product_id,branch_id,stock) VALUES(?,?,?)
+                                           ON CONFLICT(product_id,branch_id) DO UPDATE SET stock=COALESCE(stock,0)+excluded.stock''', [pid, branch_id, qty])
+                        else:
+                            cur.execute('UPDATE products SET stock=COALESCE(stock,0)+? WHERE id=?', [qty, pid])
+                        cur.execute('UPDATE products SET buy_price=? WHERE id=?', [unit_cost, pid])
+                        cur.execute('''INSERT INTO product_batches(product_id,branch_id,po_id,batch_no,qty_remaining,initial_qty,unit_cost,entry_date)
+                                       VALUES(?,?,?,?,?,?,?,?)''', [pid, branch_id, None, f'{group_no}-{item["row"]:02d}', qty, qty, unit_cost, today_str()])
+                    else:
+                        # Buat batch pembuka hanya untuk stok lama yang memang belum tercatat pada FIFO.
+                        if branch_id:
+                            batch_sum = float(cur.execute('SELECT COALESCE(SUM(qty_remaining),0) n FROM product_batches WHERE product_id=? AND branch_id=?', [pid, branch_id]).fetchone()['n'] or 0)
+                        else:
+                            batch_sum = float(cur.execute('SELECT COALESCE(SUM(qty_remaining),0) n FROM product_batches WHERE product_id=? AND branch_id IS NULL', [pid]).fetchone()['n'] or 0)
+                        missing = before - batch_sum
+                        if missing > 0.000001:
+                            fallback_cost = float(prod['buy_price'] or 0)
+                            cur.execute('''INSERT INTO product_batches(product_id,branch_id,po_id,batch_no,qty_remaining,initial_qty,unit_cost,entry_date)
+                                           VALUES(?,?,?,?,?,?,?,?)''', [pid, branch_id, None, f'OPEN-{group_no}-{item["row"]:02d}', missing, missing, fallback_cost, today_str()])
+                        if branch_id:
+                            batches = cur.execute('SELECT id,qty_remaining FROM product_batches WHERE product_id=? AND branch_id=? AND qty_remaining>0 ORDER BY entry_date,id', [pid, branch_id]).fetchall()
+                        else:
+                            batches = cur.execute('SELECT id,qty_remaining FROM product_batches WHERE product_id=? AND branch_id IS NULL AND qty_remaining>0 ORDER BY entry_date,id', [pid]).fetchall()
+                        remaining = qty
+                        for batch in batches:
+                            if remaining <= 0.000001:
+                                break
+                            available_batch = float(batch['qty_remaining'] or 0)
+                            take = min(available_batch, remaining)
+                            cur.execute('UPDATE product_batches SET qty_remaining=? WHERE id=?', [available_batch - take, batch['id']])
+                            remaining -= take
+                        if remaining > 0.000001:
+                            raise ValueError(f'Batch FIFO {prod["product_name"]} tidak mencukupi sebesar {remaining:g}.')
+                        if branch_id:
+                            cur.execute('UPDATE product_branch_stock SET stock=stock-? WHERE product_id=? AND branch_id=?', [qty, pid, branch_id])
+                        else:
+                            cur.execute('UPDATE products SET stock=stock-? WHERE id=?', [qty, pid])
+
+                    cur.execute('''INSERT INTO stock_movements(product_id,movement_type,qty,unit_cost,note,created_by)
+                                   VALUES(?,?,?,?,?,?)''', [pid, movement_type, qty, unit_cost, f'[{group_no}] {note}'.strip(), session.get('user_id')])
+                    movement_id = cur.lastrowid
+                    signed_qty = qty if direction_in else -qty
+                    cur.execute('''INSERT INTO stock_history(trx_no,trx_date,product_id,product_name,barcode,qty,movement_type,origin,destination,
+                                   stock_before,stock_after,reference_type,reference_id,note,created_by)
+                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                                [group_no, today_str(), pid, prod['product_name'], prod['barcode'], signed_qty,
+                                 f'Mutasi: {movement_type}', branch_name if not direction_in else '', branch_name if direction_in else '',
+                                 before, after, 'stock_movements', movement_id, note, session.get('user_id')])
+                cur.execute('''INSERT INTO audit_logs(log_time,username,action,entity,entity_id,detail,ip_address,user_agent)
+                               VALUES(?,?,?,?,?,?,?,?)''', [now_str(), session.get('username','system'), 'CREATE_BULK', 'stock_movements', group_no,
+                               f'{movement_type}: {len(clean_items)} barang di {branch_name}', get_ip(), get_ua()])
+                conn.commit()
+            except Exception as exc:
+                conn.rollback()
+                flash(f'Mutasi dibatalkan. Tidak ada stok yang berubah: {exc}', 'error')
+                return redirect(url_for('stock_movements'))
+            finally:
+                conn.close()
+            flash(f'Mutasi {group_no} berhasil diposting untuk {len(clean_items)} barang.', 'success')
+            return redirect(url_for('stock_movements', trx=group_no))
+
+    if branch_id:
+        products_rows = q_all('''SELECT p.id,p.barcode,p.product_name,p.unit,p.buy_price,COALESCE(bs.stock,0) stock
+                                 FROM products p LEFT JOIN product_branch_stock bs ON bs.product_id=p.id AND bs.branch_id=?
+                                 WHERE p.active=1 ORDER BY p.product_name''', [branch_id])
+    else:
+        products_rows = q_all('SELECT id,barcode,product_name,unit,buy_price,stock FROM products WHERE active=1 ORDER BY product_name')
+    key = (request.args.get('q') or '').strip()
+    type_filter = (request.args.get('type') or '').strip()
+    trx_filter = (request.args.get('trx') or '').strip()
+    sql = '''SELECT sm.*,p.barcode,p.product_name,p.unit,u.username,
+             CASE WHEN INSTR(sm.note,']')>0 THEN SUBSTR(sm.note,2,INSTR(sm.note,']')-2) ELSE '' END group_no
+             FROM stock_movements sm LEFT JOIN products p ON p.id=sm.product_id LEFT JOIN users u ON u.id=sm.created_by WHERE 1=1'''
+    params = []
+    if key:
+        sql += ' AND (p.product_name LIKE ? OR p.barcode LIKE ? OR sm.note LIKE ?)'
+        params += [f'%{key}%', f'%{key}%', f'%{key}%']
+    if type_filter:
+        sql += ' AND sm.movement_type=?'; params.append(type_filter)
+    if trx_filter:
+        sql += ' AND sm.note LIKE ?'; params.append(f'[{trx_filter}]%')
+    sql += ' ORDER BY sm.id DESC LIMIT 300'
+    rows = q_all(sql, params)
+    stats = q_one('''SELECT COUNT(*) total_rows,COUNT(DISTINCT product_id) products,
+                     COALESCE(SUM(CASE WHEN movement_type='Masuk' THEN qty ELSE 0 END),0) qty_in,
+                     COALESCE(SUM(CASE WHEN movement_type<>'Masuk' THEN qty ELSE 0 END),0) qty_out
+                     FROM stock_movements WHERE date(created_at)=date('now','localtime')''')
+    body = render_template_string(r'''
+    <div class="movement-shell">
+      <header class="movement-header"><div><span class="movement-kicker">INVENTORY OPERATIONS</span><h2>Mutasi Stok</h2><p>Posting beberapa barang dalam satu transaksi yang konsisten dan tercatat pada FIFO.</p></div><div class="movement-header-meta"><span>Lokasi aktif</span><b>{{branch_name}}</b><a class="btn btn-ghost" href="{{url_for('inventory_control',view='operations') if 'inventory_control' in endpoint_names else url_for('stock_history')}}">Buka Ledger</a></div></header>
+      <section class="movement-kpis"><div><span>Baris hari ini</span><b>{{stats.total_rows}}</b></div><div><span>Produk bergerak</span><b>{{stats.products}}</b></div><div><span>Qty masuk</span><b>{{stats.qty_in}}</b></div><div><span>Qty keluar</span><b>{{stats.qty_out}}</b></div></section>
+      <section class="movement-panel movement-entry"><div class="movement-panel-head"><div><span class="movement-kicker">TRANSAKSI BARU</span><h3>Input Mutasi Multi-Barang</h3><p>Satu jenis mutasi dan catatan berlaku untuk seluruh baris.</p></div><span class="badge badge-info" id="movementItemCount">1 barang</span></div>
+        <form method="post" id="movementForm"><input type="hidden" name="action" value="add_movement">
+          <div class="movement-header-fields"><div class="form-group"><label>Jenis Mutasi</label><select name="movement_type" id="movementType" required><option value="Masuk">Stok Masuk</option><option value="Keluar">Stok Keluar</option><option value="Opname">Adjustment Kurang</option></select></div><div class="form-group movement-note"><label>Catatan / Referensi</label><input name="note" id="movementNote" placeholder="Contoh: penerimaan manual, barang rusak, koreksi audit"></div></div>
+          <div class="movement-items"><div class="movement-items-head"><div><b>Daftar Barang</b><span>Tambahkan semua barang sebelum memposting transaksi.</span></div><button type="button" class="btn btn-ghost" id="addMovementRow">+ Tambah Barang</button></div>
+            <div class="movement-table-wrap"><table class="movement-entry-table"><thead><tr><th>#</th><th>Barang</th><th>Stok Saat Ini</th><th>Qty</th><th class="cost-head">Harga Satuan</th><th>Subtotal</th><th></th></tr></thead><tbody id="movementRows"></tbody></table></div>
+            <div class="movement-summary"><span>Total barang <b id="summaryItems">1</b></span><span>Total qty <b id="summaryQty">0</b></span><span class="summary-value">Estimasi nilai <b id="summaryValue">Rp 0</b></span></div>
+          </div>
+          <div class="movement-form-actions"><span class="muted small">Semua baris diposting bersamaan. Jika satu baris gagal, seluruh transaksi dibatalkan.</span><button type="submit" id="postMovement">Posting Mutasi</button></div>
+        </form>
+      </section>
+      <section class="movement-panel"><div class="movement-panel-head"><div><span class="movement-kicker">ACTIVITY LEDGER</span><h3>Riwayat Mutasi</h3><p>Filter berdasarkan barang, barcode, nomor transaksi, atau jenis mutasi.</p></div><form method="get" class="movement-filters"><input name="q" value="{{key}}" placeholder="Cari barang / barcode / nomor"><select name="type"><option value="">Semua jenis</option>{% for x in ['Masuk','Keluar','Opname'] %}<option value="{{x}}" {{'selected' if type_filter==x else ''}}>{{'Adjustment' if x=='Opname' else x}}</option>{% endfor %}</select><button class="btn btn-ghost">Filter</button>{% if key or type_filter or trx_filter %}<a class="btn btn-ghost" href="{{url_for('stock_movements')}}">Reset</a>{% endif %}</form></div>
+        <div class="movement-history"><table><thead><tr><th>Waktu</th><th>Nomor</th><th>Barang</th><th>Jenis</th><th class="text-right">Qty</th><th class="text-right">Harga</th><th>Operator</th><th>Catatan</th></tr></thead><tbody>{% for r in rows %}<tr><td>{{r.created_at[:16]}}</td><td>{% if r.group_no %}<a href="{{url_for('stock_movements',trx=r.group_no)}}" class="movement-trx">{{r.group_no}}</a>{% else %}<span class="muted">Legacy-{{r.id}}</span>{% endif %}</td><td><b>{{r.product_name}}</b><small>{{r.barcode}} · {{r.unit or 'pcs'}}</small></td><td><span class="movement-status {{'in' if r.movement_type=='Masuk' else 'adjust' if r.movement_type=='Opname' else 'out'}}">{{'Adjustment' if r.movement_type=='Opname' else r.movement_type}}</span></td><td class="text-right"><b>{{r.qty}}</b></td><td class="text-right">{{rupiah(r.unit_cost) if r.unit_cost else '-'}}</td><td>{{r.username or 'Tidak tercatat'}}</td><td>{{r.note or '-'}}</td></tr>{% else %}<tr><td colspan="8" class="movement-empty">Belum ada mutasi yang sesuai filter.</td></tr>{% endfor %}</tbody></table></div>
+      </section>
+    </div>
+    <template id="movementRowTemplate"><tr class="movement-row"><td class="row-number"></td><td><select name="product_id[]" class="product-select" required><option value="">Pilih barang</option>{% for p in products_rows %}<option value="{{p.id}}" data-stock="{{p.stock or 0}}" data-cost="{{p.buy_price or 0}}" data-unit="{{p.unit or 'pcs'}}">{{p.barcode}} — {{p.product_name}}</option>{% endfor %}</select></td><td><div class="stock-display"><b>0</b><small>tersedia</small></div></td><td><div class="qty-control"><input type="number" name="qty[]" class="qty-input" min="0.001" step="0.001" placeholder="0" required><span class="unit-display">pcs</span></div></td><td class="cost-cell"><input type="number" name="unit_cost[]" class="cost-input" min="0" step="0.01" placeholder="0"></td><td class="row-subtotal">Rp 0</td><td><button type="button" class="remove-row btn btn-sm btn-ghost" aria-label="Hapus barang">×</button></td></tr></template>
+    <script>
+    (function(){const body=document.getElementById('movementRows'),tpl=document.getElementById('movementRowTemplate'),type=document.getElementById('movementType'),note=document.getElementById('movementNote');
+    const rupiah=n=>'Rp '+Math.round(n||0).toLocaleString('id-ID');
+    function addRow(){body.appendChild(tpl.content.cloneNode(true));bind();refresh()}
+    function bind(){body.querySelectorAll('.movement-row').forEach(row=>{if(row.dataset.bound)return;row.dataset.bound='1';const sel=row.querySelector('.product-select'),qty=row.querySelector('.qty-input'),cost=row.querySelector('.cost-input');sel.addEventListener('change',()=>{const o=sel.selectedOptions[0];row.querySelector('.stock-display b').textContent=Number(o?.dataset.stock||0).toLocaleString('id-ID');row.querySelector('.unit-display').textContent=o?.dataset.unit||'pcs';if(!cost.value)cost.value=o?.dataset.cost||0;refresh()});qty.addEventListener('input',refresh);cost.addEventListener('input',refresh);row.querySelector('.remove-row').addEventListener('click',()=>{if(body.children.length>1)row.remove();else{sel.value='';qty.value='';cost.value=''}refresh()})})}
+    function refresh(){const incoming=type.value==='Masuk';document.querySelectorAll('.cost-head,.cost-cell,.summary-value').forEach(x=>x.style.display=incoming?'':'none');let qty=0,value=0;[...body.children].forEach((row,i)=>{row.querySelector('.row-number').textContent=i+1;const q=Number(row.querySelector('.qty-input').value||0),c=Number(row.querySelector('.cost-input').value||0);qty+=q;value+=q*c;row.querySelector('.row-subtotal').textContent=incoming?rupiah(q*c):'-'});const n=body.children.length;document.getElementById('movementItemCount').textContent=n+' barang';document.getElementById('summaryItems').textContent=n;document.getElementById('summaryQty').textContent=qty.toLocaleString('id-ID');document.getElementById('summaryValue').textContent=rupiah(value);note.required=type.value==='Opname'}
+    document.getElementById('addMovementRow').addEventListener('click',addRow);type.addEventListener('change',refresh);document.getElementById('movementForm').addEventListener('submit',function(e){const picks=[...body.querySelectorAll('.product-select')].map(x=>x.value).filter(Boolean);if(new Set(picks).size!==picks.length){e.preventDefault();alert('Barang yang sama tidak boleh dipilih dua kali.');return}const b=document.getElementById('postMovement');b.disabled=true;b.classList.add('is-loading');b.textContent='Memposting...'});addRow()})();
+    </script>
+    ''', products_rows=products_rows, rows=rows, stats=stats, key=key, type_filter=type_filter, trx_filter=trx_filter,
+         branch_name=branch_name, rupiah=rupiah, endpoint_names={r.endpoint for r in app.url_map.iter_rules()})
     return render_page('Mutasi Stok', body)
 
 # =========================
@@ -7966,56 +8634,96 @@ def stock_movements():
 # =========================
 @app.route('/stock-transfer', methods=['GET', 'POST'])
 @login_required
-@role_required('admin', 'kasir', 'branch_admin', 'branch_cashier')
+@role_required('admin','kasir','branch_admin','branch_cashier')
 def stock_transfer():
-    if request.method == 'POST':
-        product_id = int(request.form.get('product_id') or 0)
-        origin = request.form.get('origin')
-        target = request.form.get('target')
-        qty = parse_float(request.form.get('qty', 0))
-        if product_id <= 0 or qty <= 0 or origin == target:
-            flash('Data transfer tidak valid.', 'error')
-            return redirect(url_for('stock_transfer'))
-        if origin == 'PUSAT':
-            p = q_one('SELECT stock FROM products WHERE id=?', [product_id])
-            if float(p['stock']) < qty:
-                flash('Stok PUSAT tidak mencukupi.', 'error')
-                return redirect(url_for('stock_transfer'))
-            exec_sql('UPDATE products SET stock = stock - ? WHERE id = ?', [qty, product_id])
-        else:
-            pbs = q_one('SELECT stock FROM product_branch_stock WHERE product_id=? AND branch_id=?', [product_id, int(origin)])
-            if not pbs or float(pbs['stock']) < qty:
-                flash('Stok Cabang asal tidak mencukupi.', 'error')
-                return redirect(url_for('stock_transfer'))
-            exec_sql('UPDATE product_branch_stock SET stock = stock - ? WHERE product_id=? AND branch_id=?', [qty, product_id, int(origin)])
-        if target == 'PUSAT':
-            exec_sql('UPDATE products SET stock = stock + ? WHERE id = ?', [qty, product_id])
-        else:
-            exec_sql('INSERT INTO product_branch_stock(product_id, branch_id, stock) VALUES (?, ?, ?) ON CONFLICT(product_id, branch_id) DO UPDATE SET stock = stock + ?', [product_id, int(target), qty, qty])
-        log_action('STOCK_TRANSFER', 'products', product_id, f'Transfer {qty} dari {origin} ke {target}')
-        # Log ke stock_history
-        origin_name = origin if origin == 'PUSAT' else (q_one('SELECT name FROM koperasi_branches WHERE id=?', [int(origin)]) or [''])[0] if origin else 'PUSAT'
-        target_name = target if target == 'PUSAT' else (q_one('SELECT name FROM koperasi_branches WHERE id=?', [int(target)]) or [''])[0] if target else 'PUSAT'
-        log_stock_history(product_id, qty, 'Transfer Antar Cabang', origin=origin_name, destination=target_name, reference_type='stock_transfer', reference_id=product_id, note=f'{origin_name} → {target_name}')
-        flash(f'✅ Transfer stok berhasil: {qty} unit.', 'success')
-        return redirect(url_for('stock_transfer'))
-    products = q_all("SELECT id, barcode, product_name, stock FROM products WHERE active=1 ORDER BY product_name ASC")
-    branches = q_all("SELECT id, branch_code, name FROM koperasi_branches WHERE is_active=1 ORDER BY name")
-    body = render_template_string('''<div class="card"><div class="kartu"><h2>🚚 Transfer Stok Antar Cabang</h2></div><hr><form method="post"><div class="grid"><div class="col-12"><div class="form-group"><label>Barang</label><select name="product_id" required><option value="">— Pilih Barang —</option>{% for p in products %}<option value="{{ p.id }}">{{ p.barcode }} — {{ p.product_name }} (Pusat: {{ p.stock }})</option>{% endfor %}</select></div></div><div class="col-6"><div class="form-group"><label>Asal</label><select name="origin" required><option value="PUSAT">🏢 PUSAT</option>{% for b in branches %}<option value="{{ b.id }}">📍 {{ b.name }}</option>{% endfor %}</select></div></div><div class="col-6"><div class="form-group"><label>Tujuan</label><select name="target" required><option value="">— Pilih Tujuan —</option><option value="PUSAT">🏢 PUSAT</option>{% for b in branches %}<option value="{{ b.id }}">📍 {{ b.name }}</option>{% endfor %}</select></div></div><div class="col-6"><div class="form-group"><label>Jumlah (Qty)</label><input type="number" name="qty" step="any" min="0.1" required></div></div><div class="col-12"><button type="submit" class="btn-success">📤 Kirim Transfer</button></div></div></form></div>''', products=products, branches=branches, rupiah=rupiah)
-    return render_page('Transfer Stok', body)
+    user=current_user(); current_bid,branch_warning=resolve_operational_branch(user); branch_mode=is_branch_role(user)
+    fixed_origin=str(current_bid) if branch_mode and current_bid else None
+    if request.method=='POST':
+        if branch_mode and not current_bid:
+            flash('Transfer belum dapat diproses karena cabang akun belum dikonfigurasi.','error'); return redirect(url_for('stock_transfer'))
+        try: product_id=int(request.form.get('product_id') or 0)
+        except Exception: product_id=0
+        requested_origin=(request.form.get('origin') or '').strip(); target=(request.form.get('target') or '').strip(); qty=parse_float(request.form.get('qty'),0)
+        origin=fixed_origin if branch_mode else requested_origin
+        valid_targets={'PUSAT'}|{str(r['id']) for r in q_all('SELECT id FROM koperasi_branches WHERE is_active=1')}
+        if product_id<=0 or qty<=0 or not origin or target not in valid_targets or origin==target:
+            flash('Rute, barang, atau jumlah transfer tidak valid.','error'); return redirect(url_for('stock_transfer'))
+        prod=q_one('SELECT id,product_name,barcode FROM products WHERE id=? AND active=1',[product_id])
+        if not prod:
+            flash('Barang tidak ditemukan.','error'); return redirect(url_for('stock_transfer'))
+        conn=get_conn()
+        try:
+            cur=conn.cursor(); cur.execute('BEGIN IMMEDIATE')
+            if origin=='PUSAT':
+                row=cur.execute('SELECT COALESCE(stock,0) stock FROM products WHERE id=?',[product_id]).fetchone(); before_origin=float(row['stock'] or 0)
+                if before_origin<qty: raise ValueError(f'Stok PUSAT tidak cukup. Tersedia {before_origin:g}.')
+                changed=cur.execute('UPDATE products SET stock=stock-? WHERE id=? AND stock>=?',[qty,product_id,qty]).rowcount
+            else:
+                row=cur.execute('SELECT COALESCE(stock,0) stock FROM product_branch_stock WHERE product_id=? AND branch_id=?',[product_id,int(origin)]).fetchone(); before_origin=float(row['stock'] or 0) if row else 0
+                if before_origin<qty: raise ValueError(f'Stok cabang asal tidak cukup. Tersedia {before_origin:g}.')
+                changed=cur.execute('UPDATE product_branch_stock SET stock=stock-? WHERE product_id=? AND branch_id=? AND stock>=?',[qty,product_id,int(origin),qty]).rowcount
+            if changed!=1: raise ValueError('Stok asal berubah saat proses. Silakan ulangi.')
+            if target=='PUSAT':
+                before_target=float(cur.execute('SELECT COALESCE(stock,0) stock FROM products WHERE id=?',[product_id]).fetchone()['stock'] or 0)
+                cur.execute('UPDATE products SET stock=stock+? WHERE id=?',[qty,product_id])
+            else:
+                row=cur.execute('SELECT COALESCE(stock,0) stock FROM product_branch_stock WHERE product_id=? AND branch_id=?',[product_id,int(target)]).fetchone(); before_target=float(row['stock'] or 0) if row else 0
+                cur.execute('INSERT INTO product_branch_stock(product_id,branch_id,stock,min_stock) VALUES(?,?,?,0) ON CONFLICT(product_id,branch_id) DO UPDATE SET stock=stock+excluded.stock',[product_id,int(target),qty])
+            after_origin=before_origin-qty; after_target=before_target+qty
+            origin_name='PUSAT' if origin=='PUSAT' else cur.execute('SELECT name FROM koperasi_branches WHERE id=?',[int(origin)]).fetchone()['name']
+            target_name='PUSAT' if target=='PUSAT' else cur.execute('SELECT name FROM koperasi_branches WHERE id=?',[int(target)]).fetchone()['name']
+            trx=gen_code('TRF')
+            cur.execute('''INSERT INTO stock_history(trx_no,trx_date,product_id,product_name,barcode,qty,movement_type,origin,destination,stock_before,stock_after,reference_type,reference_id,note,created_by)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',[trx,today_str(),product_id,prod['product_name'],prod['barcode'],-qty,'Transfer Keluar',origin_name,target_name,before_origin,after_origin,'stock_transfer',0,f'{origin_name} -> {target_name}',user['id']])
+            cur.execute('''INSERT INTO stock_history(trx_no,trx_date,product_id,product_name,barcode,qty,movement_type,origin,destination,stock_before,stock_after,reference_type,reference_id,note,created_by)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',[trx,today_str(),product_id,prod['product_name'],prod['barcode'],qty,'Transfer Masuk',origin_name,target_name,before_target,after_target,'stock_transfer',0,f'{origin_name} -> {target_name}',user['id']])
+            conn.commit()
+        except Exception as e:
+            conn.rollback(); flash(f'Transfer dibatalkan. Tidak ada stok berubah: {e}','error'); return redirect(url_for('stock_transfer'))
+        finally: conn.close()
+        log_action('STOCK_TRANSFER','products',product_id,f'{trx}; {origin_name}->{target_name}; qty={qty}; source={before_origin}->{after_origin}; target={before_target}->{after_target}')
+        flash(f'Transfer berhasil: {prod["product_name"]} {qty:g} unit, {origin_name} ke {target_name}.','success'); return redirect(url_for('stock_transfer'))
+    branches=q_all('SELECT id,branch_code,name FROM koperasi_branches WHERE is_active=1 ORDER BY name')
+    if branch_mode and current_bid:
+        products=q_all('''SELECT p.id,p.barcode,p.product_name,p.unit,COALESCE(bs.stock,0) stock FROM products p LEFT JOIN product_branch_stock bs ON bs.product_id=p.id AND bs.branch_id=? WHERE p.active=1 AND COALESCE(bs.stock,0)>0 ORDER BY p.product_name''',[current_bid])
+    elif not branch_mode:
+        products=q_all('SELECT id,barcode,product_name,unit,COALESCE(stock,0) stock FROM products WHERE active=1 ORDER BY product_name')
+    else:
+        products=[]
+    all_products=q_all('SELECT id,COALESCE(stock,0) stock FROM products WHERE active=1'); branch_stocks=q_all('SELECT product_id,branch_id,COALESCE(stock,0) stock FROM product_branch_stock')
+    stock_map={str(p['id']):{'PUSAT':float(p['stock'] or 0)} for p in all_products}
+    for x in branch_stocks: stock_map.setdefault(str(x['product_id']),{})[str(x['branch_id'])]=float(x['stock'] or 0)
+    current_name=get_branch_name(current_bid) if current_bid else 'Cabang belum dikonfigurasi'
+    if branch_mode and current_bid:
+        recent=q_all('''SELECT product_name,ABS(qty) qty,origin,destination,created_at,trx_no FROM stock_history WHERE movement_type='Transfer Keluar' AND (origin=? OR origin=?) ORDER BY id DESC LIMIT 8''',[current_name,str(current_bid)])
+    elif branch_mode:
+        recent=[]
+    else:
+        recent=q_all("SELECT product_name,ABS(qty) qty,origin,destination,created_at,trx_no FROM stock_history WHERE movement_type='Transfer Keluar' ORDER BY id DESC LIMIT 8")
+    body=render_template_string(r'''
+    <div class="stock-workspace transfer-ai-suite">{% if branch_warning %}<div class="branch-config-warning"><b>Konfigurasi cabang</b><span>{{branch_warning}}</span></div>{% endif %}<header class="stock-hero ai-line-hero"><div><span class="stock-eyebrow">SMART INVENTORY ROUTING</span><h2>Transfer Stok Antar Lokasi</h2><p>{% if branch_mode %}Lokasi asal dikunci otomatis ke <b>{{current_name}}</b>. Pilih tujuan dan jumlah saja.{% else %}Pilih rute distribusi dan pantau perubahan stok sebelum transaksi diposting.{% endif %}</p></div><div class="stock-location"><span>Lokasi asal aktif</span><b>{{current_name if branch_mode else 'Akses seluruh lokasi'}}</b><a class="btn btn-ghost" href="{{url_for('stock_history')}}">Ledger Stok</a></div></header>
+    <div class="transfer-layout"><section class="card transfer-card"><div class="transfer-card-head"><span class="stock-eyebrow">TRANSFER BARU</span><h3>Rute Distribusi</h3><p>Transaksi bersifat atomik. Jika salah satu proses gagal, seluruh perubahan dibatalkan.</p></div><form method="post" class="transfer-form" id="transferForm"><div class="form-group transfer-product"><label>Barang dari {{current_name if branch_mode else 'lokasi asal'}}</label><select name="product_id" id="transferProduct" required><option value="">Pilih barang</option>{% for p in products %}<option value="{{p.id}}" data-unit="{{p.unit or 'pcs'}}">{{p.barcode}} - {{p.product_name}} · stok {{p.stock}}</option>{% endfor %}</select></div><div class="transfer-route"><div class="transfer-node origin"><div class="form-group"><label>Lokasi Asal</label>{% if branch_mode %}<input type="hidden" name="origin" value="{{current_bid}}"><input value="{{current_name}}" disabled>{% else %}<select name="origin" id="transferOrigin" required><option value="PUSAT">PUSAT</option>{% for b in branches %}<option value="{{b.id}}">{{b.branch_code}} · {{b.name}}</option>{% endfor %}</select>{% endif %}</div><div class="transfer-stock"><span>Stok tersedia</span><b id="originStock">0</b></div></div><div class="transfer-swap">→</div><div class="transfer-node target"><div class="form-group"><label>Lokasi Tujuan</label><select name="target" id="transferTarget" required><option value="">Pilih tujuan</option>{% if not branch_mode or current_bid %}<option value="PUSAT">PUSAT</option>{% endif %}{% for b in branches %}{% if not branch_mode or b.id!=current_bid %}<option value="{{b.id}}">{{b.branch_code}} · {{b.name}}</option>{% endif %}{% endfor %}</select></div><div class="transfer-stock"><span>Stok tujuan</span><b id="targetStock">0</b></div></div></div><div class="transfer-qty-row"><div class="form-group"><label>Jumlah Transfer</label><input type="number" name="qty" id="transferQty" min="0.001" step="0.001" required></div><div class="transfer-preview"><span>Simulasi perubahan</span><b id="transferPreview">Pilih barang dan tujuan</b></div></div><div class="transfer-actions"><span class="transfer-note">Stok asal dan tujuan diverifikasi ulang di server.</span><button id="transferSubmit">Posting Transfer</button></div></form></section><aside><section class="card transfer-side ai-audit-card"><div class="transfer-side-head"><span class="stock-eyebrow">AUDIT TRAIL</span><h3>Transfer Terakhir</h3></div><div class="transfer-recent">{% for r in recent %}<div class="transfer-recent-item"><span class="transfer-recent-icon">⇄</span><div><b>{{r.product_name}} · {{r.qty}}</b><small>{{r.origin}} → {{r.destination}} · {{r.trx_no}}</small></div></div>{% else %}<div class="transfer-empty">Belum ada transfer dari lokasi ini.</div>{% endfor %}</div></section></aside></div></div>
+    <script>(function(){const stocks={{stock_map|tojson}},p=document.getElementById('transferProduct'),o=document.getElementById('transferOrigin'),t=document.getElementById('transferTarget'),q=document.getElementById('transferQty'),fixed='{{current_bid if branch_mode else ""}}';function origin(){return fixed||(o?o.value:'')}function val(place){return Number((stocks[p.value]||{})[place]||0)}function fmt(v){return Number(v||0).toLocaleString('id-ID',{maximumFractionDigits:3})}function refresh(){let a=val(origin()),b=val(t.value),n=Number(q.value||0),u=p.selectedOptions[0]?.dataset.unit||'pcs';document.getElementById('originStock').textContent=fmt(a)+' '+u;document.getElementById('targetStock').textContent=fmt(b)+' '+u;document.getElementById('transferPreview').textContent=!p.value||!t.value?'Pilih barang dan tujuan':n>a?'Jumlah melebihi stok asal':fmt(a-n)+' '+u+' → '+fmt(b+n)+' '+u}[p,o,t,q].filter(Boolean).forEach(x=>{x.addEventListener('change',refresh);x.addEventListener('input',refresh)});document.getElementById('transferForm').addEventListener('submit',e=>{if(Number(q.value||0)>val(origin())){e.preventDefault();alert('Jumlah melebihi stok asal.');return}document.getElementById('transferSubmit').disabled=true});refresh()})();</script>
+    ''',products=products,branches=branches,stock_map=stock_map,recent=recent,branch_mode=branch_mode,current_bid=current_bid,current_name=current_name,branch_warning=branch_warning)
+    return render_page('Transfer Stok',body)
 
 # =========================
 # Riwayat Stok
 # =========================
 @app.route('/stock-history')
 @login_required
-@role_required('admin', 'kasir', 'branch_admin', 'branch_cashier')
+@role_required('admin','kasir','branch_admin','branch_cashier','manager')
 def stock_history():
     page = request.args.get('page', 1, type=int)
     product_filter = request.args.get('product_id', '')
     type_filter = request.args.get('type', '')
     params = []
     where = []
+    user=current_user(); bid=get_branch_id(); branch_name=get_branch_name(bid)
+    if is_branch_role(user):
+        location_tokens=[str(bid),branch_name] if bid else ['PUSAT']
+        where.append('(COALESCE(sh.origin,"") IN ('+','.join('?' for _ in location_tokens)+') OR COALESCE(sh.destination,"") IN ('+','.join('?' for _ in location_tokens)+'))')
+        params.extend(location_tokens+location_tokens)
     if product_filter:
         where.append('sh.product_id = ?')
         params.append(int(product_filter))
@@ -8033,7 +8741,7 @@ def stock_history():
     body = render_template_string('''
     <div class="card">
         <div class="kartu">
-            <div><h2>📜 Riwayat Stok Barang</h2><div class="muted small">Semua pergerakan stok: mutasi, transfer, penjualan, pembelian, retur</div></div>
+            <div><h2>📜 Riwayat Stok Barang</h2><div class="muted small">Pergerakan stok {{branch_name if branch_mode else "seluruh lokasi"}}: mutasi, transfer, penjualan, pembelian, dan retur</div></div>
             <form method="get" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;width:auto;">
                 <div><label class="small muted">Barang</label><select name="product_id" style="width:160px;" onchange="this.form.submit()"><option value="">Semua</option>{% for p in products_list %}<option value="{{ p.id }}" {% if product_filter|string == p.id|string %}selected{% endif %}>{{ p.barcode }} — {{ p.product_name }}</option>{% endfor %}</select></div>
                 <div><label class="small muted">Tipe</label><select name="type" style="width:140px;" onchange="this.form.submit()"><option value="">Semua</option><option value="Mutasi" {% if type_filter == 'Mutasi' %}selected{% endif %}>Mutasi</option><option value="Transfer" {% if type_filter == 'Transfer' %}selected{% endif %}>Transfer</option><option value="Penjualan" {% if type_filter == 'Penjualan' %}selected{% endif %}>Penjualan</option><option value="Pembelian" {% if type_filter == 'Pembelian' %}selected{% endif %}>Pembelian</option><option value="Retur" {% if type_filter == 'Retur' %}selected{% endif %}>Retur</option></select></div>
@@ -8056,7 +8764,7 @@ def stock_history():
         </tr>{% else %}<tr><td colspan="11" class="muted text-center">Belum ada riwayat stok.</td></tr>{% endfor %}</tbody></table></div>
         {{ pag_html|safe }}
     </div>
-    ''', rows=rows, pag_html=pag_html, products_list=products_list, product_filter=product_filter, type_filter=type_filter)
+    ''', rows=rows, pag_html=pag_html, products_list=products_list, product_filter=product_filter, type_filter=type_filter, branch_name=branch_name, branch_mode=is_branch_role(user))
     return render_page('Riwayat Stok', body)
 
 # =========================
@@ -8571,6 +9279,8 @@ def sales_returns():
         items_json = request.form.get('return_items', '[]')
         items = json.loads(items_json)
         sale = q_one('SELECT * FROM sales WHERE id=? AND status="Posted"', [sales_id])
+        role=current_user()['role']; current_bid=get_branch_id()
+        if sale and role not in ('admin','bendahara','supervisor') and ((sale['branch_id'] or None)!=(current_bid or None)): sale=None
         if not sale:
             flash('Transaksi tidak ditemukan atau sudah diproses.', 'error')
             return redirect(url_for('sales_returns'))
@@ -8592,8 +9302,8 @@ def sales_returns():
         ret_id = exec_sql('INSERT INTO sales_returns(return_no, sales_id, member_id, return_date, total, reason, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)', [ret_no, sales_id, sale['member_id'], today_str(), total_return, reason, session.get('user_id')])
         for pid, qty, price, sub in ret_items:
             exec_sql('INSERT INTO sales_return_items(return_id, product_id, qty, price, subtotal) VALUES (?, ?, ?, ?, ?)', [ret_id, pid, qty, price, sub])
-            exec_sql('UPDATE products SET stock = stock + ? WHERE id=?', [qty, pid])
-            log_stock_history(pid, qty, 'Retur', reference_type='sales_returns', reference_id=ret_id, note=f'Retur {ret_no}')
+            update_branch_stock(pid,qty,sale['branch_id'],'add')
+            log_stock_history(pid,qty,'Retur',origin=str(sale['branch_id'] or 'PUSAT'),reference_type='sales_returns',reference_id=ret_id,note=f'Retur {ret_no}')
         if sale['member_id'] and sale['payment_method'] == 'wallet':
             saldo_sebelum = q_one('SELECT COALESCE(SUM(CASE WHEN tipe="MASUK" THEN nominal ELSE -nominal END), 0) as saldo FROM saldo_history WHERE member_id=?', [sale['member_id']])['saldo']
             saldo_setelah = saldo_sebelum + total_return
@@ -8601,25 +9311,39 @@ def sales_returns():
         log_action('CREATE', 'sales_returns', ret_id, f'Retur {ret_no} dari {sale["invoice_no"]} total {total_return}')
         flash(f'Retur berhasil. {ret_no} — Stok dikembalikan.', 'success')
         return redirect(url_for('sales_returns_list'))
-    sales = q_all('SELECT s.*, COALESCE(m.name, s.customer_name, "Umum") as pelanggan FROM sales s LEFT JOIN members m ON m.id=s.member_id WHERE s.status="Posted" ORDER BY s.id DESC LIMIT 50')
-    body = render_template_string('''<div class="card"><h2>🔄 Retur Penjualan</h2><div class="muted small">Pilih transaksi lalu centang item yang ingin diretur</div><div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Tanggal</th><th>Pelanggan</th><th>Total</th><th>Aksi</th></tr></thead><tbody>{% for s in sales %}<tr><td>{{ s.invoice_no }}</td><td>{{ s.trx_date }}</td><td>{{ s.pelanggan }}</td><td>{{ rupiah(s.total) }}</td><td><a href="{{ url_for('sales_returns_process', sales_id=s.id) }}" class="btn btn-sm btn-warn">🔄 Retur</a></td></tr>{% else %}<tr><td colspan="5" class="muted text-center">Belum ada transaksi.</td></tr>{% endfor %}</tbody></table></div></div>''', sales=sales, rupiah=rupiah)
+    return_sql='SELECT s.*,COALESCE(m.name,s.customer_name,"Umum") pelanggan,COALESCE(b.name,"PUSAT") branch_name FROM sales s LEFT JOIN members m ON m.id=s.member_id LEFT JOIN koperasi_branches b ON b.id=s.branch_id WHERE s.status="Posted"'
+    return_params=[]; scope_sql,scope_params=branch_sales_scope('s'); return_sql+=scope_sql+' ORDER BY s.id DESC LIMIT 50'; return_params+=scope_params
+    sales=q_all(return_sql,return_params)
+    body = render_template_string('''<div class="sales-suite returns-suite"><header class="sales-hero"><div><span>RETURN MANAGEMENT</span><h2>Retur Penjualan</h2><p>Pilih transaksi yang valid, periksa detail barang, lalu proses pengembalian stok secara terkontrol.</p></div><div class="sales-hero-chip"><small>Transaksi tersedia</small><b>{{sales|length}} transaksi</b></div></header><div class="card sales-panel"><div class="sales-panel-head"><div><span class="sales-kicker">TRANSAKSI POSTED</span><h3>Pilih Transaksi untuk Diretur</h3><p>Hanya transaksi berstatus Posted yang dapat diproses.</p></div><a href="{{url_for('sales_returns_list')}}" class="btn btn-ghost">Riwayat Retur</a></div><div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Tanggal</th><th>Pelanggan</th><th>Lokasi</th><th>Total</th><th>Aksi</th></tr></thead><tbody>{% for s in sales %}<tr><td>{{ s.invoice_no }}</td><td>{{ s.trx_date }}</td><td>{{ s.pelanggan }}</td><td>{{s.branch_name}}</td><td>{{ rupiah(s.total) }}</td><td><a href="{{ url_for('sales_returns_process', sales_id=s.id) }}" class="btn btn-sm btn-warn">🔄 Retur</a></td></tr>{% else %}<tr><td colspan="6" class="muted text-center">Belum ada transaksi.</td></tr>{% endfor %}</tbody></table></div></div></div>''', sales=sales, rupiah=rupiah)
     return render_page('Retur Penjualan', body)
 
 @app.route('/sales-returns/process/<int:sales_id>', methods=['GET', 'POST'])
 @login_required
-@role_required('admin', 'kasir')
+@role_required('admin','kasir','branch_admin','branch_cashier')
 def sales_returns_process(sales_id):
     sale = q_one('SELECT s.*, COALESCE(m.name, s.customer_name, "Umum") as pelanggan FROM sales s LEFT JOIN members m ON m.id=s.member_id WHERE s.id=?', [sales_id])
-    items = q_all('SELECT si.*, p.stock FROM sales_items si LEFT JOIN products p ON p.id=si.product_id WHERE si.sales_id=?', [sales_id])
-    body = render_template_string('''<div class="card"><h2>🔄 Retur — {{ sale.invoice_no }}</h2><div class="muted small">{{ sale.pelanggan }} | {{ sale.trx_date }}</div><form method="post" id="retForm"><input type="hidden" name="sales_id" value="{{ sale.id }}"><input type="hidden" name="return_items" id="return_items" value="[]"><div class="form-group"><label>Alasan Retur</label><textarea name="reason" style="min-height:50px;"></textarea></div><div class="table-wrap"><table><thead><tr><th><input type="checkbox" id="checkAll" onchange="toggleAll(this)"></th><th>Barang</th><th>Qty Beli</th><th>Harga</th><th>Stok Skrg</th><th>Qty Retur</th></tr></thead><tbody>{% for i in items %}<tr><td><input type="checkbox" class="ret-check" data-pid="{{ i.product_id }}" data-price="{{ i.price }}" data-max="{{ i.qty }}" data-name="{{ i.product_name }}"></td><td>{{ i.product_name }}</td><td>{{ i.qty }}</td><td>{{ rupiah(i.price) }}</td><td>{{ i.stock }}</td><td><input type="number" class="ret-qty" min="1" max="{{ i.qty }}" value="{{ i.qty }}" disabled style="width:80px;"></td></tr>{% endfor %}</tbody></table></div><button type="submit" class="btn-warn">📤 Proses Retur</button></form></div><script>document.getElementById('checkAll')&&document.getElementById('checkAll').addEventListener('change',function(){document.querySelectorAll('.ret-check').forEach(c=>{c.checked=this.checked;c.closest('tr').querySelector('.ret-qty').disabled=!this.checked})});function toggleAll(s){document.querySelectorAll('.ret-check').forEach(c=>{c.checked=s.checked;c.closest('tr').querySelector('.ret-qty').disabled=!s.checked})}document.getElementById('retForm').addEventListener('submit',function(e){var items=[];document.querySelectorAll('.ret-check:checked').forEach(c=>{var q=parseInt(c.closest('tr').querySelector('.ret-qty').value)||0;if(q>0)items.push({product_id:parseInt(c.dataset.pid),qty:q,price:parseFloat(c.dataset.price)})});document.getElementById('return_items').value=JSON.stringify(items)})</script>''', sale=sale, items=items, rupiah=rupiah)
+    role=current_user()['role']; current_bid=get_branch_id()
+    if not sale or (role not in ('admin','bendahara','supervisor') and ((sale['branch_id'] or None)!=(current_bid or None))):
+        flash('Transaksi retur tidak ditemukan di cabang akun ini.','error'); return redirect(url_for('sales_returns'))
+    if current_bid:
+        items=q_all('''SELECT si.*,COALESCE(pbs.stock,0) stock FROM sales_items si LEFT JOIN product_branch_stock pbs ON pbs.product_id=si.product_id AND pbs.branch_id=? WHERE si.sales_id=?''',[current_bid,sales_id])
+    else:
+        items=q_all('SELECT si.*,COALESCE(p.stock,0) stock FROM sales_items si LEFT JOIN products p ON p.id=si.product_id WHERE si.sales_id=?',[sales_id])
+    body = render_template_string('''<div class="sales-suite return-process-suite"><header class="sales-hero"><div><span>RETURN PROCESS</span><h2>Proses Retur</h2><p>{{sale.invoice_no}} · {{sale.pelanggan}} · {{sale.trx_date}}</p></div><a href="{{url_for('sales_returns')}}" class="btn btn-ghost">Kembali</a></header><div class="card sales-panel"><div class="sales-panel-head"><div><span class="sales-kicker">PILIH ITEM</span><h3>Barang yang Dikembalikan</h3></div></div><form method="post" action="{{url_for('sales_returns')}}" id="retForm"><input type="hidden" name="sales_id" value="{{ sale.id }}"><input type="hidden" name="return_items" id="return_items" value="[]"><div class="form-group"><label>Alasan Retur</label><textarea name="reason" style="min-height:50px;"></textarea></div><div class="table-wrap"><table><thead><tr><th><input type="checkbox" id="checkAll" onchange="toggleAll(this)"></th><th>Barang</th><th>Qty Beli</th><th>Harga</th><th>Stok Skrg</th><th>Qty Retur</th></tr></thead><tbody>{% for i in items %}<tr><td><input type="checkbox" class="ret-check" data-pid="{{ i.product_id }}" data-price="{{ i.price }}" data-max="{{ i.qty }}" data-name="{{ i.product_name }}"></td><td>{{ i.product_name }}</td><td>{{ i.qty }}</td><td>{{ rupiah(i.price) }}</td><td>{{ i.stock }}</td><td><input type="number" class="ret-qty" min="1" max="{{ i.qty }}" value="{{ i.qty }}" disabled style="width:80px;"></td></tr>{% endfor %}</tbody></table></div><button type="submit" class="btn-warn">📤 Proses Retur</button></form></div></div><script>document.getElementById('checkAll')&&document.getElementById('checkAll').addEventListener('change',function(){document.querySelectorAll('.ret-check').forEach(c=>{c.checked=this.checked;c.closest('tr').querySelector('.ret-qty').disabled=!this.checked})});function toggleAll(s){document.querySelectorAll('.ret-check').forEach(c=>{c.checked=s.checked;c.closest('tr').querySelector('.ret-qty').disabled=!s.checked})}document.getElementById('retForm').addEventListener('submit',function(e){var items=[];document.querySelectorAll('.ret-check:checked').forEach(c=>{var q=parseInt(c.closest('tr').querySelector('.ret-qty').value)||0;if(q>0)items.push({product_id:parseInt(c.dataset.pid),qty:q,price:parseFloat(c.dataset.price)})});document.getElementById('return_items').value=JSON.stringify(items)})</script>''', sale=sale, items=items, rupiah=rupiah)
     return render_page(f'Retur {sale["invoice_no"]}', body)
 
 @app.route('/sales-returns/list')
 @login_required
-@role_required('admin', 'kasir')
+@role_required('admin','kasir','branch_admin','branch_cashier')
 def sales_returns_list():
-    rows = q_all('SELECT r.*, s.invoice_no FROM sales_returns r LEFT JOIN sales s ON s.id=r.sales_id ORDER BY r.id DESC LIMIT 200')
-    body = render_template_string('''<div class="card"><h2>📋 Riwayat Retur</h2><div class="table-wrap"><table><thead><tr><th>No Retur</th><th>Invoice Asal</th><th>Tanggal</th><th>Total</th><th>Alasan</th><th>Status</th></tr></thead><tbody>{% for r in rows %}<tr><td>{{ r.return_no }}</td><td>{{ r.invoice_no }}</td><td>{{ r.return_date }}</td><td>{{ rupiah(r.total) }}</td><td>{{ r.reason or '-' }}</td><td><span class="badge badge-warn">{{ r.status }}</span></td></tr>{% else %}<tr><td colspan="6" class="muted text-center">Belum ada retur.</td></tr>{% endfor %}</tbody></table></div></div>''', rows=rows, rupiah=rupiah)
+    user=current_user()
+    bid,branch_warning=resolve_operational_branch(user)
+    sql='''SELECT r.*,s.invoice_no,COALESCE(b.name,'PUSAT') branch_name FROM sales_returns r JOIN sales s ON s.id=r.sales_id LEFT JOIN koperasi_branches b ON b.id=s.branch_id WHERE 1=1'''; params=[]
+    if user['role'] in ('branch_admin','branch_cashier','kasir'):
+        if bid: sql+=' AND s.branch_id=?'; params.append(bid)
+        else: sql+=' AND 1=0'
+    rows=q_all(sql+' ORDER BY r.id DESC LIMIT 200',params)
+    body = render_template_string('''<div class="sales-suite return-history-suite"><header class="sales-hero"><div><span>RETURN HISTORY</span><h2>Riwayat Retur</h2><p>Audit seluruh pengembalian barang dan nilai transaksi retur.</p></div><a href="{{url_for('sales_returns')}}" class="btn btn-ghost">Buat Retur</a></header><div class="card sales-panel"><div class="sales-panel-head"><div><span class="sales-kicker">AUDIT RETUR</span><h3>Daftar Retur</h3></div></div><div class="table-wrap"><table><thead><tr><th>No Retur</th><th>Invoice Asal</th><th>Tanggal</th><th>Lokasi</th><th>Total</th><th>Alasan</th><th>Status</th></tr></thead><tbody>{% for r in rows %}<tr><td>{{ r.return_no }}</td><td>{{ r.invoice_no }}</td><td>{{ r.return_date }}</td><td><span class="badge badge-info">{{r.branch_name}}</span></td><td>{{ rupiah(r.total) }}</td><td>{{ r.reason or '-' }}</td><td><span class="badge badge-warn">{{ r.status }}</span></td></tr>{% else %}<tr><td colspan="7" class="muted text-center">Belum ada retur.</td></tr>{% endfor %}</tbody></table></div></div></div>''', rows=rows, rupiah=rupiah)
     return render_page('Riwayat Retur', body)
 
 # =========================
@@ -8629,13 +9353,19 @@ def sales_returns_list():
 @login_required
 @role_required('admin', 'kasir', 'branch_admin', 'branch_cashier')
 def cashier_discount():
+    user=current_user()
+    bid,branch_warning=resolve_operational_branch(user)
+    branch_key=str(bid) if bid else 'UNASSIGNED-DISCOUNT'
+    if session.get('discount_cart_branch')!=branch_key: save_cart([]); session['discount_cart_branch']=branch_key
     cart = get_cart()
     if request.method == 'POST':
+        if user['role'] in ('branch_admin','branch_cashier','kasir') and not bid:
+            flash('Transaksi diblokir karena cabang akun belum dikonfigurasi.','error'); return redirect(url_for('cashier_discount'))
         action = request.form.get('action')
         if action == 'add_item':
             barcode = request.form.get('barcode', '').strip()
             qty = parse_float(request.form.get('qty', 1) or 1)
-            prod = q_one('SELECT id, barcode, product_name, sell_price, stock FROM products WHERE barcode=? AND active=1', [barcode])
+            prod=q_one('''SELECT p.id,p.barcode,p.product_name,p.sell_price,COALESCE(bs.stock,0) stock FROM products p LEFT JOIN product_branch_stock bs ON bs.product_id=p.id AND bs.branch_id=? WHERE p.barcode=? AND p.active=1''',[bid,barcode]) if bid else q_one('SELECT id,barcode,product_name,sell_price,COALESCE(stock,0) stock FROM products WHERE barcode=? AND active=1',[barcode])
             if not barcode:
                 flash('Barcode wajib diisi / discan.', 'warning')
             elif not prod:
@@ -8714,11 +9444,14 @@ def cashier_discount():
             disc_note = ''
             if global_disc_amount > 0:
                 disc_note = f'Diskon {global_disc}{"" if global_disc_type==chr(37) else "Rp"}={rupiah(global_disc_amount)}'
-            sid = exec_sql('INSERT INTO sales(invoice_no, trx_date, member_id, cashier_id, customer_name, total, paid, change_amount, note, status, payment_method) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "Posted", ?)', [invoice, today_str(), member_id, session.get('user_id'), customer_name, final_total, paid, change_amount, note + ' ' + disc_note, payment_method])
+            for item in cart:
+                if get_product_stock(item['product_id'],bid)<float(item['qty']):
+                    flash(f"Stok {item['product_name']} di {get_branch_name(bid)} tidak cukup.",'error'); return redirect(url_for('cashier_discount'))
+            sid=exec_sql('INSERT INTO sales(invoice_no,trx_date,member_id,cashier_id,customer_name,total,paid,change_amount,note,status,payment_method,branch_id) VALUES(?,?,?,?,?,?,?,?,?,"Posted",?,?)',[invoice,today_str(),member_id,user['id'],customer_name,final_total,paid,change_amount,note+' '+disc_note,payment_method,bid])
             for item in cart:
                 exec_sql('INSERT INTO sales_items(sales_id, product_id, barcode, product_name, qty, price, subtotal) VALUES (?, ?, ?, ?, ?, ?, ?)', [sid, item['product_id'], item['barcode'], item['product_name'], item['qty'], item['price'], item.get('subtotal', item['qty'] * item['price'])])
-                exec_sql('UPDATE products SET stock = stock - ? WHERE id=?', [item['qty'], item['product_id']])
-                log_stock_history(item['product_id'], item['qty'], 'Penjualan', reference_type='sales', reference_id=sid, note=f'Invoice {invoice}')
+                update_branch_stock(item['product_id'],item['qty'],bid,'subtract')
+                log_stock_history(item['product_id'], item['qty'], 'Penjualan', reference_type='sales', reference_id=sid, origin=str(bid or 'PUSAT'),note=f'Invoice {invoice}; {get_branch_name(bid)}')
             log_action('CREATE', 'sales', sid, f'Transaksi diskon {invoice} total {final_total}')
             save_cart([])
             flash(f'Transaksi tersimpan. Invoice {invoice}. Total {rupiah(final_total)}. Kembalian {rupiah(change_amount)}', 'success')
@@ -8920,27 +9653,91 @@ def supplier_payments():
 # =========================
 # Fitur 3: Laporan Keuangan PDF (Laba Rugi + Neraca)
 # =========================
+CSS_DESIGN += r'''
+/* Financial command dashboard */
+.fin-shell{display:grid;gap:14px;max-width:none!important}.fin-hero{position:relative;display:flex;justify-content:space-between;align-items:flex-end;gap:24px;overflow:hidden;padding:27px 29px;border-radius:14px;background:linear-gradient(125deg,#101828,#213b59);color:#fff;box-shadow:0 12px 30px rgba(16,24,40,.14)}.fin-hero:after{content:'';position:absolute;right:-65px;top:-100px;width:240px;height:240px;border:44px solid rgba(227,93,52,.18);border-radius:50%}.fin-hero>div{position:relative;z-index:1}.fin-eyebrow{display:block;color:#f4a184;font-size:8px;font-weight:900;letter-spacing:.17em}.fin-hero h2{margin:5px 0 6px;color:#fff;font-size:27px;letter-spacing:-.04em}.fin-hero p{max-width:720px;color:#c5cfdb;font-size:11px}.fin-period{display:flex;align-items:end;gap:8px;padding:11px;border:1px solid rgba(255,255,255,.13);border-radius:10px;background:rgba(255,255,255,.07)}.fin-period label{display:block;margin-bottom:4px;color:#aebbc9;font-size:8px;font-weight:800;text-transform:uppercase}.fin-period select{min-width:110px;height:38px!important;min-height:38px!important;background:#fff!important}.fin-period button{height:38px!important;min-height:38px!important;background:#e35d34!important}.fin-kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.fin-kpi{position:relative;overflow:hidden;padding:16px 17px;border:1px solid #d0d5dd;border-top:3px solid #2457d6;border-radius:10px;background:#fff}.fin-kpi.in{border-top-color:#087e6a}.fin-kpi.out{border-top-color:#e35d34}.fin-kpi.net{border-top-color:#2457d6}.fin-kpi.profit{border-top-color:#7a5af8}.fin-kpi.cash{border-top-color:#d69e18}.fin-kpi span,.fin-kpi b,.fin-kpi small{display:block}.fin-kpi span{color:#667085;font-size:8px;font-weight:850;text-transform:uppercase;letter-spacing:.07em}.fin-kpi b{margin:8px 0 4px;color:#101828;font-size:19px;line-height:1.15;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.fin-kpi small{color:#98a2b3;font-size:8px}.fin-flow{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:14px}.fin-panel{overflow:hidden;border:1px solid #d0d5dd;border-radius:11px;background:#fff;box-shadow:0 2px 8px rgba(16,24,40,.035)}.fin-panel-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:17px 19px;border-bottom:1px solid #e4e7ec}.fin-panel-head h3{margin:4px 0 2px;font-size:15px}.fin-panel-head p{color:#667085;font-size:9px}.fin-panel-badge{padding:5px 8px;border-radius:999px;background:#eef4ff;color:#2457d6;font-size:8px;font-weight:850}.cash-flow-visual{padding:18px}.cash-flow-route{display:grid;grid-template-columns:minmax(0,1fr) 72px minmax(0,1fr) 72px minmax(0,1fr);align-items:center;gap:8px}.cash-node{min-height:128px;padding:15px;border:1px solid #d0d5dd;border-radius:11px;background:#f8f9fb}.cash-node.in{border-top:3px solid #087e6a}.cash-node.center{border-top:3px solid #2457d6;background:#eef4ff}.cash-node.out{border-top:3px solid #e35d34}.cash-node span,.cash-node b,.cash-node small{display:block}.cash-node span{color:#667085;font-size:8px;font-weight:850;text-transform:uppercase}.cash-node b{margin:9px 0 5px;font-size:18px;line-height:1.15}.cash-node small{color:#667085;font-size:9px;line-height:1.45}.cash-arrow{text-align:center;color:#98a2b3}.cash-arrow b{display:block;font-size:20px}.cash-arrow small{font-size:7px;text-transform:uppercase}.fin-health{display:grid;gap:10px;padding:17px}.health-row{padding:12px;border:1px solid #e4e7ec;border-radius:10px;background:#f8f9fb}.health-row>div:first-child{display:flex;justify-content:space-between;gap:10px;margin-bottom:7px}.health-row span{color:#667085;font-size:9px}.health-row b{font-size:10px}.health-track{height:7px;overflow:hidden;border-radius:99px;background:#e4e7ec}.health-fill{height:100%;border-radius:99px;background:#2457d6}.health-fill.green{background:#087e6a}.health-fill.orange{background:#e35d34}.fin-months{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:8px;align-items:end;height:220px;padding:20px 18px 16px}.month-col{display:grid;grid-template-rows:1fr auto;align-items:end;gap:7px;height:100%;min-width:0}.month-bars{display:flex;align-items:end;justify-content:center;gap:3px;height:170px}.month-bar{width:11px;min-height:2px;border-radius:4px 4px 1px 1px}.month-bar.in{background:#087e6a}.month-bar.out{background:#e35d34}.month-col span{text-align:center;color:#667085;font-size:7px;font-weight:800}.fin-legend{display:flex;gap:14px;align-items:center;padding:0 18px 15px;color:#667085;font-size:8px}.fin-legend i{display:inline-block;width:8px;height:8px;margin-right:4px;border-radius:2px}.fin-legend .li-in i{background:#087e6a}.fin-legend .li-out i{background:#e35d34}.fin-sources{display:grid;grid-template-columns:1fr 1fr;gap:14px}.fin-list{padding:5px 18px 15px}.fin-list-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;padding:10px 0;border-bottom:1px solid #edf0f3}.fin-list-row:last-child{border-bottom:0}.fin-list-row b,.fin-list-row small{display:block}.fin-list-row b{font-size:10px}.fin-list-row small{margin-top:2px;color:#667085;font-size:8px}.fin-list-row strong{font-size:10px;font-variant-numeric:tabular-nums}.fin-list-row.in strong{color:#087e6a}.fin-list-row.out strong{color:#b54708}.fin-statements{display:grid;grid-template-columns:1fr 1fr;gap:14px}.statement-body{padding:8px 18px 17px}.statement-section{margin-top:10px}.statement-title{display:flex;justify-content:space-between;padding:8px 0;color:#344054;font-size:9px;font-weight:900;text-transform:uppercase;border-bottom:1px solid #d0d5dd}.statement-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:8px;padding:8px 0;border-bottom:1px solid #edf0f3;font-size:9px}.statement-row code{color:#667085}.statement-row strong{font-variant-numeric:tabular-nums}.statement-total{display:flex;justify-content:space-between;gap:12px;margin-top:8px;padding:11px;border-radius:9px;background:#f2f4f7;font-size:10px}.statement-total.positive{background:#e9f7f2;color:#087e6a}.statement-total.negative{background:#fff0f1;color:#b42335}.fin-actions{display:flex;gap:7px}.fin-actions .btn{min-height:34px!important}.fin-note{padding:12px 15px;border:1px solid #c8d8f1;border-radius:10px;background:#eef4ff;color:#315b89;font-size:9px;line-height:1.55}
+@media(max-width:1200px){.fin-kpis{grid-template-columns:repeat(3,1fr)}.fin-flow{grid-template-columns:1fr}.fin-statements{grid-template-columns:1fr}}
+@media(max-width:900px){.cash-flow-route{grid-template-columns:1fr}.cash-arrow{transform:rotate(90deg)}.fin-sources{grid-template-columns:1fr}.fin-months{overflow-x:auto;grid-template-columns:repeat(12,48px)}}
+@media(max-width:768px){.fin-shell{padding:0 12px}.fin-hero{align-items:flex-start;flex-direction:column;padding:20px;border-radius:20px}.fin-hero h2{font-size:22px}.fin-period{width:100%}.fin-period>div{flex:1}.fin-period select{width:100%}.fin-kpis{grid-template-columns:repeat(2,minmax(0,1fr));padding:0!important}.fin-kpi{padding:13px}.fin-kpi b{font-size:15px}.fin-panel{margin:0!important;border-radius:18px}.fin-panel-head{align-items:flex-start;flex-direction:column;padding:15px}.cash-flow-visual{padding:14px}.fin-actions{width:100%}.fin-actions .btn{flex:1}.fin-statements{gap:10px}.statement-body{padding:7px 14px 15px}}
+@media(max-width:420px){.fin-kpis{grid-template-columns:1fr}.fin-period{align-items:stretch;flex-direction:column}}
+'''
+
+def _fin_sum(sql, params=None):
+    try:
+        row=q_one(sql,params or []); return float(row['x'] or 0) if row else 0.0
+    except Exception:
+        return 0.0
+
+def _financial_operational_cashflow(start, end):
+    """Build cash movement from operational source tables with explicit, non-overlapping rules."""
+    rows=[]
+    def add(direction, source, amount, ref_type, note):
+        amount=round(float(amount or 0),2)
+        if amount>0: rows.append({'direction':direction,'source':source,'amount':amount,'ref_type':ref_type,'note':note})
+    # Wallet sales are excluded here because cash entered when topup was approved.
+    add('IN','Penjualan Tunai',_fin_sum("SELECT COALESCE(SUM(total),0) x FROM sales WHERE status='Posted' AND LOWER(COALESCE(payment_method,'tunai'))='tunai' AND trx_date BETWEEN ? AND ?",[start,end]),'sales_cash','Penjualan Posted dengan metode tunai')
+    add('IN','Topup Wallet Disetujui',_fin_sum("SELECT COALESCE(SUM(nominal),0) x FROM topup_requests WHERE status='APPROVED' AND substr(COALESCE(approved_at,created_at),1,10) BETWEEN ? AND ?",[start,end]),'wallet_topup','Kas masuk saat topup disetujui; belanja wallet tidak dihitung ulang')
+    add('IN','Simpanan Masuk',_fin_sum("SELECT COALESCE(SUM(amount),0) x FROM savings_transactions WHERE direction='Masuk' AND trx_date BETWEEN ? AND ?",[start,end]),'savings_in','Penerimaan simpanan anggota')
+    add('OUT','Penarikan Simpanan',_fin_sum("SELECT COALESCE(SUM(amount),0) x FROM savings_transactions WHERE direction='Keluar' AND trx_date BETWEEN ? AND ?",[start,end]),'savings_out','Pengeluaran penarikan simpanan')
+    add('IN','Angsuran Terverifikasi',_fin_sum("SELECT COALESCE(SUM(amount)+SUM(COALESCE(penalty_amount,0)),0) x FROM loan_payments WHERE UPPER(TRIM(COALESCE(status,'')))='VERIFIED' AND payment_date BETWEEN ? AND ?",[start,end]),'loan_payment','Angsuran dan denda yang telah tervalidasi')
+    add('OUT','Pencairan Pinjaman',_fin_sum("SELECT COALESCE(SUM(principal),0) x FROM loans WHERE (status='Berjalan' OR current_stage='ACTIVE') AND substr(COALESCE(approved_at,loan_date),1,10) BETWEEN ? AND ?",[start,end]),'loan_disbursement','Pokok pinjaman aktif/disetujui')
+    add('OUT','Pembayaran Supplier',_fin_sum("SELECT COALESCE(SUM(amount),0) x FROM supplier_payments WHERE payment_date BETWEEN ? AND ?",[start,end]),'supplier_payment','Pembayaran hutang supplier')
+    return rows
+
+def _financial_integrity_audit(start, end, operational_rows):
+    debit=_fin_sum("SELECT COALESCE(SUM(debit),0) x FROM journal_entries WHERE entry_date BETWEEN ? AND ?",[start,end])
+    credit=_fin_sum("SELECT COALESCE(SUM(credit),0) x FROM journal_entries WHERE entry_date BETWEEN ? AND ?",[start,end])
+    unbalanced=int(_fin_sum("SELECT COUNT(*) x FROM (SELECT entry_no FROM journal_entries WHERE entry_date BETWEEN ? AND ? GROUP BY entry_no HAVING ABS(SUM(COALESCE(debit,0))-SUM(COALESCE(credit,0)))>0.01)",[start,end]))
+    cash_debit=_fin_sum("SELECT COALESCE(SUM(j.debit),0) x FROM journal_entries j JOIN accounts a ON a.id=j.account_id WHERE a.account_code='1001' AND j.entry_date BETWEEN ? AND ?",[start,end])
+    cash_credit=_fin_sum("SELECT COALESCE(SUM(j.credit),0) x FROM journal_entries j JOIN accounts a ON a.id=j.account_id WHERE a.account_code='1001' AND j.entry_date BETWEEN ? AND ?",[start,end])
+    op_in=sum(x['amount'] for x in operational_rows if x['direction']=='IN'); op_out=sum(x['amount'] for x in operational_rows if x['direction']=='OUT')
+    source_count=sum(1 for x in operational_rows if x['amount']>0)
+    journal_cash_count=int(_fin_sum("SELECT COUNT(*) x FROM journal_entries j JOIN accounts a ON a.id=j.account_id WHERE a.account_code='1001' AND j.entry_date BETWEEN ? AND ?",[start,end]))
+    warnings=[]
+    if abs(debit-credit)>0.01: warnings.append(f'Total jurnal tidak seimbang sebesar {rupiah(abs(debit-credit))}.')
+    if unbalanced: warnings.append(f'Ada {unbalanced} nomor jurnal yang tidak seimbang.')
+    if source_count and journal_cash_count==0: warnings.append('Transaksi operasional ada, tetapi akun Kas belum memiliki posting jurnal. Cashflow memakai buku kas operasional.')
+    cash_gap_in=op_in-cash_debit; cash_gap_out=op_out-cash_credit
+    if abs(cash_gap_in)>0.01 or abs(cash_gap_out)>0.01: warnings.append('Cashflow operasional dan akun Kas belum sepenuhnya terhubung; selisih ditampilkan untuk rekonsiliasi, bukan disembunyikan.')
+    return {'debit':debit,'credit':credit,'unbalanced':unbalanced,'cash_debit':cash_debit,'cash_credit':cash_credit,'op_in':op_in,'op_out':op_out,'gap_in':cash_gap_in,'gap_out':cash_gap_out,'journal_cash_count':journal_cash_count,'warnings':warnings,'ok':not warnings}
+
 @app.route('/financial-statements')
 @login_required
 @role_required('admin', 'bendahara')
 def financial_statements():
-    year = request.args.get('year', str(datetime.now().year))
-    start = f'{year}-01-01'; end = f'{year}-12-31'
-    tb = q_all('SELECT a.account_code, a.account_name, a.category, a.normal_balance, COALESCE(SUM(j.debit),0) as debit, COALESCE(SUM(j.credit),0) as credit FROM accounts a LEFT JOIN journal_entries j ON j.account_id=a.id AND j.entry_date >= ? AND j.entry_date <= ? GROUP BY a.id ORDER BY a.account_code', [start, end])
-    revenue_items = []; expense_items = []; asset_items = []; liab_items = []; modal_items = []
-    total_revenue = 0; total_expense = 0; total_asset = 0; total_liab = 0; total_modal = 0
+    try: year=int(request.args.get('year',datetime.now().year))
+    except Exception: year=datetime.now().year
+    year=min(max(year,2020),datetime.now().year+1); start=f'{year}-01-01'; end=f'{year}-12-31'
+    tb=q_all('''SELECT a.account_code,a.account_name,a.category,a.normal_balance,COALESCE(SUM(j.debit),0) debit,COALESCE(SUM(j.credit),0) credit FROM accounts a LEFT JOIN journal_entries j ON j.account_id=a.id AND j.entry_date BETWEEN ? AND ? GROUP BY a.id ORDER BY a.account_code''',[start,end])
+    buckets={'Pendapatan':[],'Beban':[],'Aset':[],'Kewajiban':[],'Modal':[]}; totals={k:0.0 for k in buckets}
     for r in tb:
-        cat = r['category']
-        saldo = float(r['debit']) - float(r['credit']) if r['normal_balance'] == 'Debit' else float(r['credit']) - float(r['debit'])
-        item = {'code': r['account_code'], 'name': r['account_name'], 'amount': abs(saldo)}
-        if cat == 'Pendapatan': revenue_items.append(item); total_revenue += abs(saldo)
-        elif cat == 'Beban': expense_items.append(item); total_expense += abs(saldo)
-        elif cat == 'Aset': asset_items.append(item); total_asset += abs(saldo)
-        elif cat == 'Kewajiban': liab_items.append(item); total_liab += abs(saldo)
-        elif cat == 'Modal': modal_items.append(item); total_modal += abs(saldo)
-    laba_bersih = total_revenue - total_expense
-    body = render_template_string('''<div class="grid"><div class="col-6"><div class="card"><h2>📊 Laba Rugi {{ year }}</h2><form method="get" style="display:flex;gap:8px;margin-bottom:12px;"><select name="year" onchange="this.form.submit()">{% for y in range(2024,2028) %}<option value="{{ y }}" {% if y|string==year %}selected{% endif %}>{{ y }}</option>{% endfor %}</select><a href="{{ url_for('financial_statements_pdf', year=year, report_type='lr') }}" class="btn btn-sm">🖨️ Cetak PDF</a></form><h3>Pendapatan</h3><table><tbody>{% for i in revenue_items %}<tr><td>{{ i.code }} — {{ i.name }}</td><td class="text-right">{{ rupiah(i.amount) }}</td></tr>{% endfor %}</tbody><tfoot><tr><td><strong>Total Pendapatan</strong></td><td class="text-right"><strong>{{ rupiah(total_revenue) }}</strong></td></tr></tfoot></table><hr><h3>Beban</h3><table><tbody>{% for i in expense_items %}<tr><td>{{ i.code }} — {{ i.name }}</td><td class="text-right">{{ rupiah(i.amount) }}</td></tr>{% endfor %}</tbody><tfoot><tr><td><strong>Total Beban</strong></td><td class="text-right"><strong>{{ rupiah(total_expense) }}</strong></td></tr></tfoot></table><hr><div style="background:#f0fdf4;padding:12px;border-radius:8px;"><strong>LABA BERSIH: {{ rupiah(laba_bersih) }}</strong></div></div></div><div class="col-6"><div class="card"><h2>📊 Neraca {{ year }}</h2><a href="{{ url_for('financial_statements_pdf', year=year, report_type='neraca') }}" class="btn btn-sm" style="margin-bottom:12px;">🖨️ Cetak PDF</a><h3>Aset</h3><table><tbody>{% for i in asset_items %}<tr><td>{{ i.code }} — {{ i.name }}</td><td class="text-right">{{ rupiah(i.amount) }}</td></tr>{% endfor %}</tbody><tfoot><tr><td><strong>Total Aset</strong></td><td class="text-right"><strong>{{ rupiah(total_asset) }}</strong></td></tr></tfoot></table><hr><h3>Kewajiban</h3><table><tbody>{% for i in liab_items %}<tr><td>{{ i.code }} — {{ i.name }}</td><td class="text-right">{{ rupiah(i.amount) }}</td></tr>{% endfor %}</tbody><tfoot><tr><td><strong>Total Kewajiban</strong></td><td class="text-right"><strong>{{ rupiah(total_liab) }}</strong></td></tr></tfoot></table><hr><h3>Modal</h3><table><tbody>{% for i in modal_items %}<tr><td>{{ i.code }} — {{ i.name }}</td><td class="text-right">{{ rupiah(i.amount) }}</td></tr>{% endfor %}</tbody><tfoot><tr><td><strong>Total Modal</strong></td><td class="text-right"><strong>{{ rupiah(total_modal) }}</strong></td></tr></tfoot></table></div></div></div>''', year=year, revenue_items=revenue_items, expense_items=expense_items, asset_items=asset_items, liab_items=liab_items, modal_items=modal_items, total_revenue=total_revenue, total_expense=total_expense, total_asset=total_asset, total_liab=total_liab, total_modal=total_modal, laba_bersih=laba_bersih, rupiah=rupiah)
-    return render_page('Laporan Keuangan', body)
+        raw=float(r['debit'] or 0)-float(r['credit'] or 0) if r['normal_balance']=='Debit' else float(r['credit'] or 0)-float(r['debit'] or 0)
+        item={'code':r['account_code'],'name':r['account_name'],'amount':raw}
+        if r['category'] in buckets: buckets[r['category']].append(item); totals[r['category']]+=raw
+    profit=totals['Pendapatan']-totals['Beban']
+    operational=_financial_operational_cashflow(start,end); audit=_financial_integrity_audit(start,end,operational)
+    cash_in=audit['op_in']; cash_out=audit['op_out']; net_cash=cash_in-cash_out
+    cash_journal_gap=abs(float(audit.get('gap_in',0) or 0))+abs(float(audit.get('gap_out',0) or 0))
+    months=[]; names=['Jan','Feb','Mar','Apr','Mei','Jun','Jul','Agu','Sep','Okt','Nov','Des']
+    # Monthly source totals use the same explicit rules to prevent total/detail mismatch.
+    for i,n in enumerate(names,1):
+        ms=f'{year}-{i:02d}-01'; me=(date(year+1,1,1)-timedelta(days=1) if i==12 else date(year,i+1,1)-timedelta(days=1)).isoformat()
+        mr=_financial_operational_cashflow(ms,me); months.append({'name':n,'in':sum(x['amount'] for x in mr if x['direction']=='IN'),'out':sum(x['amount'] for x in mr if x['direction']=='OUT')})
+    maxv=max([x['in'] for x in months]+[x['out'] for x in months]+[1])
+    for x in months: x['in_pct']=max(2,round(x['in']/maxv*100)); x['out_pct']=max(2,round(x['out']/maxv*100))
+    inflows=[x for x in operational if x['direction']=='IN']; outflows=[x for x in operational if x['direction']=='OUT']
+    years=range(max(2020,datetime.now().year-5),datetime.now().year+2)
+    body=render_template_string(r'''
+    <div class="fin-shell">
+      <header class="fin-hero"><div><span class="fin-eyebrow">FINANCIAL CONTROL & RECONCILIATION</span><h2>Dashboard Keuangan Terverifikasi</h2><p>Cashflow operasional dipisahkan dari laporan berbasis jurnal agar transaksi yang belum terposting tidak menghasilkan angka menyesatkan.</p></div><form method="get" class="fin-period"><div><label>Periode</label><select name="year">{% for y in years %}<option value="{{y}}" {{'selected' if y==year else ''}}>{{y}}</option>{% endfor %}</select></div><button>Tampilkan</button></form></header>
+      {% if audit.warnings %}<section class="fin-panel" style="border-left:4px solid #e35d34"><div class="fin-panel-head"><div><span class="fin-eyebrow">PERLU REKONSILIASI</span><h3>Temuan Integritas Data</h3><p>Angka tidak dipaksakan sama. Selisih ditampilkan untuk ditindaklanjuti.</p></div><span class="fin-panel-badge">{{audit.warnings|length}} temuan</span></div><div class="fin-list">{% for w in audit.warnings %}<div class="fin-list-row out"><div><b>{{w}}</b></div></div>{% endfor %}</div></section>{% endif %}
+      <section class="fin-kpis"><div class="fin-kpi in"><span>Kas Masuk Operasional</span><b>{{rupiah(cash_in)}}</b><small>Berdasarkan sumber transaksi</small></div><div class="fin-kpi out"><span>Kas Keluar Operasional</span><b>{{rupiah(cash_out)}}</b><small>Berdasarkan sumber transaksi</small></div><div class="fin-kpi net"><span>Arus Kas Bersih</span><b>{{rupiah(net_cash)}}</b><small>{{'Surplus' if net_cash>=0 else 'Defisit'}}</small></div><div class="fin-kpi profit"><span>Laba Bersih Jurnal</span><b>{{rupiah(profit)}}</b><small>Hanya jurnal yang sudah terposting</small></div><div class="fin-kpi cash"><span>Selisih Kas vs Jurnal</span><b>{{rupiah(cash_journal_gap)}}</b><small>Masuk {{rupiah(audit.gap_in)}} · Keluar {{rupiah(audit.gap_out)}}</small></div></section>
+      <section class="fin-flow"><div class="fin-panel"><div class="fin-panel-head"><div><span class="fin-eyebrow">CASH FLOW MAP</span><h3>Alur Kas Operasional</h3><p>Wallet tidak dihitung ganda: kas masuk dicatat saat topup disetujui, bukan saat wallet dibelanjakan.</p></div></div><div class="cash-flow-visual"><div class="cash-flow-route"><div class="cash-node in"><span>Total Sumber Dana</span><b>{{rupiah(cash_in)}}</b><small>{{inflows|length}} kelompok kas masuk</small></div><div class="cash-arrow"><b>→</b><small>masuk</small></div><div class="cash-node center"><span>Perubahan Kas</span><b>{{rupiah(net_cash)}}</b><small>Kas masuk dikurangi kas keluar</small></div><div class="cash-arrow"><b>→</b><small>keluar</small></div><div class="cash-node out"><span>Total Penggunaan Dana</span><b>{{rupiah(cash_out)}}</b><small>{{outflows|length}} kelompok kas keluar</small></div></div></div></div><aside class="fin-panel"><div class="fin-panel-head"><div><span class="fin-eyebrow">REKONSILIASI</span><h3>Jurnal vs Operasional</h3></div></div><div class="fin-health"><div class="health-row"><div><span>Total debit jurnal</span><b>{{rupiah(audit.debit)}}</b></div></div><div class="health-row"><div><span>Total kredit jurnal</span><b>{{rupiah(audit.credit)}}</b></div></div><div class="health-row"><div><span>Kas masuk akun 1001</span><b>{{rupiah(audit.cash_debit)}}</b></div></div><div class="health-row"><div><span>Kas keluar akun 1001</span><b>{{rupiah(audit.cash_credit)}}</b></div></div><div class="fin-note">Status: <b>{{'Konsisten' if audit.ok else 'Belum sepenuhnya terhubung'}}</b>. Dashboard tidak menganggap jurnal lengkap jika sumber transaksi belum terposting.</div></div></aside></section>
+      <section class="fin-panel"><div class="fin-panel-head"><div><span class="fin-eyebrow">MONTHLY CONTROL</span><h3>Kas Masuk dan Keluar Bulanan</h3><p>Total batang menggunakan aturan sumber transaksi yang sama dengan KPI.</p></div></div><div class="fin-months">{% for m in months %}<div class="month-col" title="{{m.name}} masuk {{rupiah(m['in'])}}, keluar {{rupiah(m['out'])}}"><div class="month-bars"><i class="month-bar in" style="height:{{m.in_pct}}%"></i><i class="month-bar out" style="height:{{m.out_pct}}%"></i></div><span>{{m.name}}</span></div>{% endfor %}</div><div class="fin-legend"><span class="li-in"><i></i>Kas masuk</span><span class="li-out"><i></i>Kas keluar</span></div></section>
+      <section class="fin-sources"><div class="fin-panel"><div class="fin-panel-head"><div><span class="fin-eyebrow">SUMBER DANA</span><h3>Kas Masuk</h3></div></div><div class="fin-list">{% for x in inflows %}<div class="fin-list-row in"><div><b>{{x.source}}</b><small>{{x.note}}</small></div><strong>{{rupiah(x.amount)}}</strong></div>{% else %}<div class="fin-list-row"><small>Tidak ada kas masuk.</small></div>{% endfor %}<div class="statement-total positive"><b>Total Kas Masuk</b><strong>{{rupiah(cash_in)}}</strong></div></div></div><div class="fin-panel"><div class="fin-panel-head"><div><span class="fin-eyebrow">PENGGUNAAN DANA</span><h3>Kas Keluar</h3></div></div><div class="fin-list">{% for x in outflows %}<div class="fin-list-row out"><div><b>{{x.source}}</b><small>{{x.note}}</small></div><strong>{{rupiah(x.amount)}}</strong></div>{% else %}<div class="fin-list-row"><small>Tidak ada kas keluar.</small></div>{% endfor %}<div class="statement-total negative"><b>Total Kas Keluar</b><strong>{{rupiah(cash_out)}}</strong></div></div></div></section>
+      <section class="fin-statements"><div class="fin-panel"><div class="fin-panel-head"><div><span class="fin-eyebrow">JURNAL</span><h3>Laba Rugi {{year}}</h3></div><div class="fin-actions"><a class="btn btn-sm btn-ghost" href="{{url_for('financial_statements_pdf',year=year,report_type='lr')}}">PDF</a></div></div><div class="statement-body">{% for cat in ['Pendapatan','Beban'] %}<div class="statement-section"><div class="statement-title"><span>{{cat}}</span><b>{{rupiah(totals[cat])}}</b></div>{% for i in buckets[cat] %}<div class="statement-row"><code>{{i.code}}</code><span>{{i.name}}</span><strong>{{rupiah(i.amount)}}</strong></div>{% endfor %}</div>{% endfor %}<div class="statement-total {{'positive' if profit>=0 else 'negative'}}"><b>Laba Bersih</b><strong>{{rupiah(profit)}}</strong></div></div></div><div class="fin-panel"><div class="fin-panel-head"><div><span class="fin-eyebrow">JURNAL</span><h3>Neraca {{year}}</h3></div><div class="fin-actions"><a class="btn btn-sm btn-ghost" href="{{url_for('financial_statements_pdf',year=year,report_type='neraca')}}">PDF</a></div></div><div class="statement-body">{% for cat in ['Aset','Kewajiban','Modal'] %}<div class="statement-section"><div class="statement-title"><span>{{cat}}</span><b>{{rupiah(totals[cat])}}</b></div>{% for i in buckets[cat] %}<div class="statement-row"><code>{{i.code}}</code><span>{{i.name}}</span><strong>{{rupiah(i.amount)}}</strong></div>{% endfor %}</div>{% endfor %}<div class="statement-total"><b>Selisih Neraca</b><strong>{{rupiah(totals['Aset']-totals['Kewajiban']-totals['Modal'])}}</strong></div></div></div></section>
+    </div>''',year=year,years=years,audit=audit,cash_in=cash_in,cash_out=cash_out,net_cash=net_cash,cash_journal_gap=cash_journal_gap,months=months,inflows=inflows,outflows=outflows,buckets=buckets,totals=totals,profit=profit,rupiah=rupiah)
+    return render_page('Laporan Keuangan',body)
 
 @app.route('/financial-statements/pdf/<int:year>/<report_type>')
 @login_required
@@ -9309,19 +10106,134 @@ def notifications_read_all():
     flash('Semua notifikasi ditandai dibaca.', 'success')
     return redirect(url_for('notifications'))
 
+CSS_DESIGN += r'''
+.manager-mobile-shell{display:grid;gap:14px}.manager-hero{isolation:isolate;position:relative;overflow:hidden;min-height:230px;padding:27px;border-radius:18px;background:radial-gradient(circle at 82% 15%,rgba(37,99,235,.35),transparent 27%),linear-gradient(135deg,#07111f,#102840 62%,#173b55);color:#fff;box-shadow:0 22px 55px rgba(7,17,31,.23)}.manager-hero:before{content:'';position:absolute;inset:0;z-index:-2;background-image:linear-gradient(rgba(94,234,212,.075) 1px,transparent 1px),linear-gradient(90deg,rgba(96,165,250,.06) 1px,transparent 1px);background-size:25px 25px}.manager-hairlines{position:absolute;inset:-55px -30px -70px 40%;z-index:-1;background:repeating-radial-gradient(ellipse at 100% 9%,transparent 0 12px,rgba(94,234,212,.24) 13px 14px,transparent 15px 29px);transform:rotate(-9deg);filter:drop-shadow(0 0 7px rgba(45,212,191,.20))}.manager-hero-content{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;height:100%}.manager-hero span,.manager-panel-head span{color:#67e8f9;font-size:8px;font-weight:950;letter-spacing:.18em}.manager-hero h2{margin:7px 0;color:#fff;font-size:28px}.manager-hero p{max-width:650px;color:#b8ccdd;font-size:10px}.manager-live{padding:9px 12px;border:1px solid rgba(255,255,255,.16);border-radius:999px;background:rgba(255,255,255,.09);font-size:9px;font-weight:900}.manager-kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.manager-kpis article{position:relative;overflow:hidden;padding:16px;border:1px solid #d9e2ec;border-radius:13px;background:#fff}.manager-kpis article:before{content:'';position:absolute;left:0;top:0;width:4px;height:100%;background:linear-gradient(#2563eb,#2dd4bf)}.manager-kpis span,.manager-kpis b,.manager-kpis small{display:block}.manager-kpis span{color:#64748b;font-size:8px;font-weight:900;text-transform:uppercase}.manager-kpis b{margin:8px 0 3px;font-size:19px}.manager-kpis small{color:#94a3b8;font-size:8px}.manager-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:14px}.manager-panel{position:relative;overflow:hidden;border:1px solid #d9e2ec;border-radius:15px;background:#fff;box-shadow:0 8px 24px rgba(15,35,52,.05)}.manager-panel.wide{grid-column:1/-1}.manager-panel:after{content:'';position:absolute;right:-45px;top:-50px;width:150px;height:150px;border:1px solid rgba(37,99,235,.08);border-radius:50%;box-shadow:0 0 0 16px rgba(45,212,191,.025)}.manager-panel-head{position:relative;z-index:2;display:flex;justify-content:space-between;align-items:center;padding:17px 19px;border-bottom:1px solid #e5ecf2}.manager-panel-head h3{margin:4px 0 0;font-size:15px}.manager-branch-list{position:relative;z-index:2;display:grid;gap:9px;padding:15px}.manager-branch-card{display:grid;grid-template-columns:minmax(0,1fr) repeat(3,auto) 24px;gap:12px;align-items:center;padding:12px;border:1px solid #e3eaf1;border-radius:11px;color:#183047;text-decoration:none;background:#fbfdff}.manager-branch-card b,.manager-branch-card small{display:block}.manager-branch-card small{margin-top:3px;color:#8494a5;font-size:8px}.manager-branch-card strong{text-align:right;font-size:10px}.manager-branch-card strong span{display:block;color:#8a98a7;font-size:7px;font-weight:700}.manager-flow{display:flex;align-items:center;gap:8px;padding:22px;overflow-x:auto}.manager-flow div{min-width:145px;padding:13px;border:1px solid #dce6ee;border-radius:11px;background:linear-gradient(145deg,#fff,#f4f9fc)}.manager-flow i{color:#2dd4bf;font-style:normal;font-weight:900}.manager-flow b,.manager-flow small{display:block}.manager-flow b{margin:7px 0 3px}.manager-flow small{color:#8494a5;font-size:8px}.manager-flow>span{color:#38bdf8;font-size:19px}.manager-bars{display:grid;gap:11px;padding:18px}.manager-bars p{display:flex;justify-content:space-between;margin:0 0 5px;font-size:9px}.manager-bars i{display:block;height:8px;overflow:hidden;border-radius:99px;background:#eaf0f5}.manager-bars em{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,#2563eb,#38bdf8,#5eead4)}
+@media(max-width:900px){.manager-grid{grid-template-columns:1fr}.manager-panel.wide{grid-column:1}.manager-kpis{grid-template-columns:1fr 1fr}.manager-hero-content{align-items:flex-start;flex-direction:column}.manager-branch-card{grid-template-columns:minmax(0,1fr) auto}.manager-branch-card strong:nth-of-type(n+2){display:none}}
+@media(max-width:600px){.manager-mobile-shell{padding:0 12px}.manager-hero{min-height:0;padding:20px;border-radius:21px}.manager-hero h2{font-size:23px}.manager-hairlines{inset:0 -150px 0 18%}.manager-kpis{grid-template-columns:1fr 1fr}.manager-kpis article{padding:13px}.manager-kpis b{font-size:15px}.manager-panel{border-radius:19px}.manager-flow{scroll-snap-type:x mandatory}.manager-flow div{scroll-snap-align:start}.manager-branch-card{padding:11px}}
+'''
+
+CSS_DESIGN += r"""
+/* FINAL MANAGER VISUAL OVERRIDE: endpoint-specific, collision resistant */
+body.page-manager_dashboard{background:#edf3f8!important}
+body.page-manager_dashboard .main-content{background:linear-gradient(180deg,#edf3f8,#f8fafc)!important}
+body.page-manager_dashboard .manager-mobile-shell{display:grid!important;gap:16px!important;width:100%!important;max-width:none!important}
+body.page-manager_dashboard .manager-hero{isolation:isolate!important;position:relative!important;display:block!important;min-height:260px!important;padding:30px!important;overflow:hidden!important;border:1px solid rgba(103,232,249,.18)!important;border-radius:20px!important;background:radial-gradient(circle at 77% 30%,rgba(37,99,235,.38),transparent 26%),radial-gradient(circle at 45% 120%,rgba(20,184,166,.24),transparent 35%),linear-gradient(135deg,#050d18 0%,#0b2035 54%,#123d57 100%)!important;box-shadow:0 24px 60px rgba(5,13,24,.28)!important;color:#fff!important;animation:managerHeroIn .7s cubic-bezier(.2,.8,.2,1) both!important}
+body.page-manager_dashboard .manager-hero:before{content:''!important;position:absolute!important;inset:0!important;z-index:-3!important;background-image:linear-gradient(rgba(103,232,249,.075) 1px,transparent 1px),linear-gradient(90deg,rgba(96,165,250,.07) 1px,transparent 1px)!important;background-size:25px 25px!important;animation:managerGridMove 18s linear infinite!important}
+body.page-manager_dashboard .manager-hero:after{content:''!important;position:absolute!important;right:-105px!important;top:-155px!important;z-index:-2!important;width:490px!important;height:490px!important;border:1px solid rgba(103,232,249,.27)!important;border-radius:50%!important;box-shadow:0 0 0 20px rgba(45,212,191,.07),0 0 0 43px rgba(59,130,246,.05),0 0 0 69px rgba(103,232,249,.025),0 0 100px rgba(37,99,235,.3)!important;animation:managerRingBreath 5s ease-in-out infinite!important}
+body.page-manager_dashboard .manager-hairlines{display:block!important;position:absolute!important;inset:-65px -15px -80px 39%!important;z-index:-1!important;opacity:1!important;background:repeating-radial-gradient(ellipse at 100% 12%,transparent 0 11px,rgba(103,232,249,.27) 12px 13px,transparent 14px 27px)!important;filter:drop-shadow(0 0 8px rgba(45,212,191,.24))!important;animation:managerHairDrift 12s ease-in-out infinite alternate!important}
+body.page-manager_dashboard .manager-hero-content{position:relative!important;z-index:5!important;display:flex!important;justify-content:space-between!important;align-items:flex-end!important;gap:24px!important;min-height:200px!important}
+body.page-manager_dashboard .manager-hero h2{margin:8px 0!important;color:#fff!important;font-size:32px!important;line-height:1.04!important;letter-spacing:-.055em!important}
+body.page-manager_dashboard .manager-hero p{max-width:680px!important;color:#b9cede!important;font-size:11px!important;line-height:1.7!important}
+body.page-manager_dashboard .manager-live{display:flex!important;align-items:center!important;gap:7px!important;padding:10px 14px!important;border:1px solid rgba(255,255,255,.18)!important;border-radius:999px!important;background:rgba(255,255,255,.09)!important;backdrop-filter:blur(12px)!important;color:#dff!important;font-size:8px!important;font-weight:950!important;letter-spacing:.1em!important}
+body.page-manager_dashboard .manager-live i{width:8px!important;height:8px!important;border-radius:50%!important;background:#5eead4!important;box-shadow:0 0 0 0 rgba(94,234,212,.5)!important;animation:managerPulse 1.8s infinite!important}
+body.page-manager_dashboard .manager-orbit{position:absolute!important;z-index:-1!important;border:1px solid rgba(96,165,250,.16)!important;border-radius:50%!important;animation:managerSpin 18s linear infinite!important}.manager-orbit.o1{right:8%;top:15%;width:150px;height:150px}.manager-orbit.o2{right:15%;top:31%;width:82px;height:82px;animation-direction:reverse!important;animation-duration:11s!important}.manager-orbit:after{content:'';position:absolute;left:50%;top:-4px;width:8px;height:8px;border-radius:50%;background:#67e8f9;box-shadow:0 0 15px #67e8f9}
+body.page-manager_dashboard .manager-data-particles i{position:absolute!important;z-index:1!important;width:4px!important;height:4px!important;border-radius:50%!important;background:#67e8f9!important;box-shadow:0 0 10px #67e8f9!important;animation:managerFloat 6s ease-in-out infinite!important}.manager-data-particles i:nth-child(1){left:48%;top:30%}.manager-data-particles i:nth-child(2){left:61%;top:68%;animation-delay:-1s!important}.manager-data-particles i:nth-child(3){left:74%;top:37%;animation-delay:-2.2s!important}.manager-data-particles i:nth-child(4){left:88%;top:72%;animation-delay:-3.3s!important}.manager-data-particles i:nth-child(5){left:55%;top:80%;animation-delay:-4.5s!important}
+body.page-manager_dashboard .manager-kpis{display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;gap:11px!important}.manager-kpis article{animation:managerCardIn .55s both!important}.manager-kpis article:nth-child(2){animation-delay:.08s!important}.manager-kpis article:nth-child(3){animation-delay:.16s!important}.manager-kpis article:nth-child(4){animation-delay:.24s!important}
+body.page-manager_dashboard .manager-panel{border-color:#d8e4ed!important;border-radius:17px!important;box-shadow:0 9px 28px rgba(15,35,52,.06)!important;animation:managerCardIn .62s .18s both!important}
+body.page-manager_dashboard .manager-network-map{position:relative!important;z-index:3!important;width:100%!important;height:390px!important;overflow:hidden!important;background:radial-gradient(circle at center,rgba(37,99,235,.19),transparent 32%),linear-gradient(145deg,#071421,#0d2b40)!important;border-bottom:1px solid #dbe5ed!important}
+body.page-manager_dashboard .manager-map-grid{position:absolute;inset:0;background-image:linear-gradient(rgba(103,232,249,.07) 1px,transparent 1px),linear-gradient(90deg,rgba(96,165,250,.065) 1px,transparent 1px);background-size:27px 27px;animation:managerGridMove 20s linear infinite}
+body.page-manager_dashboard .manager-map-rings{position:absolute;left:50%;top:50%;width:285px;height:285px;border:1px solid rgba(103,232,249,.12);border-radius:50%;transform:translate(-50%,-50%);box-shadow:0 0 0 38px rgba(45,212,191,.035),0 0 0 78px rgba(59,130,246,.025);animation:managerRingBreath 4.5s ease-in-out infinite}
+body.page-manager_dashboard .manager-map-core{position:absolute;left:50%;top:50%;z-index:5;display:grid;place-items:center;width:84px;height:84px;border:1px solid rgba(103,232,249,.5);border-radius:50%;background:rgba(6,22,35,.88);color:#dff;text-align:center;transform:translate(-50%,-50%);box-shadow:0 0 35px rgba(45,212,191,.26)}.manager-map-core i{position:absolute;width:62px;height:62px;border:1px dashed rgba(103,232,249,.36);border-radius:50%;animation:managerSpin 9s linear infinite}.manager-map-core b{font-size:8px;letter-spacing:.12em;line-height:1.25}
+body.page-manager_dashboard .manager-map-node{position:absolute!important;left:var(--x)!important;top:var(--y)!important;z-index:7!important;display:flex!important;align-items:center!important;gap:8px!important;color:#e8f8ff!important;text-decoration:none!important;transform:translate(-50%,-50%)!important;animation:managerNodeIn .65s var(--delay) both!important}.manager-map-node>i{display:block;width:13px;height:13px;border:2px solid #bff;border-radius:50%;background:#2dd4bf;box-shadow:0 0 0 5px rgba(45,212,191,.12),0 0 17px #2dd4bf;animation:managerNodePulse 2.2s infinite}.manager-map-node.critical>i{background:#fb7185;box-shadow:0 0 0 5px rgba(251,113,133,.13),0 0 17px #fb7185}.manager-map-node span{padding:7px 9px;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:rgba(5,18,30,.74);backdrop-filter:blur(8px);white-space:nowrap}.manager-map-node b,.manager-map-node small{display:block}.manager-map-node b{font-size:9px}.manager-map-node small{margin-top:2px;color:#9fb8c9;font-size:7px}
+body.page-manager_dashboard .manager-map-scan{position:absolute;left:0;right:0;top:-4px;height:2px;background:linear-gradient(90deg,transparent,#67e8f9,transparent);box-shadow:0 0 13px #67e8f9;animation:managerScan 4s linear infinite}
+body.page-manager_dashboard .manager-branch-card{transition:transform .2s,border-color .2s,box-shadow .2s!important}.manager-branch-card:hover{transform:translateY(-2px)!important;border-color:#7dd3fc!important;box-shadow:0 10px 22px rgba(37,99,235,.09)!important}.manager-bars em{position:relative;overflow:hidden;animation:managerBarGrow .9s ease-out both!important}.manager-bars em:after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.7),transparent);animation:managerShimmer 2.7s infinite}
+body.page-manager_dashboard .manager-flow div{transition:transform .2s,box-shadow .2s!important}.manager-flow div:hover{transform:translateY(-4px)!important;box-shadow:0 12px 25px rgba(37,99,235,.1)!important}.manager-flow>span{animation:managerArrow 1.4s ease-in-out infinite!important}
+@keyframes managerHeroIn{from{opacity:0;transform:translateY(12px) scale(.985)}to{opacity:1;transform:none}}@keyframes managerGridMove{to{background-position:25px 25px}}@keyframes managerHairDrift{from{transform:rotate(-9deg) translateX(-9px)}to{transform:rotate(-5deg) translateX(12px)}}@keyframes managerRingBreath{50%{opacity:.56;transform:translate(-50%,-50%) scale(1.055)}}@keyframes managerSpin{to{transform:rotate(360deg)}}@keyframes managerPulse{70%{box-shadow:0 0 0 9px rgba(94,234,212,0)}}@keyframes managerFloat{50%{transform:translateY(-17px) scale(1.6);opacity:.35}}@keyframes managerCardIn{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}@keyframes managerNodeIn{from{opacity:0;transform:translate(-50%,-50%) scale(.55)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}@keyframes managerNodePulse{50%{transform:scale(1.2)}}@keyframes managerScan{to{top:100%}}@keyframes managerBarGrow{from{width:0}}@keyframes managerShimmer{to{transform:translateX(120%)}}@keyframes managerArrow{50%{transform:translateX(4px);color:#2dd4bf}}
+@media(max-width:800px){body.page-manager_dashboard .manager-network-map{height:430px!important}.manager-map-node span{display:none}.manager-map-node>i{width:16px;height:16px}.manager-map-core{width:72px!important;height:72px!important}}
+@media(max-width:600px){body.page-manager_dashboard .main-content{padding-left:0!important;padding-right:0!important}body.page-manager_dashboard .manager-mobile-shell{padding:0 12px!important}.manager-hero{min-height:235px!important;padding:20px!important}.manager-hero-content{min-height:195px!important;align-items:flex-start!important;flex-direction:column!important}.manager-hero h2{font-size:25px!important}.manager-live{align-self:flex-start!important}.manager-hairlines{inset:0 -190px 0 18%!important}.manager-orbit{opacity:.55}.manager-kpis{grid-template-columns:1fr 1fr!important}.manager-network-map{height:370px!important}.manager-branch-list{padding:10px!important}.manager-flow{padding:15px!important}}
+@media(prefers-reduced-motion:reduce){body.page-manager_dashboard *{animation-duration:.01ms!important;animation-iteration-count:1!important}}
+"""
+
+@app.route('/manager/dashboard')
+@login_required
+@role_required('manager')
+def manager_dashboard():
+    branches=q_all('SELECT * FROM koperasi_branches WHERE is_active=1 ORDER BY name')
+    data=[]; total_stock=total_value=total_sales=0.0; low_total=0
+    month=datetime.now().strftime('%Y-%m')
+    for b in branches:
+        st=q_one('''SELECT COUNT(*) items,COALESCE(SUM(pbs.stock),0) stock,COALESCE(SUM(pbs.stock*p.buy_price),0) value,
+                    COALESCE(SUM(CASE WHEN pbs.stock<=COALESCE(pbs.min_stock,p.min_stock,0) THEN 1 ELSE 0 END),0) low
+                    FROM product_branch_stock pbs JOIN products p ON p.id=pbs.product_id WHERE pbs.branch_id=? AND p.active=1''',[b['id']])
+        sale=q_one('SELECT COUNT(*) trx,COALESCE(SUM(total),0) total FROM sales WHERE branch_id=? AND status="Posted" AND substr(trx_date,1,7)=?',[b['id'],month])
+        idx=len(data); positions=[(14,22),(38,15),(66,24),(84,43),(64,65),(35,72),(14,56),(49,43)]
+        px,py=positions[idx%len(positions)]
+        row={**dict(b),**dict(st),'sales':float(sale['total'] or 0),'trx':sale['trx'] or 0,'map_x':px,'map_y':py}; data.append(row)
+        total_stock+=float(row['stock'] or 0); total_value+=float(row['value'] or 0); total_sales+=row['sales']; low_total+=int(row['low'] or 0)
+    max_sales=max([x['sales'] for x in data]+[1]); recent=q_all('''SELECT s.invoice_no,s.trx_date,s.total,COALESCE(b.name,'PUSAT') branch_name,u.full_name cashier FROM sales s LEFT JOIN koperasi_branches b ON b.id=s.branch_id LEFT JOIN users u ON u.id=s.cashier_id WHERE s.status='Posted' ORDER BY s.id DESC LIMIT 12''')
+    body=render_template_string(r'''
+    <div class="manager-mobile-shell"><header class="manager-hero"><div class="manager-hairlines"></div><div class="manager-orbit o1"></div><div class="manager-orbit o2"></div><div class="manager-data-particles"><i></i><i></i><i></i><i></i><i></i></div><div class="manager-hero-content"><div><span>EXECUTIVE OBSERVABILITY</span><h2>Manager Control Tower</h2><p>Pantau stok, nilai persediaan, penjualan, risiko stok kritis, dan flow data seluruh cabang dalam satu layar mobile-first.</p></div><div class="manager-live"><i></i> LIVE MONITOR</div></div></header>
+    <section class="manager-kpis"><article><span>Cabang Aktif</span><b>{{data|length}}</b><small>Seluruh jaringan</small></article><article><span>Total Stok</span><b>{{'%.0f'|format(total_stock)}}</b><small>Unit lintas cabang</small></article><article><span>Nilai Persediaan</span><b>{{rupiah(total_value)}}</b><small>Harga beli</small></article><article><span>Penjualan Bulan Ini</span><b>{{rupiah(total_sales)}}</b><small>{{low_total}} stok kritis</small></article></section>
+    <section class="manager-grid"><article class="manager-panel wide"><div class="manager-panel-head"><div><span>BRANCH MAP INTELLIGENCE</span><h3>Peta dan Kondisi Semua Cabang</h3></div><a href="{{url_for('maps')}}">Buka Peta Penuh</a></div><div class="manager-network-map"><div class="manager-map-grid"></div><div class="manager-map-rings"></div><div class="manager-map-core"><i></i><b>CONTROL<br>TOWER</b></div>{% for b in data %}<a class="manager-map-node {{'critical' if b.low else ''}}" style="--x:{{b.map_x}}%;--y:{{b.map_y}}%;--delay:{{ loop.index0 * 0.18 }}s" href="{{url_for('maps_branch',branch_id=b.id)}}"><i></i><span><b>{{b.branch_code}}</b><small>{{'%.0f'|format(b.stock)}} unit · {{b.low}} kritis</small></span></a>{% endfor %}<div class="manager-map-scan"></div></div><div class="manager-branch-list">{% for b in data %}<a class="manager-branch-card" href="{{url_for('maps_branch',branch_id=b.id)}}"><div><b>{{b.name}}</b><small>{{b.branch_code}} · {{b.address or 'Alamat belum diisi'}}</small></div><strong><span>STOK</span>{{'%.0f'|format(b.stock)}}</strong><strong><span>NILAI</span>{{rupiah(b.value)}}</strong><strong><span>SALES</span>{{rupiah(b.sales)}}</strong><i>›</i></a>{% endfor %}</div></article>
+    <article class="manager-panel" id="finance"><div class="manager-panel-head"><div><span>BRANCH FINANCE</span><h3>Penjualan per Cabang</h3></div><a href="{{url_for('manager_finance')}}">Detail Keuangan</a></div><div class="manager-bars">{% for b in data %}<div><p><b>{{b.name}}</b><span>{{rupiah(b.sales)}}</span></p><i><em style="width:{{b.sales/max_sales*100}}%"></em></i></div>{% endfor %}</div></article>
+    <article class="manager-panel"><div class="manager-panel-head"><div><span>LIVE TRANSACTION FLOW</span><h3>Aktivitas Terbaru</h3></div></div><div class="activity-list">{% for r in recent %}<div class="activity-item"><i>↙</i><div><b>{{r.invoice_no}}</b><small>{{r.branch_name}} · {{r.cashier or '-'}}</small></div><strong>{{rupiah(r.total)}}</strong><span>›</span></div>{% endfor %}</div></article>
+    <article class="manager-panel wide" id="flow"><div class="manager-panel-head"><div><span>DATA FLOW</span><h3>Aliran Data Operasional</h3></div><a href="{{url_for('manager_flow')}}">Buka Flow Monitor</a></div><div class="manager-flow"><div><i>01</i><b>Kasir Cabang</b><small>Input transaksi dan pembayaran</small></div><span>→</span><div><i>02</i><b>Persediaan</b><small>Stok cabang berkurang real-time</small></div><span>→</span><div><i>03</i><b>Ledger</b><small>Audit pergerakan tercatat</small></div><span>→</span><div><i>04</i><b>Keuangan</b><small>Revenue per cabang terbentuk</small></div><span>→</span><div><i>05</i><b>Manager Insight</b><small>Monitoring dan keputusan</small></div></div></article></section></div>
+    ''',data=data,total_stock=total_stock,total_value=total_value,total_sales=total_sales,low_total=low_total,max_sales=max_sales,recent=recent,rupiah=rupiah)
+    return render_page('Manager Control Tower',body)
+
 # =========================
 # Fitur Maps + Multi-Cabang
 # =========================
+CSS_DESIGN += r'''
+.manager-module{display:grid;gap:14px}.manager-module-hero{position:relative;overflow:hidden;padding:25px;border-radius:18px;background:radial-gradient(circle at 84% 20%,rgba(37,99,235,.35),transparent 27%),linear-gradient(135deg,#06111d,#123550);color:#fff;box-shadow:0 18px 45px rgba(6,17,29,.22)}.manager-module-hero:before{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(103,232,249,.075) 1px,transparent 1px),linear-gradient(90deg,rgba(96,165,250,.06) 1px,transparent 1px);background-size:25px 25px;animation:managerGridMove 18s linear infinite}.manager-module-hero:after{content:'';position:absolute;right:-65px;top:-100px;width:300px;height:300px;border:1px solid rgba(103,232,249,.24);border-radius:50%;box-shadow:0 0 0 18px rgba(45,212,191,.05),0 0 0 42px rgba(59,130,246,.03);animation:managerModuleOrbit 7s ease-in-out infinite}.manager-module-hero>div{position:relative;z-index:2}.manager-module-hero span{color:#67e8f9;font-size:8px;font-weight:950;letter-spacing:.18em}.manager-module-hero h2{margin:7px 0;color:#fff;font-size:26px}.manager-module-hero p{margin:0;color:#b9cede;font-size:10px}.manager-module-kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.manager-module-kpis article{padding:15px;border:1px solid #d9e4ed;border-radius:13px;background:#fff;animation:managerCardIn .55s both}.manager-module-kpis span,.manager-module-kpis b,.manager-module-kpis small{display:block}.manager-module-kpis span{color:#64748b;font-size:8px;font-weight:900}.manager-module-kpis b{margin:8px 0 3px;font-size:18px}.manager-module-kpis small{color:#94a3b8;font-size:8px}.manager-module-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.manager-module-card{overflow:hidden;border:1px solid #d9e4ed;border-radius:15px;background:#fff;box-shadow:0 8px 24px rgba(15,35,52,.05)}.manager-module-card.wide{grid-column:1/-1}.manager-module-head{display:flex;justify-content:space-between;align-items:center;padding:17px 19px;border-bottom:1px solid #e5edf3}.manager-module-head span{color:#0f9f97;font-size:8px;font-weight:950;letter-spacing:.16em}.manager-module-head h3{margin:4px 0 0;font-size:15px}.manager-finance-row{display:grid;grid-template-columns:minmax(0,1fr) repeat(4,110px);gap:10px;align-items:center;padding:13px 18px;border-bottom:1px solid #edf2f6}.manager-finance-row:last-child{border-bottom:0}.manager-finance-row b,.manager-finance-row small{display:block}.manager-finance-row small{color:#8a99a8;font-size:8px}.manager-finance-row strong{text-align:right;font-size:10px}.manager-finance-row strong span{display:block;color:#94a3b8;font-size:7px}.manager-stock-cards{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;padding:14px}.manager-stock-card{padding:14px;border:1px solid #e1e9f0;border-radius:12px;background:linear-gradient(145deg,#fff,#f7fbff)}.manager-stock-card header{display:flex;justify-content:space-between;gap:10px}.manager-stock-card p{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:13px 0 0}.manager-stock-card p span{padding:8px;border-radius:8px;background:#eef4f8;color:#64748b;font-size:7px}.manager-stock-card p b{display:block;margin-top:3px;color:#173047;font-size:11px}.flow-monitor{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;padding:18px}.flow-monitor article{position:relative;padding:16px;border:1px solid #dbe6ee;border-radius:13px;background:linear-gradient(145deg,#fff,#f3f9fc);animation:managerCardIn .55s both}.flow-monitor article:not(:last-child):after{content:'→';position:absolute;right:-17px;top:50%;z-index:4;color:#2dd4bf;font-size:17px;animation:managerArrow 1.4s infinite}.flow-monitor i{display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:#e5faf5;color:#087e6a;font-style:normal;font-weight:900}.flow-monitor b,.flow-monitor small{display:block}.flow-monitor b{margin:10px 0 4px}.flow-monitor small{color:#8191a0;font-size:8px;line-height:1.5}@keyframes managerModuleOrbit{50%{transform:scale(1.05) rotate(8deg)}}
+@media(max-width:900px){.manager-module-grid{grid-template-columns:1fr}.manager-module-card.wide{grid-column:1}.manager-finance-row{grid-template-columns:minmax(0,1fr) repeat(2,90px)}.manager-finance-row strong:nth-of-type(n+3){display:none}.flow-monitor{grid-template-columns:1fr;}.flow-monitor article:not(:last-child):after{content:'↓';right:50%;top:auto;bottom:-18px}.manager-stock-cards{grid-template-columns:1fr}}
+@media(max-width:600px){.manager-module{padding:0 12px}.manager-module-hero{padding:20px;border-radius:21px}.manager-module-kpis{grid-template-columns:1fr 1fr}.manager-module-kpis article{padding:12px}.manager-module-kpis b{font-size:14px}.manager-module-card{border-radius:18px}.manager-finance-row{grid-template-columns:minmax(0,1fr) 90px;padding:12px}.manager-finance-row strong:nth-of-type(n+2){display:none}}
+'''
+
+@app.route('/manager/finance')
+@login_required
+@role_required('manager')
+def manager_finance():
+    month=(request.args.get('month') or datetime.now().strftime('%Y-%m'))[:7]
+    branches=q_all('SELECT id,branch_code,name FROM koperasi_branches WHERE is_active=1 ORDER BY name')
+    rows=[]
+    for b in branches:
+        sale=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) revenue,COALESCE(SUM(paid),0) received,COALESCE(AVG(total),0) avg_ticket FROM sales WHERE branch_id=? AND status="Posted" AND substr(trx_date,1,7)=?',[b['id'],month])
+        ret=q_one('SELECT COUNT(*) n,COALESCE(SUM(r.total),0) total FROM sales_returns r JOIN sales s ON s.id=r.sales_id WHERE s.branch_id=? AND substr(r.return_date,1,7)=?',[b['id'],month])
+        rows.append({**dict(b),'trx':sale['n'] or 0,'revenue':float(sale['revenue'] or 0),'received':float(sale['received'] or 0),'avg_ticket':float(sale['avg_ticket'] or 0),'returns':float(ret['total'] or 0),'return_count':ret['n'] or 0})
+    revenue=sum(x['revenue'] for x in rows); returns=sum(x['returns'] for x in rows); trx=sum(x['trx'] for x in rows); received=sum(x['received'] for x in rows)
+    body=render_template_string(r'''<div class="manager-module"><header class="manager-module-hero"><div><span>BRANCH FINANCIAL OBSERVABILITY</span><h2>Keuangan per Cabang</h2><p>Monitoring revenue, penerimaan, rata-rata transaksi, dan retur seluruh cabang. Halaman ini read-only.</p></div></header><section class="manager-module-kpis"><article><span>Revenue</span><b>{{rupiah(revenue)}}</b><small>{{trx}} transaksi</small></article><article><span>Dana Diterima</span><b>{{rupiah(received)}}</b><small>Periode {{month}}</small></article><article><span>Retur</span><b>{{rupiah(returns)}}</b><small>Semua cabang</small></article><article><span>Penjualan Bersih</span><b>{{rupiah(revenue-returns)}}</b><small>Revenue dikurangi retur</small></article></section><section class="manager-module-card wide"><div class="manager-module-head"><div><span>BRANCH FINANCE MATRIX</span><h3>Perbandingan Cabang</h3></div><form method="get"><input type="month" name="month" value="{{month}}" onchange="this.form.submit()"></form></div>{% for r in rows %}<div class="manager-finance-row"><div><b>{{r.name}}</b><small>{{r.branch_code}} · {{r.trx}} transaksi</small></div><strong><span>REVENUE</span>{{rupiah(r.revenue)}}</strong><strong><span>DITERIMA</span>{{rupiah(r.received)}}</strong><strong><span>AVG TICKET</span>{{rupiah(r.avg_ticket)}}</strong><strong><span>RETUR</span>{{rupiah(r.returns)}}</strong></div>{% else %}<div class="ai-empty">Belum ada cabang.</div>{% endfor %}</section></div>''',rows=rows,revenue=revenue,returns=returns,trx=trx,received=received,month=month,rupiah=rupiah)
+    return render_page('Keuangan Cabang',body)
+
+@app.route('/manager/inventory')
+@login_required
+@role_required('manager')
+def manager_inventory():
+    branches=q_all('SELECT id,branch_code,name FROM koperasi_branches WHERE is_active=1 ORDER BY name'); rows=[]
+    for b in branches:
+        st=q_one('''SELECT COUNT(*) items,COALESCE(SUM(pbs.stock),0) stock,COALESCE(SUM(pbs.stock*p.buy_price),0) value,COALESCE(SUM(CASE WHEN pbs.stock<=COALESCE(pbs.min_stock,p.min_stock,0) THEN 1 ELSE 0 END),0) low FROM product_branch_stock pbs JOIN products p ON p.id=pbs.product_id WHERE pbs.branch_id=? AND p.active=1''',[b['id']])
+        rows.append({**dict(b),**dict(st)})
+    total=sum(float(x['stock'] or 0) for x in rows); value=sum(float(x['value'] or 0) for x in rows); low=sum(int(x['low'] or 0) for x in rows)
+    body=render_template_string(r'''<div class="manager-module"><header class="manager-module-hero"><div><span>INVENTORY NETWORK OBSERVABILITY</span><h2>Stok Semua Cabang</h2><p>Ringkasan stok fisik, nilai persediaan, dan produk kritis pada seluruh jaringan.</p></div></header><section class="manager-module-kpis"><article><span>Total Cabang</span><b>{{rows|length}}</b><small>Lokasi aktif</small></article><article><span>Total Stok</span><b>{{'%.0f'|format(total)}}</b><small>Unit</small></article><article><span>Nilai Persediaan</span><b>{{rupiah(value)}}</b><small>Harga beli</small></article><article><span>Stok Kritis</span><b>{{low}}</b><small>Perlu perhatian</small></article></section><section class="manager-module-card wide"><div class="manager-module-head"><div><span>BRANCH STOCK MATRIX</span><h3>Kondisi Persediaan</h3></div><a href="{{url_for('maps')}}">Buka Peta</a></div><div class="manager-stock-cards">{% for r in rows %}<a href="{{url_for('maps_branch',branch_id=r.id)}}" class="manager-stock-card" style="text-decoration:none;color:inherit"><header><div><b>{{r.name}}</b><small>{{r.branch_code}}</small></div><span class="badge {{'badge-danger' if r.low else 'badge-success'}}">{{r.low}} kritis</span></header><p><span>ITEM<b>{{r.items}}</b></span><span>STOK<b>{{'%.0f'|format(r.stock)}}</b></span><span>NILAI<b>{{rupiah(r.value)}}</b></span></p></a>{% endfor %}</div></section></div>''',rows=rows,total=total,value=value,low=low,rupiah=rupiah)
+    return render_page('Stok Semua Cabang',body)
+
+@app.route('/manager/flow')
+@login_required
+@role_required('manager')
+def manager_flow():
+    counts={'sales':q_one('SELECT COUNT(*) n FROM sales')['n'],'stock':q_one('SELECT COUNT(*) n FROM stock_history')['n'],'queue':q_one('SELECT COUNT(*) n FROM quick_cashier_queue')['n'],'returns':q_one('SELECT COUNT(*) n FROM sales_returns')['n']}
+    body=render_template_string(r'''<div class="manager-module"><header class="manager-module-hero"><div><span>OPERATIONAL DATA PIPELINE</span><h2>Flow Data Koperasi</h2><p>Visualisasi jalur data dari transaksi kasir sampai insight Manager.</p></div></header><section class="manager-module-kpis"><article><span>Sales Records</span><b>{{counts.sales}}</b><small>Transaksi tercatat</small></article><article><span>Stock Ledger</span><b>{{counts.stock}}</b><small>Pergerakan stok</small></article><article><span>Quick Queue</span><b>{{counts.queue}}</b><small>Data antrean</small></article><article><span>Returns</span><b>{{counts.returns}}</b><small>Retur tercatat</small></article></section><section class="manager-module-card wide"><div class="manager-module-head"><div><span>LIVE DATA ARCHITECTURE</span><h3>Aliran Operasional</h3></div></div><div class="flow-monitor"><article><i>01</i><b>Kasir Cabang</b><small>Invoice, metode pembayaran, customer, cashier_id, dan branch_id.</small></article><article><i>02</i><b>Sales Ledger</b><small>Transaksi Posted menjadi sumber laporan per cabang.</small></article><article><i>03</i><b>Stock Engine</b><small>FIFO dan product_branch_stock memperbarui stok lokasi.</small></article><article><i>04</i><b>Audit & Finance</b><small>Riwayat stok, retur, penerimaan, dan revenue terhubung.</small></article><article><i>05</i><b>Manager Insight</b><small>Data lintas cabang disajikan read-only untuk keputusan.</small></article></div></section></div>''',counts=counts)
+    return render_page('Flow Data',body)
+
+CSS_DESIGN += r"""
+body.page-maps .manager-map-page{position:relative;height:520px;overflow:hidden;margin-bottom:14px;border:1px solid rgba(103,232,249,.16);border-radius:20px;background:radial-gradient(circle at center,rgba(37,99,235,.22),transparent 31%),linear-gradient(145deg,#06111d,#0d3047);box-shadow:0 20px 45px rgba(6,17,29,.2)}body.page-maps .manager-map-page .manager-map-grid{position:absolute;inset:0;background-image:linear-gradient(rgba(103,232,249,.07) 1px,transparent 1px),linear-gradient(90deg,rgba(96,165,250,.065) 1px,transparent 1px);background-size:28px 28px;animation:managerGridMove 20s linear infinite}body.page-maps .manager-map-page .manager-map-rings{position:absolute;left:50%;top:50%;width:340px;height:340px;border:1px solid rgba(103,232,249,.13);border-radius:50%;transform:translate(-50%,-50%);box-shadow:0 0 0 44px rgba(45,212,191,.035),0 0 0 90px rgba(59,130,246,.025);animation:managerRingBreath 5s ease-in-out infinite}body.page-maps .manager-map-page .manager-map-core{width:94px;height:94px}.manager-leaflet-map{margin-top:14px;min-height:360px}@media(max-width:600px){body.page-maps .manager-map-page{height:430px;margin:0 12px 14px}.manager-leaflet-map{height:360px!important;margin:0 12px 14px!important}.manager-map-page .manager-map-node span{display:none}.manager-map-page .manager-map-node>i{width:17px;height:17px}}
+"""
+
 @app.route('/maps')
 @login_required
 def maps():
+    user=current_user(); bid=get_branch_id()
+    if is_branch_role(user):
+        if bid: return redirect(url_for('maps_branch',branch_id=bid))
+        flash('Akun cabang belum memiliki lokasi cabang.','error'); return redirect(url_for('dashboard'))
     branches = q_all('SELECT * FROM koperasi_branches WHERE is_active=1 ORDER BY name')
     branch_data = []
     for b in branches:
         stats = q_one('''SELECT COUNT(*) as total_items, COALESCE(SUM(stock),0) as total_stock,
             COALESCE(SUM(stock * (SELECT sell_price FROM products WHERE id=pbs.product_id)),0) as total_value
             FROM product_branch_stock pbs WHERE pbs.branch_id=?''', [b['id']])
-        branch_data.append({**b, **stats})
+        idx=len(branch_data); pos=[(12,25),(36,15),(66,24),(85,45),(65,70),(34,76),(12,58),(50,46)][idx%8]
+        branch_data.append({**b, **stats,'map_x':pos[0],'map_y':pos[1]})
     body = render_template_string('''
     <div class="card">
         <div class="kartu">
@@ -9333,7 +10245,7 @@ def maps():
             </div>
         </div>
     </div>
-    <div id="map" style="height:500px;border-radius:var(--radius);border:1px solid var(--border);margin-bottom:16px;background:#f1f5f9;"></div>
+    {% if user.role=='manager' %}<div class="manager-map-page"><div class="manager-map-grid"></div><div class="manager-map-rings"></div><div class="manager-map-core"><i></i><b>ALL<br>BRANCHES</b></div>{% for b in branch_data %}<a class="manager-map-node" style="--x:{{b.map_x}}%;--y:{{b.map_y}}%;--delay:{{ loop.index0 * 0.16 }}s" href="{{url_for('maps_branch',branch_id=b.id)}}"><i></i><span><b>{{b.branch_code}}</b><small>{{'%.0f'|format(b.total_stock)}} unit</small></span></a>{% endfor %}<div class="manager-map-scan"></div></div>{% endif %}<div id="map" class="{{'manager-leaflet-map' if user.role=='manager' else ''}}" style="height:500px;border-radius:var(--radius);border:1px solid var(--border);margin-bottom:16px;background:#f1f5f9;"></div>
     <div class="metrics">
         <div class="metric"><div class="label">Total Cabang</div><div class="value" style="color:#2563eb;">{{ branches|length }}</div></div>
         <div class="metric"><div class="label">Total Stok</div><div class="value" style="color:#10b981;">{{ "%.0f"|format(branch_data|sum(attribute='total_stock')) }}</div></div>
@@ -9358,6 +10270,7 @@ def maps():
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
+    if(typeof L !== 'undefined'){
     var map = L.map('map').setView([-2.5, 117], 5);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '&copy; OpenStreetMap',
@@ -9378,9 +10291,11 @@ def maps():
     {% endif %}
     {% endfor %}
     if(bounds.length > 0){ map.fitBounds(bounds, {padding:[50,50]}); }
-    setTimeout(function(){
-        map.invalidateSize();
-    }, 500);
+    setTimeout(function(){ map.invalidateSize(); },500);
+    } else {
+      var mapEl=document.getElementById('map');
+      if(mapEl){mapEl.innerHTML='<div style="display:grid;place-items:center;height:100%;padding:24px;text-align:center;color:#64748b"><div><b>Peta geografis tidak tersedia</b><br><small>Peta jaringan cabang di atas tetap dapat digunakan tanpa internet.</small></div></div>';}
+    }
     </script>
     ''', branches=branches, branch_data=branch_data, user=current_user())
     return render_page('Peta Stok', body)
@@ -9413,6 +10328,9 @@ def maps_list():
 @app.route('/maps/branch/<int:branch_id>')
 @login_required
 def maps_branch(branch_id):
+    user=current_user(); current_bid=get_branch_id()
+    if is_branch_role(user) and int(branch_id)!=(int(current_bid) if current_bid else 0):
+        flash('Akses peta cabang lain ditolak.','error'); return redirect(url_for('dashboard'))
     branch = q_one('SELECT * FROM koperasi_branches WHERE id=?', [branch_id])
     if not branch:
         flash('Cabang tidak ditemukan.', 'error')
@@ -9422,9 +10340,8 @@ def maps_branch(branch_id):
         FROM products p
         LEFT JOIN product_branch_stock pbs ON pbs.product_id=p.id AND pbs.branch_id=?
         WHERE p.active=1 ORDER BY p.product_name''', [branch_id])
-    total_items = len(stocks)
-    total_stok = sum(float(s['branch_stock']) for s in stocks)
-    total_nilai = sum(float(s['branch_stock']) * float(s['sell_price']) for s in stocks)
+    total_items=len(stocks); total_stok=sum(float(s['branch_stock']) for s in stocks); total_nilai=sum(float(s['branch_stock'])*float(s['sell_price']) for s in stocks)
+    month=datetime.now().strftime('%Y-%m'); branch_sales=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM sales WHERE branch_id=? AND status="Posted" AND substr(trx_date,1,7)=?',[branch_id,month])
     pusat_branch = q_one('SELECT id FROM koperasi_branches WHERE branch_code="PUSAT"')
     body = render_template_string('''
     <div class="card">
@@ -9435,14 +10352,14 @@ def maps_branch(branch_id):
         <div class="metrics">
             <div class="metric"><div class="label">Total Item</div><div class="value" style="color:#2563eb;">{{ total_items }}</div></div>
             <div class="metric"><div class="label">Total Stok</div><div class="value" style="color:#10b981;">{{ "%.0f"|format(total_stok) }}</div></div>
-            <div class="metric"><div class="label">Nilai Stok</div><div class="value" style="color:#f59e0b;">{{ rupiah(total_nilai) }}</div></div>
+            <div class="metric"><div class="label">Nilai Stok</div><div class="value" style="color:#f59e0b;">{{ rupiah(total_nilai) }}</div></div><div class="metric"><div class="label">Penjualan Bulan Ini</div><div class="value" style="color:#2563eb;">{{rupiah(branch_sales.total)}}</div><div class="sub">{{branch_sales.n}} transaksi</div></div>
         </div>
         <div class="table-wrap"><table><thead><tr><th>Barcode</th><th>Barang</th><th>Kategori</th><th>Stok {{ branch.name }}</th><th>Stok Pusat</th><th>Harga Jual</th></tr></thead>
         <tbody>{% for s in stocks %}<tr><td>{{ s.barcode }}</td><td>{{ s.product_name }}</td><td>{{ s.category or '-' }}</td>
         <td><span style="font-weight:700;color:{{ '#ef4444' if s.branch_stock <= s.branch_min_stock else '#10b981' }};">{{ "%.0f"|format(s.branch_stock) }}</span>{% if s.branch_stock <= s.branch_min_stock %} ⚠️{% endif %}</td>
         <td>{{ "%.0f"|format(s.pusat_stock) }}</td><td>{{ rupiah(s.sell_price) }}</td></tr>{% else %}<tr><td colspan="6" class="muted text-center">Belum ada data stok.</td></tr>{% endfor %}</tbody></table></div>
     </div>
-    ''', branch=branch, stocks=stocks, total_items=total_items, total_stok=total_stok, total_nilai=total_nilai, rupiah=rupiah)
+    ''', branch=branch, stocks=stocks, total_items=total_items, total_stok=total_stok, total_nilai=total_nilai, branch_sales=branch_sales, rupiah=rupiah)
     return render_page(f'Stok — {branch["name"]}', body)
 
 # =========================
