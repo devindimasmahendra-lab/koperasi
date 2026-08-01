@@ -10,6 +10,12 @@ import math
 import json
 import os
 import qrcode
+try:
+    import cv2
+    import numpy as np
+except Exception:
+    cv2 = None
+    np = None
 from io import BytesIO as _BytesIO
 import base64
 from werkzeug.utils import secure_filename
@@ -400,7 +406,7 @@ ALL_MENU_ITEMS = {
     'shu_member': 'SHU Saya',
     'member_hub': 'Ruang Anggota',
     # QR payment and cashier operations
-    'cashier_qr_payment': 'QR Payment Statis Cabang',
+    'cashier_qr_payment': 'QR Statis Cabang',
     'cashier_qr_dynamic': 'Generate QR Nominal Manual',
     'branch_qr_payment_history': 'Riwayat QR Payment',
     'wallet_qr_scanner': 'Scan QR Pembayaran',
@@ -3581,7 +3587,7 @@ def mobile_app_menu(user, active_url=''):
         add('⌂', 'Dashboard', '/')
         add('⚡', 'Kasir Cepat', '/quick-cashier')
         add('▣','Kasir','/cashier')
-        add('▦','QR Payment Statis','/cashier/qr-payment')
+        add('▦','QR Statis Cabang','/cashier/qr-payment')
         add('⌗','Generate QR Nominal','/cashier/qr-dynamic')
         add('％','Kasir Diskon', '/cashier-with-discount')
         add('◷', 'Riwayat Penjualan', '/sales-history')
@@ -3628,7 +3634,7 @@ def mobile_app_menu(user, active_url=''):
         add('⌂', 'Dashboard', '/')
         add('⚡', 'Kasir Cepat', '/quick-cashier')
         add('▣','Kasir','/cashier')
-        add('▦','QR Payment Statis','/cashier/qr-payment')
+        add('▦','QR Statis Cabang','/cashier/qr-payment')
         add('⌗','Generate QR Nominal','/cashier/qr-dynamic')
         add('％','Kasir Diskon', '/cashier-with-discount')
         add('◷', 'Riwayat Penjualan', '/sales-history')
@@ -3659,7 +3665,7 @@ def mobile_app_menu(user, active_url=''):
         add('⌂', 'Command Center', '/admin/command-center')
         add('⚡', 'Kasir Cepat', '/quick-cashier')
         add('▣','Kasir','/cashier')
-        add('▦','QR Payment Statis','/cashier/qr-payment')
+        add('▦','QR Statis Cabang','/cashier/qr-payment')
         add('⌗','Generate QR Nominal','/cashier/qr-dynamic')
         add('％', 'Kasir Diskon', '/cashier-with-discount')
         add('◷', 'Riwayat Penjualan', '/sales-history')
@@ -3822,7 +3828,7 @@ def render_page(title, body, **ctx):
             nav_html += _sidebar_section('Transaksi', '🛒', [
                 ('quick_cashier', url_for('quick_cashier'), '⚡', 'Kasir Cepat'),
                 ('cashier', url_for('cashier'), '🧾', 'Kasir'),
-                ('cashier_qr_payment',url_for('cashier_qr_payment'),'▦','QR Payment Statis'),
+                ('cashier_qr_payment',url_for('cashier_qr_payment'),'▦','QR Statis Cabang'),
                 ('cashier_qr_dynamic',url_for('cashier_qr_dynamic'),'⌗','Generate QR Nominal'),
                 ('sales_history', url_for('sales_history'), '📊', 'Riwayat Penjualan'),
             ])
@@ -3890,7 +3896,7 @@ def render_page(title, body, **ctx):
             nav_html += _sidebar_section('Kasir & Penjualan', '▣', [
                 ('quick_cashier', url_for('quick_cashier'), '⚡', 'Kasir Cepat'),
                 ('cashier',url_for('cashier'),'▣','Kasir'),
-                ('cashier_qr_payment',url_for('cashier_qr_payment'),'▦','QR Payment Statis'),
+                ('cashier_qr_payment',url_for('cashier_qr_payment'),'▦','QR Statis Cabang'),
                 ('cashier_qr_dynamic',url_for('cashier_qr_dynamic'),'⌗','Generate QR Nominal'),
                 ('quick_cashier_queue', url_for('quick_cashier_queue'), '✓', 'Verifikasi Transaksi'),
                 ('admin_cashier_control',url_for('admin_cashier_control'),'◉','Control Center Kasir'),
@@ -3976,7 +3982,7 @@ def render_page(title, body, **ctx):
             nav_html += _sidebar_section('Transaksi', '🛒', [
                 ('quick_cashier', url_for('quick_cashier'), '⚡', 'Kasir Cepat'),
                 ('cashier', url_for('cashier'), '🧾', 'Kasir'),
-                ('cashier_qr_payment',url_for('cashier_qr_payment'),'▦','QR Payment Statis'),
+                ('cashier_qr_payment',url_for('cashier_qr_payment'),'▦','QR Statis Cabang'),
                 ('cashier_qr_dynamic',url_for('cashier_qr_dynamic'),'⌗','Generate QR Nominal'),
                 ('branch_qr_payment_history',url_for('branch_qr_payment_history'),'◎','Riwayat QR Payment'),
                 ('sales_history', url_for('sales_history'), '📊', 'Riwayat Penjualan'),
@@ -5661,7 +5667,7 @@ def dashboard():
     pay_chart=horizontal_bar_chart_svg([(f"{r['payment_method']} ({r['cnt']})",float(r['total'])) for r in pay_method],f'Komposisi Pembayaran {cur_month[5:]}/{cur_month[:4]}',colors=['#3b82f6','#8b5cf6','#f59e0b'])
     body = render_template_string('''
     <section class="command-center-v13"><div class="cc-main"><div class="command-kicker">OPERATIONS COMMAND CENTER</div><h2>Kendali operasional {{branch_name if branch_mode else "seluruh koperasi"}}</h2><p>{% if branch_mode %}Data pada halaman ini hanya berasal dari cabang {{branch_name}}, termasuk penjualan, stok, produk kritis, dan aktivitas kasir.{% else %}Pantau arus transaksi, validasi pekerjaan, dan kondisi keuangan melalui satu pandangan yang terhubung.{% endif %}</p><div class="command-actions"><a class="primary" href="{{ url_for('quick_cashier') }}">Transaksi Baru</a><a href="{{ url_for('products') }}">Kelola Barang</a><a href="{{ url_for('reports') }}">Buka Laporan</a></div></div><div class="cc-status"><div class="cc-status-head"><span>Status Operasional</span><b class="cc-live">LIVE</b></div><div class="cc-status-grid"><div><strong>{{pending_approval}}</strong><span>Approval</span></div><div><strong>{{pending_users}}</strong><span>User Baru</span></div><div><strong>{{low_stock_count}}</strong><span>Stok Kritis</span></div><div><strong>{{active_loan_count}}</strong><span>Kredit Aktif</span></div></div></div></section>
-    {% if branch_mode %}<section class="branch-qr-dashboard"><div><span>BRANCH QR PAYMENT</span><h3>Pembayaran QR {{branch_name}}</h3><p>Gunakan QR statis cabang atau buat QR khusus sesuai nominal transaksi.</p></div><div class="branch-qr-dashboard-actions"><a href="{{url_for('cashier_qr_payment')}}"><i>▦</i><b>QR Statis</b><small>QR tetap cabang</small></a><a href="{{url_for('cashier_qr_dynamic')}}"><i>⌗</i><b>Generate Nominal</b><small>QR khusus transaksi</small></a><a href="{{url_for('branch_qr_payment_history')}}"><i>◷</i><b>Riwayat QR</b><small>Audit pembayaran</small></a></div></section>{% endif %}
+    {% if branch_mode %}<section class="branch-qr-dashboard"><div><span>BRANCH QR PAYMENT</span><h3>Pembayaran QR {{branch_name}}</h3><p>Gunakan QR statis cabang atau buat QR khusus sesuai nominal transaksi.</p></div><div class="branch-qr-dashboard-actions"><a href="{{url_for('cashier_qr_payment')}}"><i>▦</i><b>QR Statis</b><small>Langsung scan tanpa generate</small></a><a href="{{url_for('cashier_qr_dynamic')}}"><i>⌗</i><b>Generate Nominal</b><small>QR khusus transaksi</small></a><a href="{{url_for('branch_qr_payment_history')}}"><i>◷</i><b>Riwayat QR</b><small>Audit pembayaran</small></a></div></section>{% endif %}
     <section class="data-flow-panel"><div class="flow-head"><div><span class="command-kicker">DATA FLOW</span><h3>Alur data operasional</h3></div><span>Input hingga laporan</span></div><div class="flow-track"><a href="{{url_for('members')}}" class="flow-node"><i>01</i><b>Anggota & Master</b><small>{{m_count}} anggota · {{p_count}} barang</small></a><span class="flow-arrow">→</span><a href="{{url_for('quick_cashier')}}" class="flow-node"><i>02</i><b>Transaksi</b><small>{{rupiah(sale_today)}} hari ini</small></a><span class="flow-arrow">→</span><a href="{{url_for('approvals')}}" class="flow-node"><i>03</i><b>Verifikasi</b><small>{{pending_approval}} menunggu</small></a><span class="flow-arrow">→</span><a href="{{url_for('accounting')}}" class="flow-node"><i>04</i><b>Keuangan</b><small>{{rupiah(profit_month-expense_month)}} laba bersih</small></a><span class="flow-arrow">→</span><a href="{{url_for('reports')}}" class="flow-node"><i>05</i><b>Laporan</b><small>Siap dianalisis</small></a></div></section>
     <div class="section-caption"><h3>Ringkasan Kinerja</h3><span>Diperbarui dari data transaksi aktif</span></div>
     <div class="metrics">
@@ -6439,14 +6445,40 @@ CSS_DESIGN += r"""
 @media(max-width:768px){.wallet-scanner{padding:0 12px}.scanner-hero{padding:21px;border-radius:22px}.scanner-hero h2{font-size:24px}.scanner-stage{max-height:none;aspect-ratio:3/4;border-radius:23px}.scanner-tools{border-radius:20px}.scanner-manual{grid-template-columns:1fr}.scanner-manual input,.scanner-manual button{grid-column:1;grid-row:auto}.qr-camera-primary .mn-icon{width:50px!important;height:50px!important;margin-top:-25px!important;border:5px solid #eef3ef!important;border-radius:18px!important;box-shadow:0 13px 27px rgba(37,99,235,.32)!important}}
 """
 
-@app.route('/wallet/scan-qr')
+CSS_DESIGN += r"""
+.ios-qr-capture{grid-column:1/-1;margin:0}.ios-qr-capture label{display:grid;grid-template-columns:48px 1fr;gap:2px 12px;align-items:center;padding:14px;border:1px solid #b9d9f5;border-radius:16px;background:linear-gradient(135deg,#eff8ff,#ecfdf8);cursor:pointer}.ios-qr-capture label i{grid-row:1/3;display:grid;place-items:center;width:46px;height:46px;border-radius:14px;background:linear-gradient(145deg,#2563eb,#0f9f97);color:#fff;font-size:22px;font-style:normal;box-shadow:0 10px 22px rgba(37,99,235,.22)}.ios-qr-capture label b{font-size:11px}.ios-qr-capture label small{color:#718395;font-size:8px}.ios-qr-capture input{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}.direct-static-pay form{display:grid;gap:11px;margin-top:17px}.direct-static-pay form label{display:grid;gap:7px;color:#64748b;font-size:9px;font-weight:900;text-align:left}.direct-static-pay form input{height:62px;font-size:26px!important;font-weight:900;text-align:center}.direct-static-pay>div:first-child>b{font-size:25px!important}
+@media(max-width:768px){.ios-qr-capture label{border-radius:17px}.direct-static-pay form input{font-size:23px!important}}
+"""
+
+@app.route('/wallet/scan-qr',methods=['GET','POST'])
 @login_required
 @role_required('user')
 def wallet_qr_scanner():
     member=current_wallet_member()
     if not member:
         flash('Akun anggota belum terhubung dengan wallet.','error'); return redirect(url_for('dashboard'))
-    body=render_template_string(r'''<div class="wallet-scanner"><header class="scanner-hero"><div class="scanner-grid"></div><span>KOPERASI WALLET CAMERA</span><h2>Scan untuk Bayar</h2><p>Arahkan kamera ke QR statis cabang. Nominal aktif dari kasir akan muncul otomatis setelah QR terbaca.</p></header><section class="scanner-stage"><video id="qrCamera" playsinline muted></video><div class="scanner-overlay"><i></i><i></i><i></i><i></i><span></span></div><div class="scanner-beam"></div><div id="scannerStatus" class="scanner-status"><i></i><span>Menyiapkan kamera...</span></div></section><section class="scanner-tools"><button type="button" id="startScan" class="btn-success">Aktifkan Kamera</button><button type="button" id="switchCamera" class="btn-ghost">Ganti Kamera</button><label class="scanner-manual">Atau tempel tautan QR<input id="manualQrUrl" type="url" placeholder="http://server:5000/pay/branch/..."><button type="button" id="openManual">Buka Pembayaran</button></label><p>Kamera browser membutuhkan HTTPS, kecuali saat memakai localhost. Jika kamera ditolak, izinkan akses kamera pada pengaturan browser.</p></section></div><script>(function(){var video=document.getElementById('qrCamera'),status=document.getElementById('scannerStatus'),stream=null,facing='environment',running=false,detector=null;function setStatus(t,ok){status.querySelector('span').textContent=t;status.classList.toggle('ok',!!ok)}function valid(url){try{var u=new URL(url,location.origin);return u.origin===location.origin&&u.pathname.indexOf('/pay/branch/')===0}catch(e){return false}}function go(url){if(!valid(url)){setStatus('QR bukan QR pembayaran koperasi',false);return}setStatus('QR terbaca. Membuka pembayaran...',true);stop();location.href=new URL(url,location.origin).href}async function scanLoop(){if(!running||!detector)return;try{var codes=await detector.detect(video);if(codes&&codes.length){go(codes[0].rawValue);return}}catch(e){}requestAnimationFrame(scanLoop)}async function start(){stop();setStatus('Meminta izin kamera...',false);try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:facing}},audio:false});video.srcObject=stream;await video.play();running=true;if('BarcodeDetector' in window){detector=new BarcodeDetector({formats:['qr_code']});setStatus('Kamera aktif. Arahkan ke QR cabang.',true);scanLoop()}else{setStatus('Browser belum mendukung pembaca QR otomatis. Gunakan Chrome terbaru atau tempel tautan QR.',false)}}catch(e){setStatus('Kamera tidak dapat dibuka: '+(e.message||e.name),false)}}function stop(){running=false;if(stream){stream.getTracks().forEach(function(t){t.stop()});stream=null}}document.getElementById('startScan').onclick=start;document.getElementById('switchCamera').onclick=function(){facing=facing==='environment'?'user':'environment';start()};document.getElementById('openManual').onclick=function(){go(document.getElementById('manualQrUrl').value)};window.addEventListener('pagehide',stop);if(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia)start();else setStatus('Perangkat tidak mendukung akses kamera browser.',false)})();</script>''')
+    if request.method=='POST':
+        photo=request.files.get('qr_photo')
+        if not photo or not photo.filename:
+            flash('Ambil atau pilih foto QR terlebih dahulu.','error'); return redirect(url_for('wallet_qr_scanner'))
+        if cv2 is None or np is None:
+            flash('Decoder QR server belum tersedia. Gunakan Kamera iPhone langsung.','error'); return redirect(url_for('wallet_qr_scanner'))
+        raw=photo.read(8*1024*1024)
+        try:
+            image=cv2.imdecode(np.frombuffer(raw,dtype=np.uint8),cv2.IMREAD_COLOR)
+            value,points,_=cv2.QRCodeDetector().detectAndDecode(image)
+        except Exception:
+            value=''
+        if value:
+            try:
+                from urllib.parse import urlparse
+                parsed=urlparse(value); target=parsed.path + (('?' + parsed.query) if parsed.query else '')
+            except Exception: target=''
+            if target.startswith('/pay/branch/') or target.startswith('/pay/intent/'):
+                return redirect(target)
+        flash('QR tidak terbaca atau bukan QR pembayaran koperasi. Foto ulang lebih dekat dan terang.','error')
+        return redirect(url_for('wallet_qr_scanner'))
+    body=render_template_string(r'''<div class="wallet-scanner"><header class="scanner-hero"><div class="scanner-grid"></div><span>KOPERASI WALLET CAMERA</span><h2>Scan untuk Bayar</h2><p>Arahkan kamera ke QR statis cabang. Nominal aktif dari kasir akan muncul otomatis setelah QR terbaca.</p></header><section class="scanner-stage"><video id="qrCamera" playsinline muted></video><div class="scanner-overlay"><i></i><i></i><i></i><i></i><span></span></div><div class="scanner-beam"></div><div id="scannerStatus" class="scanner-status"><i></i><span>Menyiapkan kamera...</span></div></section><section class="scanner-tools"><form method="post" enctype="multipart/form-data" class="ios-qr-capture"><label for="iosQrPhoto"><i>⌗</i><b>Scan dengan Kamera iPhone</b><small>Ambil foto QR lalu diproses otomatis</small></label><input id="iosQrPhoto" type="file" name="qr_photo" accept="image/*" capture="environment" required onchange="this.form.submit()"></form><button type="button" id="startScan" class="btn-success">Kamera Live</button><button type="button" id="switchCamera" class="btn-ghost">Ganti Kamera</button><label class="scanner-manual">Atau tempel tautan QR<input id="manualQrUrl" type="url" placeholder="http://server:5000/pay/branch/..."><button type="button" id="openManual">Buka Pembayaran</button></label><p>Kamera browser membutuhkan HTTPS, kecuali saat memakai localhost. Jika kamera ditolak, izinkan akses kamera pada pengaturan browser.</p></section></div><script>(function(){var video=document.getElementById('qrCamera'),status=document.getElementById('scannerStatus'),stream=null,facing='environment',running=false,detector=null;function setStatus(t,ok){status.querySelector('span').textContent=t;status.classList.toggle('ok',!!ok)}function valid(url){try{var u=new URL(url,location.origin);return u.origin===location.origin&&u.pathname.indexOf('/pay/branch/')===0}catch(e){return false}}function go(url){if(!valid(url)){setStatus('QR bukan QR pembayaran koperasi',false);return}setStatus('QR terbaca. Membuka pembayaran...',true);stop();location.href=new URL(url,location.origin).href}async function scanLoop(){if(!running||!detector)return;try{var codes=await detector.detect(video);if(codes&&codes.length){go(codes[0].rawValue);return}}catch(e){}requestAnimationFrame(scanLoop)}async function start(){stop();setStatus('Meminta izin kamera...',false);try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:facing}},audio:false});video.srcObject=stream;await video.play();running=true;if('BarcodeDetector' in window){detector=new BarcodeDetector({formats:['qr_code']});setStatus('Kamera aktif. Arahkan ke QR cabang.',true);scanLoop()}else{setStatus('Browser belum mendukung pembaca QR otomatis. Gunakan Chrome terbaru atau tempel tautan QR.',false)}}catch(e){setStatus('Kamera tidak dapat dibuka: '+(e.message||e.name),false)}}function stop(){running=false;if(stream){stream.getTracks().forEach(function(t){t.stop()});stream=null}}document.getElementById('startScan').onclick=start;document.getElementById('switchCamera').onclick=function(){facing=facing==='environment'?'user':'environment';start()};document.getElementById('openManual').onclick=function(){go(document.getElementById('manualQrUrl').value)};window.addEventListener('pagehide',stop);if(!('BarcodeDetector' in window)){setStatus('Safari iPhone: gunakan tombol Scan dengan Kamera iPhone di bawah.',false)}else if(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia){start()}else setStatus('Perangkat tidak mendukung akses kamera browser.',false)})();</script>''')
     return render_page('Scan QR Pembayaran',body)
 
 
@@ -6590,9 +6622,16 @@ def branch_qr_pay(token):
     balance=wallet_balance(member['id']) if 'wallet_balance' in globals() else q_one('SELECT COALESCE(SUM(CASE WHEN tipe="MASUK" THEN nominal ELSE -nominal END),0) saldo FROM saldo_history WHERE member_id=?',[member['id']])['saldo']
     if request.method=='POST':
         iid=int(request.form.get('intent_id') or 0)
+        direct_amount=parse_float(request.form.get('direct_amount'),0)
         conn=get_conn()
         try:
             conn.execute('BEGIN IMMEDIATE')
+            if iid<=0:
+                if direct_amount<1000: raise ValueError('Nominal minimal Rp1.000.')
+                paycode='QRS-'+datetime.now().strftime('%Y%m%d%H%M%S')+'-'+os.urandom(3).hex().upper()
+                expires=(datetime.now()+timedelta(minutes=10)).strftime('%Y-%m-%d %H:%M:%S')
+                cur=conn.execute('''INSERT INTO branch_qr_payment_intents(payment_code,branch_id,amount,status,note,operator_user_id,cashier_session_id,created_at,expires_at,qr_mode) VALUES(?,?,?,'WAITING','Pembayaran langsung QR statis',NULL,NULL,?,?,'STATIC_DIRECT')''',[paycode,bid,direct_amount,now_str(),expires])
+                iid=cur.lastrowid
             locked=conn.execute("SELECT * FROM branch_qr_payment_intents WHERE id=? AND branch_id=? AND status='WAITING'",[iid,bid]).fetchone()
             if not locked: raise ValueError('Tagihan sudah dibayar, dibatalkan, atau kedaluwarsa.')
             if locked['expires_at'] and locked['expires_at']<now_str(): raise ValueError('Tagihan sudah kedaluwarsa.')
@@ -6611,7 +6650,7 @@ def branch_qr_pay(token):
         finally: conn.close()
         return redirect(url_for('branch_qr_pay',token=token))
     success=request.args.get('success',type=int); paid=q_one('SELECT * FROM branch_qr_payment_intents WHERE id=? AND member_id=? AND status="PAID"',[success,member['id']]) if success else None
-    body=render_template_string(r'''<div class="member-qr-pay"><header><span>SCAN TO PAY</span><h2>{{branch_name}}</h2><p>Pembayaran langsung dari saldo Koperasi Wallet.</p></header>{% if paid %}<section class="member-pay-success"><i>✓</i><h3>Pembayaran Berhasil</h3><b>{{rupiah(paid.amount)}}</b><small>{{paid.payment_code}} · {{paid.paid_at}}</small><a href="{{url_for('wallet')}}">Lihat Mutasi Wallet</a></section>{% elif intent %}<section class="member-pay-card"><div><span>TAGIHAN AKTIF</span><b>{{rupiah(intent.amount)}}</b><small>{{intent.payment_code}} · {{intent.note or 'Pembayaran koperasi'}}</small></div><div class="member-pay-balance"><span>Saldo Anda</span><b>{{rupiah(balance)}}</b></div><form method="post"><input type="hidden" name="intent_id" value="{{intent.id}}"><button class="btn-success" {{'disabled' if balance<intent.amount else ''}} data-confirm="Bayar {{rupiah(intent.amount)}} ke {{branch_name}}?">Bayar Sekarang</button></form>{% if balance<intent.amount %}<p class="pay-insufficient">Saldo tidak cukup. Silakan isi saldo terlebih dahulu.</p>{% endif %}</section>{% else %}<section class="member-pay-wait"><div class="qr-radar"><i></i><em></em></div><h3>Menunggu nominal dari kasir</h3><p>QR cabang sudah benar. Minta kasir mengaktifkan nominal transaksi, lalu halaman akan memeriksa otomatis.</p></section><script>setTimeout(function(){location.reload()},3000)</script>{% endif %}</div>''',branch_name=branch_name,intent=intent,balance=float(balance or 0),member=member,paid=paid,rupiah=rupiah)
+    body=render_template_string(r'''<div class="member-qr-pay"><header><span>SCAN TO PAY</span><h2>{{branch_name}}</h2><p>Pembayaran langsung dari saldo Koperasi Wallet.</p></header>{% if paid %}<section class="member-pay-success"><i>✓</i><h3>Pembayaran Berhasil</h3><b>{{rupiah(paid.amount)}}</b><small>{{paid.payment_code}} · {{paid.paid_at}}</small><a href="{{url_for('wallet')}}">Lihat Mutasi Wallet</a></section>{% elif intent %}<section class="member-pay-card"><div><span>TAGIHAN AKTIF</span><b>{{rupiah(intent.amount)}}</b><small>{{intent.payment_code}} · {{intent.note or 'Pembayaran koperasi'}}</small></div><div class="member-pay-balance"><span>Saldo Anda</span><b>{{rupiah(balance)}}</b></div><form method="post"><input type="hidden" name="intent_id" value="{{intent.id}}"><button class="btn-success" {{'disabled' if balance<intent.amount else ''}} data-confirm="Bayar {{rupiah(intent.amount)}} ke {{branch_name}}?">Bayar Sekarang</button></form>{% if balance<intent.amount %}<p class="pay-insufficient">Saldo tidak cukup. Silakan isi saldo terlebih dahulu.</p>{% endif %}</section>{% else %}<section class="member-pay-card direct-static-pay"><div><span>QR STATIS CABANG</span><b>Masukkan Nominal</b><small>Konfirmasi nominal sesuai total yang disampaikan kasir.</small></div><div class="member-pay-balance"><span>Saldo Anda</span><b>{{rupiah(balance)}}</b></div><form method="post"><label>Nominal pembayaran<input type="number" name="direct_amount" min="1000" step="1000" placeholder="Rp 20.000" required autofocus></label><button class="btn-success" data-confirm="Lanjutkan pembayaran QR statis?">Lanjutkan Pembayaran</button></form></section>{% endif %}</div>''',branch_name=branch_name,intent=intent,balance=float(balance or 0),member=member,paid=paid,rupiah=rupiah)
     return render_page('Bayar QR Cabang',body)
 
 @app.route('/cashier/qr-payment/history')
