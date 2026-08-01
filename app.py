@@ -410,6 +410,8 @@ ALL_MENU_ITEMS = {
     'cashier_qr_dynamic': 'Generate QR Nominal Manual',
     'branch_qr_payment_history': 'Riwayat QR Payment',
     'wallet_qr_scanner': 'Scan QR Pembayaran',
+    'cashier_payment_code': 'Kode Bayar 3 Digit Cabang',
+    'member_pay_code': 'Bayar dengan Kode 3 Digit',
     'cashier_operator_sessions': 'Rekap Sesi Operator Kasir',
     'admin_cashier_control': 'Control Center Kasir',
     'admin_cashier_operators': 'Akun Operator Kasir',
@@ -464,6 +466,8 @@ MENU_ROLE_ACCESS = {
     'cashier_qr_dynamic': {'admin','kasir','branch_admin','branch_cashier'},
     'branch_qr_payment_history': {'admin','branch_admin','manager'},
     'wallet_qr_scanner': {'user'},
+    'cashier_payment_code': {'admin','kasir','branch_admin','branch_cashier'},
+    'member_pay_code': {'user'},
 }
 
 def is_menu_allowed_for_role(menu_id, role):
@@ -3557,7 +3561,7 @@ def mobile_app_menu(user, active_url=''):
         '/loans/my-payments': 'my_payments', '/member/expense-history': 'member_expense_history',
         '/shu/member': 'shu_member',
         '/manager/dashboard':'manager_dashboard','/manager/finance':'manager_finance',
-        '/manager/inventory':'manager_inventory','/manager/flow':'manager_flow','/cashier/operator-sessions':'cashier_operator_sessions','/admin/cashier-control':'admin_cashier_control','/admin/cashier-operators':'admin_cashier_operators','/admin/cashier-rotation-log':'admin_cashier_rotation_log','/cashier/qr-payment':'cashier_qr_payment','/cashier/qr-dynamic':'cashier_qr_dynamic','/cashier/qr-payment/history':'branch_qr_payment_history','/wallet/scan-qr':'wallet_qr_scanner'
+        '/manager/inventory':'manager_inventory','/manager/flow':'manager_flow','/cashier/operator-sessions':'cashier_operator_sessions','/admin/cashier-control':'admin_cashier_control','/admin/cashier-operators':'admin_cashier_operators','/admin/cashier-rotation-log':'admin_cashier_rotation_log','/cashier/qr-payment':'cashier_qr_payment','/cashier/qr-dynamic':'cashier_qr_dynamic','/cashier/qr-payment/history':'branch_qr_payment_history','/wallet/scan-qr':'wallet_qr_scanner','/cashier/payment-code':'cashier_payment_code','/wallet/pay-code':'member_pay_code'
     }
     def add(icon, label, url):
         menu_id = mobile_menu_ids.get(url)
@@ -3573,6 +3577,7 @@ def mobile_app_menu(user, active_url=''):
         add('◫', 'Ruang Anggota', '/member/hub')
         add('◎','Dompet','/wallet')
         add('⌗','Scan QR Bayar','/wallet/scan-qr')
+        add('123','Kode Bayar 3 Digit','/wallet/pay-code')
         add('＋','Topup Wallet','/wallet')
         add('◇', 'Kredit Saya', '/loans')
         add('↗', 'Ajukan Kredit', '/loans/apply')
@@ -3589,6 +3594,7 @@ def mobile_app_menu(user, active_url=''):
         add('▣','Kasir','/cashier')
         add('▦','QR Statis Cabang','/cashier/qr-payment')
         add('⌗','Generate QR Nominal','/cashier/qr-dynamic')
+        add('123','Kode Bayar Cabang','/cashier/payment-code')
         add('％','Kasir Diskon', '/cashier-with-discount')
         add('◷', 'Riwayat Penjualan', '/sales-history')
         add('▤', 'Laporan Harian', '/daily-report')
@@ -3636,6 +3642,7 @@ def mobile_app_menu(user, active_url=''):
         add('▣','Kasir','/cashier')
         add('▦','QR Statis Cabang','/cashier/qr-payment')
         add('⌗','Generate QR Nominal','/cashier/qr-dynamic')
+        add('123','Kode Bayar Cabang','/cashier/payment-code')
         add('％','Kasir Diskon', '/cashier-with-discount')
         add('◷', 'Riwayat Penjualan', '/sales-history')
         add('↶', 'Retur Penjualan', '/sales-returns')
@@ -3667,6 +3674,7 @@ def mobile_app_menu(user, active_url=''):
         add('▣','Kasir','/cashier')
         add('▦','QR Statis Cabang','/cashier/qr-payment')
         add('⌗','Generate QR Nominal','/cashier/qr-dynamic')
+        add('123','Kode Bayar Cabang','/cashier/payment-code')
         add('％', 'Kasir Diskon', '/cashier-with-discount')
         add('◷', 'Riwayat Penjualan', '/sales-history')
         add('↶', 'Retur Penjualan', '/sales-returns')
@@ -3815,7 +3823,8 @@ def render_page(title, body, **ctx):
             nav_html += _sidebar_section('Layanan Anggota', '◫', [
                 ('member_dashboard', url_for('member_dashboard'), '⌂', 'Beranda'),
                 ('member_hub', url_for('member_hub'), '◫', 'Ruang Anggota'),
-                ('wallet', url_for('wallet'), '◎', 'Dompet & Topup'),
+                ('wallet',url_for('wallet'),'◎','Dompet & Topup'),
+                ('member_pay_code',url_for('member_pay_code'),'123','Bayar Kode 3 Digit'),
                 ('loans', url_for('loans'), '◇', 'Kredit Saya'),
                 ('member_purchases', url_for('member_purchases'), '≡', 'Riwayat Aktivitas'),
                 ('member_digital_card', url_for('member_digital_card'), '▣', 'Kartu Anggota'),
@@ -3830,6 +3839,7 @@ def render_page(title, body, **ctx):
                 ('cashier', url_for('cashier'), '🧾', 'Kasir'),
                 ('cashier_qr_payment',url_for('cashier_qr_payment'),'▦','QR Statis Cabang'),
                 ('cashier_qr_dynamic',url_for('cashier_qr_dynamic'),'⌗','Generate QR Nominal'),
+                ('cashier_payment_code',url_for('cashier_payment_code'),'123','Kode Bayar 3 Digit'),
                 ('sales_history', url_for('sales_history'), '📊', 'Riwayat Penjualan'),
             ])
             nav_html += _sidebar_section('Barang', '📦', [
@@ -3898,6 +3908,7 @@ def render_page(title, body, **ctx):
                 ('cashier',url_for('cashier'),'▣','Kasir'),
                 ('cashier_qr_payment',url_for('cashier_qr_payment'),'▦','QR Statis Cabang'),
                 ('cashier_qr_dynamic',url_for('cashier_qr_dynamic'),'⌗','Generate QR Nominal'),
+                ('cashier_payment_code',url_for('cashier_payment_code'),'123','Kode Bayar 3 Digit'),
                 ('quick_cashier_queue', url_for('quick_cashier_queue'), '✓', 'Verifikasi Transaksi'),
                 ('admin_cashier_control',url_for('admin_cashier_control'),'◉','Control Center Kasir'),
                 ('admin_cashier_operators',url_for('admin_cashier_operators'),'♙','Akun Operator Kasir'),
@@ -3984,6 +3995,7 @@ def render_page(title, body, **ctx):
                 ('cashier', url_for('cashier'), '🧾', 'Kasir'),
                 ('cashier_qr_payment',url_for('cashier_qr_payment'),'▦','QR Statis Cabang'),
                 ('cashier_qr_dynamic',url_for('cashier_qr_dynamic'),'⌗','Generate QR Nominal'),
+                ('cashier_payment_code',url_for('cashier_payment_code'),'123','Kode Bayar 3 Digit'),
                 ('branch_qr_payment_history',url_for('branch_qr_payment_history'),'◎','Riwayat QR Payment'),
                 ('sales_history', url_for('sales_history'), '📊', 'Riwayat Penjualan'),
                 ('sales_returns', url_for('sales_returns'), '🔄', 'Retur Penjualan'),
@@ -5612,7 +5624,7 @@ def topup_approval_legacy():
 # Dashboard
 # =========================
 CSS_DESIGN += r"""
-.branch-qr-dashboard{display:flex;justify-content:space-between;align-items:center;gap:18px;margin:14px 0;padding:20px;border:1px solid rgba(103,232,249,.16);border-radius:17px;background:radial-gradient(circle at 88% 12%,rgba(37,99,235,.3),transparent 25%),linear-gradient(135deg,#071421,#103a52);color:#fff;box-shadow:0 16px 38px rgba(7,20,33,.18)}.branch-qr-dashboard>div:first-child span{color:#67e8f9;font-size:8px;font-weight:950;letter-spacing:.17em}.branch-qr-dashboard h3{margin:6px 0;color:#fff}.branch-qr-dashboard p{margin:0;color:#b8ccda;font-size:9px}.branch-qr-dashboard-actions{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;min-width:480px}.branch-qr-dashboard-actions a{padding:12px;border:1px solid rgba(255,255,255,.12);border-radius:12px;background:rgba(255,255,255,.07);color:#fff;text-decoration:none;transition:.2s}.branch-qr-dashboard-actions a:hover{transform:translateY(-2px);background:rgba(255,255,255,.12)}.branch-qr-dashboard-actions i,.branch-qr-dashboard-actions b,.branch-qr-dashboard-actions small{display:block}.branch-qr-dashboard-actions i{color:#67e8f9;font-style:normal;font-size:18px}.branch-qr-dashboard-actions b{margin:7px 0 2px;font-size:10px}.branch-qr-dashboard-actions small{color:#a9becd;font-size:7px}.dynamic-qr-layout{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:14px}.dynamic-qr-result{overflow:hidden;border:1px solid #d9e4ed;border-radius:15px;background:#fff;text-align:center;box-shadow:0 8px 24px rgba(15,35,52,.05)}.dynamic-qr-result>img{display:block;width:255px;height:255px;margin:20px auto 9px;padding:10px;border:1px solid #dce6ed;border-radius:18px}.dynamic-qr-result>b,.dynamic-qr-result>small{display:block}.dynamic-qr-result>b{font-size:27px}.dynamic-qr-result>small{padding:8px 15px 18px;color:#8191a0}.branch-qr-hero.dynamic{background:radial-gradient(circle at 84% 18%,rgba(124,58,237,.37),transparent 27%),linear-gradient(135deg,#07111f,#2d245a)}
+.branch-qr-dashboard{display:flex;justify-content:space-between;align-items:center;gap:18px;margin:14px 0;padding:20px;border:1px solid rgba(103,232,249,.16);border-radius:17px;background:radial-gradient(circle at 88% 12%,rgba(37,99,235,.3),transparent 25%),linear-gradient(135deg,#071421,#103a52);color:#fff;box-shadow:0 16px 38px rgba(7,20,33,.18)}.branch-qr-dashboard>div:first-child span{color:#67e8f9;font-size:8px;font-weight:950;letter-spacing:.17em}.branch-qr-dashboard h3{margin:6px 0;color:#fff}.branch-qr-dashboard p{margin:0;color:#b8ccda;font-size:9px}.branch-qr-dashboard-actions{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;min-width:620px}.branch-qr-dashboard-actions a{padding:12px;border:1px solid rgba(255,255,255,.12);border-radius:12px;background:rgba(255,255,255,.07);color:#fff;text-decoration:none;transition:.2s}.branch-qr-dashboard-actions a:hover{transform:translateY(-2px);background:rgba(255,255,255,.12)}.branch-qr-dashboard-actions i,.branch-qr-dashboard-actions b,.branch-qr-dashboard-actions small{display:block}.branch-qr-dashboard-actions i{color:#67e8f9;font-style:normal;font-size:18px}.branch-qr-dashboard-actions b{margin:7px 0 2px;font-size:10px}.branch-qr-dashboard-actions small{color:#a9becd;font-size:7px}.dynamic-qr-layout{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:14px}.dynamic-qr-result{overflow:hidden;border:1px solid #d9e4ed;border-radius:15px;background:#fff;text-align:center;box-shadow:0 8px 24px rgba(15,35,52,.05)}.dynamic-qr-result>img{display:block;width:255px;height:255px;margin:20px auto 9px;padding:10px;border:1px solid #dce6ed;border-radius:18px}.dynamic-qr-result>b,.dynamic-qr-result>small{display:block}.dynamic-qr-result>b{font-size:27px}.dynamic-qr-result>small{padding:8px 15px 18px;color:#8191a0}.branch-qr-hero.dynamic{background:radial-gradient(circle at 84% 18%,rgba(124,58,237,.37),transparent 27%),linear-gradient(135deg,#07111f,#2d245a)}
 @media(max-width:900px){.branch-qr-dashboard{align-items:flex-start;flex-direction:column}.branch-qr-dashboard-actions{width:100%;min-width:0}.dynamic-qr-layout{grid-template-columns:1fr}}
 @media(max-width:768px){.branch-qr-dashboard{margin:12px;padding:17px;border-radius:21px}.branch-qr-dashboard-actions{grid-template-columns:1fr}.dynamic-qr-result{border-radius:20px}.dynamic-qr-result>img{width:220px;height:220px}}
 """
@@ -5667,7 +5679,7 @@ def dashboard():
     pay_chart=horizontal_bar_chart_svg([(f"{r['payment_method']} ({r['cnt']})",float(r['total'])) for r in pay_method],f'Komposisi Pembayaran {cur_month[5:]}/{cur_month[:4]}',colors=['#3b82f6','#8b5cf6','#f59e0b'])
     body = render_template_string('''
     <section class="command-center-v13"><div class="cc-main"><div class="command-kicker">OPERATIONS COMMAND CENTER</div><h2>Kendali operasional {{branch_name if branch_mode else "seluruh koperasi"}}</h2><p>{% if branch_mode %}Data pada halaman ini hanya berasal dari cabang {{branch_name}}, termasuk penjualan, stok, produk kritis, dan aktivitas kasir.{% else %}Pantau arus transaksi, validasi pekerjaan, dan kondisi keuangan melalui satu pandangan yang terhubung.{% endif %}</p><div class="command-actions"><a class="primary" href="{{ url_for('quick_cashier') }}">Transaksi Baru</a><a href="{{ url_for('products') }}">Kelola Barang</a><a href="{{ url_for('reports') }}">Buka Laporan</a></div></div><div class="cc-status"><div class="cc-status-head"><span>Status Operasional</span><b class="cc-live">LIVE</b></div><div class="cc-status-grid"><div><strong>{{pending_approval}}</strong><span>Approval</span></div><div><strong>{{pending_users}}</strong><span>User Baru</span></div><div><strong>{{low_stock_count}}</strong><span>Stok Kritis</span></div><div><strong>{{active_loan_count}}</strong><span>Kredit Aktif</span></div></div></div></section>
-    {% if branch_mode %}<section class="branch-qr-dashboard"><div><span>BRANCH QR PAYMENT</span><h3>Pembayaran QR {{branch_name}}</h3><p>Gunakan QR statis cabang atau buat QR khusus sesuai nominal transaksi.</p></div><div class="branch-qr-dashboard-actions"><a href="{{url_for('cashier_qr_payment')}}"><i>▦</i><b>QR Statis</b><small>Langsung scan tanpa generate</small></a><a href="{{url_for('cashier_qr_dynamic')}}"><i>⌗</i><b>Generate Nominal</b><small>QR khusus transaksi</small></a><a href="{{url_for('branch_qr_payment_history')}}"><i>◷</i><b>Riwayat QR</b><small>Audit pembayaran</small></a></div></section>{% endif %}
+    {% if branch_mode %}<section class="branch-qr-dashboard"><div><span>BRANCH QR PAYMENT</span><h3>Pembayaran QR {{branch_name}}</h3><p>Gunakan QR statis cabang atau buat QR khusus sesuai nominal transaksi.</p></div><div class="branch-qr-dashboard-actions"><a href="{{url_for('cashier_qr_payment')}}"><i>▦</i><b>QR Statis</b><small>Langsung scan tanpa generate</small></a><a href="{{url_for('cashier_qr_dynamic')}}"><i>⌗</i><b>Generate Nominal</b><small>QR khusus transaksi</small></a><a href="{{url_for('cashier_payment_code')}}"><i>123</i><b>Kode Bayar</b><small>Kode cabang 3 digit</small></a><a href="{{url_for('branch_qr_payment_history')}}"><i>◷</i><b>Riwayat QR</b><small>Audit pembayaran</small></a></div></section>{% endif %}
     <section class="data-flow-panel"><div class="flow-head"><div><span class="command-kicker">DATA FLOW</span><h3>Alur data operasional</h3></div><span>Input hingga laporan</span></div><div class="flow-track"><a href="{{url_for('members')}}" class="flow-node"><i>01</i><b>Anggota & Master</b><small>{{m_count}} anggota · {{p_count}} barang</small></a><span class="flow-arrow">→</span><a href="{{url_for('quick_cashier')}}" class="flow-node"><i>02</i><b>Transaksi</b><small>{{rupiah(sale_today)}} hari ini</small></a><span class="flow-arrow">→</span><a href="{{url_for('approvals')}}" class="flow-node"><i>03</i><b>Verifikasi</b><small>{{pending_approval}} menunggu</small></a><span class="flow-arrow">→</span><a href="{{url_for('accounting')}}" class="flow-node"><i>04</i><b>Keuangan</b><small>{{rupiah(profit_month-expense_month)}} laba bersih</small></a><span class="flow-arrow">→</span><a href="{{url_for('reports')}}" class="flow-node"><i>05</i><b>Laporan</b><small>Siap dianalisis</small></a></div></section>
     <div class="section-caption"><h3>Ringkasan Kinerja</h3><span>Diperbarui dari data transaksi aktif</span></div>
     <div class="metrics">
@@ -6450,6 +6462,156 @@ CSS_DESIGN += r"""
 @media(max-width:768px){.ios-qr-capture label{border-radius:17px}.direct-static-pay form input{font-size:23px!important}}
 """
 
+
+# =========================
+# Three Digit Branch Payment Code
+# =========================
+def ensure_payment_code_schema():
+    conn=get_conn()
+    try:
+        conn.execute('''CREATE TABLE IF NOT EXISTS branch_payment_codes(
+          branch_id INTEGER PRIMARY KEY,code TEXT UNIQUE NOT NULL,is_active INTEGER DEFAULT 1,
+          version_no INTEGER DEFAULT 1,generated_at TEXT NOT NULL,generated_by INTEGER,
+          previous_code TEXT,regenerated_at TEXT,FOREIGN KEY(branch_id) REFERENCES koperasi_branches(id))''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS branch_code_payments(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,payment_no TEXT UNIQUE NOT NULL,code TEXT NOT NULL,
+          branch_id INTEGER NOT NULL,member_id INTEGER NOT NULL,amount REAL NOT NULL,status TEXT DEFAULT 'PAID',
+          wallet_before REAL,wallet_after REAL,created_at TEXT NOT NULL,ip_address TEXT,user_agent TEXT,
+          cashier_session_id INTEGER,operator_user_id INTEGER,note TEXT,
+          FOREIGN KEY(branch_id) REFERENCES koperasi_branches(id),FOREIGN KEY(member_id) REFERENCES members(id))''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS durable_notifications(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,title TEXT NOT NULL,message TEXT NOT NULL,
+          notif_type TEXT DEFAULT 'INFO',reference_type TEXT,reference_id INTEGER,created_at TEXT NOT NULL,
+          read_at TEXT,dismissed_at TEXT)''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_code_payment_branch ON branch_code_payments(branch_id,id)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_durable_notif_user ON durable_notifications(user_id,read_at,id)')
+        conn.commit()
+    finally: conn.close()
+
+def next_free_branch_code(conn,exclude_branch=None):
+    used={r['code'] for r in conn.execute('SELECT code FROM branch_payment_codes WHERE is_active=1').fetchall()}
+    # Cryptographic random start plus full deterministic scan prevents random-loop failure.
+    start=int.from_bytes(os.urandom(2),'big')%900+100
+    for offset in range(900):
+        code=str(100+((start-100+offset)%900))
+        if code not in used: return code
+    raise ValueError('Semua kombinasi kode 3 digit (100-999) sudah digunakan.')
+
+def get_branch_payment_code(branch_id,create=True):
+    ensure_payment_code_schema(); row=q_one('SELECT * FROM branch_payment_codes WHERE branch_id=?',[branch_id])
+    if not row and create:
+        conn=get_conn()
+        try:
+            conn.execute('BEGIN IMMEDIATE'); code=next_free_branch_code(conn)
+            conn.execute('INSERT INTO branch_payment_codes(branch_id,code,is_active,version_no,generated_at,generated_by) VALUES(?,?,1,1,?,?)',[branch_id,code,now_str(),session.get('user_id')]); conn.commit()
+        except Exception: conn.rollback(); raise
+        finally: conn.close()
+        row=q_one('SELECT * FROM branch_payment_codes WHERE branch_id=?',[branch_id])
+    return row
+
+def durable_notify(user_id,title,message,notif_type='INFO',reference_type=None,reference_id=None):
+    ensure_payment_code_schema()
+    return exec_sql('INSERT INTO durable_notifications(user_id,title,message,notif_type,reference_type,reference_id,created_at) VALUES(?,?,?,?,?,?,?)',[user_id,title,message,notif_type,reference_type,reference_id,now_str()])
+
+CSS_DESIGN += r"""
+.code-pay-suite,.member-code-pay{display:grid;gap:14px}.code-pay-hero,.member-code-pay>header{display:flex;justify-content:space-between;align-items:end;gap:16px;padding:25px;border-radius:20px;background:radial-gradient(circle at 86% 16%,rgba(37,99,235,.38),transparent 27%),linear-gradient(135deg,#06111d,#123b55);color:#fff;box-shadow:0 18px 45px rgba(6,17,29,.22)}.code-pay-hero span,.member-code-pay>header span{color:#67e8f9;font-size:8px;font-weight:950;letter-spacing:.18em}.code-pay-hero h2,.member-code-pay>header h2{margin:7px 0;color:#fff}.code-pay-hero p,.member-code-pay>header p{margin:0;color:#bad0dd}.code-pay-hero>b{display:flex;gap:7px;align-items:center;font-size:8px}.code-pay-hero>b i{width:8px;height:8px;border-radius:50%;background:#2dd4bf;box-shadow:0 0 12px #2dd4bf;animation:adminPresencePulse 1.8s infinite}.code-pay-layout{display:grid;grid-template-columns:1fr 1fr;gap:14px}.code-display,.code-control,.member-code-form,.code-pay-success{padding:22px;border:1px solid #d9e4ed;border-radius:18px;background:#fff;box-shadow:0 8px 25px rgba(15,35,52,.06)}.code-display{text-align:center;background:radial-gradient(circle at 50% 30%,rgba(45,212,191,.13),transparent 35%),#fff}.code-display>span{color:#0f9f97;font-size:8px;font-weight:950;letter-spacing:.17em}.code-display>strong{display:block;margin:15px;font:950 72px/1 ui-monospace,SFMono-Regular,monospace;letter-spacing:.18em;color:#102b40;text-indent:.18em}.code-display>small{color:#8090a0}.code-display>p{color:#64748b;font-size:9px}.code-dots{display:flex;justify-content:center;gap:8px;margin:14px}.code-dots i{width:8px;height:8px;border-radius:50%;background:#2dd4bf;box-shadow:0 0 9px #2dd4bf}.code-control form{display:grid;gap:11px;margin-top:18px}.code-control label{display:grid;gap:6px;font-size:9px;font-weight:850}.code-control>small{display:block;margin-top:10px;color:#8a98a5}.member-code-pay{max-width:600px;margin:0 auto}.member-code-form form{display:grid;gap:13px}.member-code-form label{display:grid;gap:7px;color:#536575;font-size:9px;font-weight:900}.member-code-form input{height:50px}.three-code-input input{height:82px!important;font:950 46px/1 ui-monospace,SFMono-Regular,monospace!important;letter-spacing:.3em;text-align:center;text-indent:.3em}.member-code-form input[name=amount]{font-size:23px!important;font-weight:900;text-align:center}.member-code-balance{display:flex;justify-content:space-between;margin-bottom:18px;padding:13px;border-radius:13px;background:#eef7f5}.code-confirm{display:grid;grid-template-columns:30px 1fr;gap:9px;align-items:center;padding:11px;border-radius:12px;background:#fff8e8;color:#805b10}.code-confirm i{display:grid;place-items:center;width:28px;height:28px;border-radius:50%;background:#f59e0b;color:#fff;font-style:normal}.code-confirm p{margin:0;font-size:8px}.code-pay-success{text-align:center}.code-pay-success>i{display:grid;place-items:center;width:62px;height:62px;margin:auto;border-radius:50%;background:#10b981;color:#fff;font-size:30px;font-style:normal}.code-pay-success>span,.code-pay-success h3,.code-pay-success b,.code-pay-success small,.code-pay-success a{display:block;margin-top:9px}.code-pay-success h3{font-size:32px}.persistent-payment-notice{position:fixed;right:20px;top:20px;z-index:99999;display:grid;grid-template-columns:52px minmax(220px,1fr) auto;gap:12px;align-items:center;padding:15px;border:1px solid #8ed9c8;border-radius:17px;background:#f4fffb;box-shadow:0 25px 70px rgba(5,50,40,.25);animation:noticeIn .3s ease}.persistent-payment-notice>i{display:grid;place-items:center;width:50px;height:50px;border-radius:15px;background:#10b981;color:#fff;font-size:25px;font-style:normal}.persistent-payment-notice span,.persistent-payment-notice b,.persistent-payment-notice small{display:block}.persistent-payment-notice span{color:#087e6a;font-size:7px;font-weight:950;letter-spacing:.16em}.persistent-payment-notice b{margin:4px 0;font-size:19px}.persistent-payment-notice small{color:#64748b}.persistent-payment-notice button{min-height:34px!important}.ios-process-btn{width:100%;margin-top:8px}.ios-file-name{padding:7px;color:#64748b;font-size:8px;text-align:center}.flash{animation:none!important;transition:none!important}.flash:not(:empty){min-height:48px!important;opacity:1!important;visibility:visible!important}@keyframes noticeIn{from{opacity:0;transform:translateY(-16px)}to{opacity:1;transform:none}}
+@media(max-width:768px){.code-pay-suite,.member-code-pay{padding:0 12px}.code-pay-hero,.member-code-pay>header{align-items:flex-start;flex-direction:column;padding:20px;border-radius:22px}.code-pay-layout{grid-template-columns:1fr}.code-display>strong{font-size:58px}.persistent-payment-notice{left:12px;right:12px;top:82px;grid-template-columns:44px minmax(0,1fr) auto}.persistent-payment-notice>i{width:42px;height:42px}.persistent-payment-notice button{font-size:0;width:34px!important}.persistent-payment-notice button:after{content:'×';font-size:18px}.member-code-pay{margin:0}}
+"""
+
+@app.route('/cashier/payment-code',methods=['GET','POST'])
+@login_required
+@role_required('admin','kasir','branch_admin','branch_cashier')
+def cashier_payment_code():
+    ensure_payment_code_schema(); bid=get_branch_id()
+    if not bid:
+        flash('Terminal belum memiliki cabang aktif.','error'); return redirect(url_for('dashboard'))
+    row=get_branch_payment_code(bid)
+    if request.method=='POST':
+        password=request.form.get('password') or ''; user=current_user()
+        if not verify_password(user['password_hash'],password):
+            flash('Password akun terminal tidak valid. Kode tidak diubah.','error')
+        else:
+            conn=get_conn()
+            try:
+                conn.execute('BEGIN IMMEDIATE'); current=conn.execute('SELECT * FROM branch_payment_codes WHERE branch_id=?',[bid]).fetchone()
+                last=current['regenerated_at'] or current['generated_at']
+                if last:
+                    elapsed=(datetime.now()-datetime.strptime(last,'%Y-%m-%d %H:%M:%S')).total_seconds()
+                    if elapsed<300: raise ValueError(f'Kode baru dapat dibuat lagi dalam {int((300-elapsed+59)//60)} menit.')
+                new_code=next_free_branch_code(conn,bid)
+                conn.execute('''UPDATE branch_payment_codes SET previous_code=code,code=?,version_no=COALESCE(version_no,1)+1,regenerated_at=?,generated_by=?,is_active=1 WHERE branch_id=?''',[new_code,now_str(),user['id'],bid]); conn.commit()
+                log_action('REGENERATE_BRANCH_PAYMENT_CODE','branch_payment_codes',bid,f'{current["code"]}->{new_code}')
+                flash('Kode pembayaran cabang berhasil diperbarui. Kode lama langsung tidak berlaku.','success')
+            except Exception as e: conn.rollback(); flash(str(e),'error')
+            finally: conn.close()
+        return redirect(url_for('cashier_payment_code'))
+    row=get_branch_payment_code(bid); recent=q_all('''SELECT p.*,m.name member_name FROM branch_code_payments p LEFT JOIN members m ON m.id=p.member_id WHERE p.branch_id=? ORDER BY p.id DESC LIMIT 25''',[bid])
+    body=render_template_string(r'''<div class="code-pay-suite"><header class="code-pay-hero"><div><span>BRANCH SHORT CODE PAYMENT</span><h2>Kode Bayar {{branch}}</h2><p>Anggota cukup memasukkan kode cabang 3 digit dan nominal. Tidak membutuhkan kamera atau QR scanner.</p></div><b><i></i> AKTIF</b></header><section class="code-pay-layout"><article class="code-display"><span>KODE CABANG</span><strong>{{row.code}}</strong><small>Versi {{row.version_no}} · Dibuat {{row.regenerated_at or row.generated_at}}</small><div class="code-dots"><i></i><i></i><i></i></div><p>Tempel kode ini di meja kasir. Kode tidak berubah sampai kasir melakukan regenerasi.</p></article><article class="code-control"><h3>Regenerasi kode</h3><p>Gunakan hanya jika kode bocor atau perlu diganti. Kode lama langsung tidak berlaku.</p><form method="post"><label>Password akun terminal<input type="password" name="password" required autocomplete="current-password"></label><button class="btn-danger" data-confirm="Ganti kode cabang sekarang? Kode lama akan langsung tidak berlaku.">Generate Kode Baru</button></form><small>Penggantian dibatasi satu kali setiap 5 menit dan direkam di audit log.</small></article></section><section class="branch-qr-history"><header><div><span>REAL-TIME CODE PAYMENTS</span><h3>Pembayaran Terbaru</h3></div></header><div id="codePaymentStream">{% for r in recent %}<article><i class="paid"></i><div><b>{{r.payment_no}}</b><small>{{r.member_name}} · {{r.created_at}}</small></div><strong>{{rupiah(r.amount)}}</strong><span class="badge badge-success">PAID</span></article>{% else %}<div class="ai-empty">Belum ada pembayaran kode.</div>{% endfor %}</div></section></div><script>(function(){var last={{recent[0].id if recent else 0}};function poll(){fetch('{{url_for("api_cashier_code_payments")}}?after='+last,{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){if(!d.ok||!d.items.length)return;last=d.items[d.items.length-1].id;var x=d.items[d.items.length-1];showPersistentPaymentNotice(x);setTimeout(function(){location.reload()},3500)}).catch(function(){})}window.showPersistentPaymentNotice=function(x){var old=document.getElementById('persistentPaymentNotice');if(old)old.remove();var el=document.createElement('div');el.id='persistentPaymentNotice';el.className='persistent-payment-notice';el.innerHTML='<i>✓</i><div><span>PEMBAYARAN MASUK</span><b>'+x.amount_text+'</b><small>'+x.member_name+' · '+x.payment_no+'</small></div><button type="button">Tutup</button>';document.body.appendChild(el);el.querySelector('button').onclick=function(){el.remove()}};poll();setInterval(poll,2000)})();</script>''',row=row,branch=get_branch_name(bid),recent=recent,rupiah=rupiah)
+    return render_page('Kode Bayar Cabang',cashier_operator_banner()+body)
+
+@app.route('/wallet/pay-code',methods=['GET','POST'])
+@login_required
+@role_required('user')
+def member_pay_code():
+    ensure_payment_code_schema(); member=current_wallet_member()
+    if not member:
+        flash('Akun anggota belum terhubung ke wallet.','error'); return redirect(url_for('dashboard'))
+    balance=wallet_balance(member['id']); result=None
+    if request.method=='POST':
+        code=(request.form.get('code') or '').strip(); amount=parse_float(request.form.get('amount'),0); note=(request.form.get('note') or '').strip()[:160]
+        if not (len(code)==3 and code.isdigit() and 100<=int(code)<=999):
+            flash('Kode cabang harus tepat 3 digit dari 100 sampai 999.','error')
+        elif amount<1000:
+            flash('Nominal minimal Rp1.000.','error')
+        else:
+            conn=get_conn()
+            try:
+                conn.execute('BEGIN IMMEDIATE'); profile=conn.execute('''SELECT pc.*,b.name branch_name FROM branch_payment_codes pc JOIN koperasi_branches b ON b.id=pc.branch_id WHERE pc.code=? AND pc.is_active=1 AND b.is_active=1''',[code]).fetchone()
+                if not profile: raise ValueError('Kode cabang tidak ditemukan atau sudah tidak berlaku.')
+                # Idempotency gives protection against double tap / network retry.
+                idem=(request.form.get('idempotency_key') or '').strip()
+                existing=conn.execute('SELECT * FROM branch_code_payments WHERE note LIKE ? AND member_id=?',[f'%IDEM:{idem}%',member['id']]).fetchone() if idem else None
+                if existing: raise ValueError('Permintaan pembayaran ini sudah pernah diproses.')
+                saldo=conn.execute('SELECT COALESCE(SUM(CASE WHEN tipe="MASUK" THEN nominal ELSE -nominal END),0) saldo FROM saldo_history WHERE member_id=?',[member['id']]).fetchone()['saldo'] or 0
+                if float(saldo)<amount: raise ValueError(f'Saldo tidak cukup. Saldo tersedia {rupiah(saldo)}.')
+                after=float(saldo)-amount; payment_no='K3D-'+datetime.now().strftime('%Y%m%d%H%M%S')+'-'+os.urandom(3).hex().upper(); audit_note=(note+' ' if note else '')+f'IDEM:{idem}'
+                cur=conn.execute('''INSERT INTO branch_code_payments(payment_no,code,branch_id,member_id,amount,status,wallet_before,wallet_after,created_at,ip_address,user_agent,note) VALUES(?,?,?,?,?,'PAID',?,?,?,?,?,?)''',[payment_no,code,profile['branch_id'],member['id'],amount,saldo,after,now_str(),request.remote_addr or '',(request.headers.get('User-Agent') or '')[:250],audit_note])
+                pid=cur.lastrowid
+                conn.execute('INSERT INTO saldo_history(member_id,tipe,nominal,saldo_sebelum,saldo_setelah,keterangan,reference_id,created_by) VALUES(?,"KELUAR",?,?,?,?,?,?)',[member['id'],amount,saldo,after,f'Kode Bayar {code} - {profile["branch_name"]}',pid,session.get('user_id')])
+                conn.commit(); result={'payment_no':payment_no,'branch_name':profile['branch_name'],'amount':amount,'after':after,'id':pid}
+                # Persistent inbox notification, not a transient flash.
+                durable_notify(session.get('user_id'),'Pembayaran Berhasil',f'{rupiah(amount)} dibayar ke {profile["branch_name"]}. Ref {payment_no}','SUCCESS','CODE_PAYMENT',pid)
+                admins=q_all("SELECT id FROM users WHERE active=1 AND (role='admin' OR (role='branch_admin' AND branch_id=?))",[profile['branch_id']])
+                for a in admins: durable_notify(a['id'],'Pembayaran Kode Masuk',f'{member["name"]} membayar {rupiah(amount)} ke {profile["branch_name"]}.','PAYMENT','CODE_PAYMENT',pid)
+                log_action('THREE_DIGIT_PAYMENT','branch_code_payments',pid,f'branch={profile["branch_id"]}; member={member["id"]}; amount={amount}')
+            except Exception as e: conn.rollback(); flash(str(e),'error')
+            finally: conn.close()
+            if result: return redirect(url_for('member_pay_code',success=result['id']))
+        return redirect(url_for('member_pay_code'))
+    success=request.args.get('success',type=int); paid=q_one('''SELECT p.*,b.name branch_name FROM branch_code_payments p JOIN koperasi_branches b ON b.id=p.branch_id WHERE p.id=? AND p.member_id=?''',[success,member['id']]) if success else None
+    idem=os.urandom(12).hex()
+    body=render_template_string(r'''<div class="member-code-pay"><header><span>NO CAMERA PAYMENT</span><h2>Bayar dengan Kode</h2><p>Masukkan kode 3 digit yang terlihat di meja kasir dan nominal pembayaran.</p></header>{% if paid %}<section class="code-pay-success"><i>✓</i><span>PEMBAYARAN BERHASIL</span><h3>{{rupiah(paid.amount)}}</h3><b>{{paid.branch_name}}</b><small>{{paid.payment_no}} · {{paid.created_at}}</small><a href="{{url_for('wallet')}}">Lihat Mutasi Wallet</a></section>{% else %}<section class="member-code-form"><div class="member-code-balance"><span>Saldo tersedia</span><b>{{rupiah(balance)}}</b></div><form method="post"><input type="hidden" name="idempotency_key" value="{{idem}}"><label>Kode cabang 3 digit<div class="three-code-input"><input name="code" type="text" inputmode="numeric" pattern="[0-9]{3}" minlength="3" maxlength="3" placeholder="123" autocomplete="one-time-code" required></div></label><label>Nominal pembayaran<input name="amount" type="number" min="1000" step="1000" placeholder="Rp 20.000" required></label><label>Catatan <small>opsional</small><input name="note" maxlength="160" placeholder="Contoh: belanja koperasi"></label><div class="code-confirm"><i>!</i><p>Periksa kode cabang dan nominal sebelum membayar. Pembayaran wallet tidak dapat dibatalkan oleh pengguna.</p></div><button class="btn-success" data-confirm="Bayar sesuai kode cabang dan nominal yang dimasukkan?">Konfirmasi Pembayaran</button></form></section>{% endif %}</div>''',paid=paid,balance=balance,idem=idem,rupiah=rupiah)
+    return render_page('Bayar Kode 3 Digit',body)
+
+@app.route('/api/cashier/code-payments')
+@login_required
+@role_required('admin','kasir','branch_admin','branch_cashier')
+def api_cashier_code_payments():
+    bid=get_branch_id(); after=request.args.get('after',0,type=int)
+    rows=q_all('''SELECT p.id,p.payment_no,p.amount,p.created_at,m.name member_name FROM branch_code_payments p JOIN members m ON m.id=p.member_id WHERE p.branch_id=? AND p.id>? ORDER BY p.id LIMIT 20''',[bid,after])
+    return jsonify({'ok':True,'items':[{'id':r['id'],'payment_no':r['payment_no'],'amount':r['amount'],'amount_text':rupiah(r['amount']),'member_name':r['member_name'],'created_at':r['created_at']} for r in rows]})
+
+@app.route('/api/durable-notifications')
+@login_required
+def api_durable_notifications():
+    ensure_payment_code_schema(); rows=q_all('SELECT * FROM durable_notifications WHERE user_id=? AND dismissed_at IS NULL ORDER BY id DESC LIMIT 30',[session.get('user_id')])
+    return jsonify({'ok':True,'unread':sum(1 for r in rows if not r['read_at']),'items':[dict(r) for r in rows]})
+
+@app.route('/api/durable-notifications/<int:notif_id>/read',methods=['POST'])
+@login_required
+def durable_notification_read(notif_id):
+    exec_sql('UPDATE durable_notifications SET read_at=COALESCE(read_at,?) WHERE id=? AND user_id=?',[now_str(),notif_id,session.get('user_id')]); return jsonify({'ok':True})
+
 @app.route('/wallet/scan-qr',methods=['GET','POST'])
 @login_required
 @role_required('user')
@@ -6478,7 +6640,7 @@ def wallet_qr_scanner():
                 return redirect(target)
         flash('QR tidak terbaca atau bukan QR pembayaran koperasi. Foto ulang lebih dekat dan terang.','error')
         return redirect(url_for('wallet_qr_scanner'))
-    body=render_template_string(r'''<div class="wallet-scanner"><header class="scanner-hero"><div class="scanner-grid"></div><span>KOPERASI WALLET CAMERA</span><h2>Scan untuk Bayar</h2><p>Arahkan kamera ke QR statis cabang. Nominal aktif dari kasir akan muncul otomatis setelah QR terbaca.</p></header><section class="scanner-stage"><video id="qrCamera" playsinline muted></video><div class="scanner-overlay"><i></i><i></i><i></i><i></i><span></span></div><div class="scanner-beam"></div><div id="scannerStatus" class="scanner-status"><i></i><span>Menyiapkan kamera...</span></div></section><section class="scanner-tools"><form method="post" enctype="multipart/form-data" class="ios-qr-capture"><label for="iosQrPhoto"><i>⌗</i><b>Scan dengan Kamera iPhone</b><small>Ambil foto QR lalu diproses otomatis</small></label><input id="iosQrPhoto" type="file" name="qr_photo" accept="image/*" capture="environment" required onchange="this.form.submit()"></form><button type="button" id="startScan" class="btn-success">Kamera Live</button><button type="button" id="switchCamera" class="btn-ghost">Ganti Kamera</button><label class="scanner-manual">Atau tempel tautan QR<input id="manualQrUrl" type="url" placeholder="http://server:5000/pay/branch/..."><button type="button" id="openManual">Buka Pembayaran</button></label><p>Kamera browser membutuhkan HTTPS, kecuali saat memakai localhost. Jika kamera ditolak, izinkan akses kamera pada pengaturan browser.</p></section></div><script>(function(){var video=document.getElementById('qrCamera'),status=document.getElementById('scannerStatus'),stream=null,facing='environment',running=false,detector=null;function setStatus(t,ok){status.querySelector('span').textContent=t;status.classList.toggle('ok',!!ok)}function valid(url){try{var u=new URL(url,location.origin);return u.origin===location.origin&&u.pathname.indexOf('/pay/branch/')===0}catch(e){return false}}function go(url){if(!valid(url)){setStatus('QR bukan QR pembayaran koperasi',false);return}setStatus('QR terbaca. Membuka pembayaran...',true);stop();location.href=new URL(url,location.origin).href}async function scanLoop(){if(!running||!detector)return;try{var codes=await detector.detect(video);if(codes&&codes.length){go(codes[0].rawValue);return}}catch(e){}requestAnimationFrame(scanLoop)}async function start(){stop();setStatus('Meminta izin kamera...',false);try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:facing}},audio:false});video.srcObject=stream;await video.play();running=true;if('BarcodeDetector' in window){detector=new BarcodeDetector({formats:['qr_code']});setStatus('Kamera aktif. Arahkan ke QR cabang.',true);scanLoop()}else{setStatus('Browser belum mendukung pembaca QR otomatis. Gunakan Chrome terbaru atau tempel tautan QR.',false)}}catch(e){setStatus('Kamera tidak dapat dibuka: '+(e.message||e.name),false)}}function stop(){running=false;if(stream){stream.getTracks().forEach(function(t){t.stop()});stream=null}}document.getElementById('startScan').onclick=start;document.getElementById('switchCamera').onclick=function(){facing=facing==='environment'?'user':'environment';start()};document.getElementById('openManual').onclick=function(){go(document.getElementById('manualQrUrl').value)};window.addEventListener('pagehide',stop);if(!('BarcodeDetector' in window)){setStatus('Safari iPhone: gunakan tombol Scan dengan Kamera iPhone di bawah.',false)}else if(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia){start()}else setStatus('Perangkat tidak mendukung akses kamera browser.',false)})();</script>''')
+    body=render_template_string(r'''<div class="wallet-scanner"><header class="scanner-hero"><div class="scanner-grid"></div><span>KOPERASI WALLET CAMERA</span><h2>Scan untuk Bayar</h2><p>Arahkan kamera ke QR statis cabang. Nominal aktif dari kasir akan muncul otomatis setelah QR terbaca.</p></header><section class="scanner-stage"><video id="qrCamera" playsinline muted></video><div class="scanner-overlay"><i></i><i></i><i></i><i></i><span></span></div><div class="scanner-beam"></div><div id="scannerStatus" class="scanner-status"><i></i><span>Menyiapkan kamera...</span></div></section><section class="scanner-tools"><form method="post" enctype="multipart/form-data" class="ios-qr-capture"><label for="iosQrPhoto"><i>⌗</i><b>Scan dengan Kamera iPhone</b><small>Ambil foto QR lalu diproses otomatis</small></label><input id="iosQrPhoto" type="file" name="qr_photo" accept="image/*" capture="environment" required><button type="submit" class="btn-success ios-process-btn">Proses Foto QR</button><div class="ios-file-name" id="iosFileName">Belum ada foto dipilih</div></form><button type="button" id="startScan" class="btn-success">Kamera Live</button><button type="button" id="switchCamera" class="btn-ghost">Ganti Kamera</button><label class="scanner-manual">Atau tempel tautan QR<input id="manualQrUrl" type="url" placeholder="http://server:5000/pay/branch/..."><button type="button" id="openManual">Buka Pembayaran</button></label><p>Kamera browser membutuhkan HTTPS, kecuali saat memakai localhost. Jika kamera ditolak, izinkan akses kamera pada pengaturan browser.</p></section></div><script>(function(){var video=document.getElementById('qrCamera'),status=document.getElementById('scannerStatus'),stream=null,facing='environment',running=false,detector=null;function setStatus(t,ok){status.querySelector('span').textContent=t;status.classList.toggle('ok',!!ok)}function valid(url){try{var u=new URL(url,location.origin);return u.origin===location.origin&&u.pathname.indexOf('/pay/branch/')===0}catch(e){return false}}function go(url){if(!valid(url)){setStatus('QR bukan QR pembayaran koperasi',false);return}setStatus('QR terbaca. Membuka pembayaran...',true);stop();location.href=new URL(url,location.origin).href}async function scanLoop(){if(!running||!detector)return;try{var codes=await detector.detect(video);if(codes&&codes.length){go(codes[0].rawValue);return}}catch(e){}requestAnimationFrame(scanLoop)}async function start(){stop();setStatus('Meminta izin kamera...',false);try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:facing}},audio:false});video.srcObject=stream;await video.play();running=true;if('BarcodeDetector' in window){detector=new BarcodeDetector({formats:['qr_code']});setStatus('Kamera aktif. Arahkan ke QR cabang.',true);scanLoop()}else{setStatus('Browser belum mendukung pembaca QR otomatis. Gunakan Chrome terbaru atau tempel tautan QR.',false)}}catch(e){setStatus('Kamera tidak dapat dibuka: '+(e.message||e.name),false)}}function stop(){running=false;if(stream){stream.getTracks().forEach(function(t){t.stop()});stream=null}}document.getElementById('startScan').onclick=start;document.getElementById('switchCamera').onclick=function(){facing=facing==='environment'?'user':'environment';start()};document.getElementById('openManual').onclick=function(){go(document.getElementById('manualQrUrl').value)};var fp=document.getElementById('iosQrPhoto');if(fp){fp.addEventListener('change',function(){document.getElementById('iosFileName').textContent=this.files&&this.files[0]?this.files[0].name:'Belum ada foto dipilih'})}window.addEventListener('pagehide',stop);if(!('BarcodeDetector' in window)){setStatus('Safari iPhone: gunakan tombol Scan dengan Kamera iPhone di bawah.',false)}else if(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia){start()}else setStatus('Perangkat tidak mendukung akses kamera browser.',false)})();</script>''')
     return render_page('Scan QR Pembayaran',body)
 
 
