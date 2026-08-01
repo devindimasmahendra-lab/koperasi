@@ -5299,9 +5299,25 @@ def member_hub():
 @app.route('/member/dashboard', methods=['GET'])
 @login_required
 def member_dashboard():
-    user=current_user(); member=q_one('SELECT * FROM members WHERE member_code=?',[f'EMP-{user["employee_number"]}'])
+    # Tabel fitur pembayaran tidak selalu sudah terbentuk pada database Render lama/baru.
+    # Pastikan tabel tersedia sebelum query aktivitas anggota dijalankan.
+    ensure_branch_qr_payment_schema()
+    ensure_payment_code_schema()
+
+    user = current_user()
+    if not user:
+        session.clear()
+        return redirect(url_for('login'))
+
+    employee_number = str(user['employee_number'] or '').strip()
+    if not employee_number:
+        flash('Nomor karyawan akun belum tersedia. Hubungi admin koperasi.', 'warning')
+        return redirect(url_for('settings'))
+
+    member = q_one('SELECT * FROM members WHERE member_code=?', [f'EMP-{employee_number}'])
     if not member:
-        flash('Profil anggota belum terhubung. Hubungi pengelola koperasi.','warning'); return redirect(url_for('dashboard'))
+        flash('Profil anggota belum terhubung. Hubungi pengelola koperasi.', 'warning')
+        return redirect(url_for('settings'))
     mid=member['id']; saldo_wallet=q_one('SELECT COALESCE(SUM(CASE WHEN tipe="MASUK" THEN nominal ELSE -nominal END),0) saldo FROM saldo_history WHERE member_id=?',[mid])['saldo'] or 0
     total_simpanan=q_one("SELECT COALESCE(SUM(CASE WHEN direction='Masuk' THEN amount ELSE -amount END),0) x FROM savings_transactions WHERE member_id=?",[mid])['x'] or 0
     total_belanja=q_one('SELECT COALESCE(SUM(total),0) x FROM sales WHERE member_id=? AND status="Posted"',[mid])['x'] or 0
