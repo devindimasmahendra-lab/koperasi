@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect, url_for, render_template_string, session, flash, send_file, jsonify
+from flask import Flask, request, redirect, url_for, render_template_string, session, flash, send_file, jsonify, has_request_context
 import sqlite3
 import pandas as pd
 from datetime import datetime, date, timedelta
@@ -399,6 +399,15 @@ ALL_MENU_ITEMS = {
     'member_expense_history': 'Riwayat Transaksi',
     'shu_member': 'SHU Saya',
     'member_hub': 'Ruang Anggota',
+    # QR payment and cashier operations
+    'cashier_qr_payment': 'QR Payment Statis Cabang',
+    'cashier_qr_dynamic': 'Generate QR Nominal Manual',
+    'branch_qr_payment_history': 'Riwayat QR Payment',
+    'wallet_qr_scanner': 'Scan QR Pembayaran',
+    'cashier_operator_sessions': 'Rekap Sesi Operator Kasir',
+    'admin_cashier_control': 'Control Center Kasir',
+    'admin_cashier_operators': 'Akun Operator Kasir',
+    'admin_cashier_rotation_log': 'Log Rotasi Kasir',
 }
 
 
@@ -442,6 +451,13 @@ MENU_ROLE_ACCESS = {
     'member_dashboard': {'user'}, 'wallet': {'user'}, 'member_purchases': {'user'},
     'member_digital_card': {'user'}, 'member_card_pdf': {'user'}, 'apply_loan': {'user'},
     'my_payments': {'user'}, 'member_expense_history': {'user'}, 'shu_member': {'user'}, 'member_hub': {'user'},
+    'admin_cashier_control': {'admin'}, 'admin_cashier_operators': {'admin'},
+    'cashier_operator_sessions': {'admin','branch_admin','manager'},
+    'admin_cashier_rotation_log': {'admin'},
+    'cashier_qr_payment': {'admin','kasir','branch_admin','branch_cashier'},
+    'cashier_qr_dynamic': {'admin','kasir','branch_admin','branch_cashier'},
+    'branch_qr_payment_history': {'admin','branch_admin','manager'},
+    'wallet_qr_scanner': {'user'},
 }
 
 def is_menu_allowed_for_role(menu_id, role):
@@ -3533,11 +3549,15 @@ def mobile_app_menu(user, active_url=''):
         '/member/purchases': 'member_purchases', '/member/digital-card': 'member_digital_card',
         '/member/card-pdf': 'member_card_pdf', '/loans/apply': 'apply_loan',
         '/loans/my-payments': 'my_payments', '/member/expense-history': 'member_expense_history',
-        '/shu/member': 'shu_member'
+        '/shu/member': 'shu_member',
+        '/manager/dashboard':'manager_dashboard','/manager/finance':'manager_finance',
+        '/manager/inventory':'manager_inventory','/manager/flow':'manager_flow','/cashier/operator-sessions':'cashier_operator_sessions','/admin/cashier-control':'admin_cashier_control','/admin/cashier-operators':'admin_cashier_operators','/admin/cashier-rotation-log':'admin_cashier_rotation_log','/cashier/qr-payment':'cashier_qr_payment','/cashier/qr-dynamic':'cashier_qr_dynamic','/cashier/qr-payment/history':'branch_qr_payment_history','/wallet/scan-qr':'wallet_qr_scanner'
     }
     def add(icon, label, url):
         menu_id = mobile_menu_ids.get(url)
-        if not menu_id or not is_menu_visible(menu_id, role):
+        if not menu_id:
+            return
+        if role != 'manager' and not is_menu_visible(menu_id, role):
             return
         active = ' style="background:var(--primary-light);border-color:var(--primary);"' if url == active_url else ''
         items.append((icon, label, url, active))
@@ -3545,8 +3565,9 @@ def mobile_app_menu(user, active_url=''):
     if role == 'user':
         add('⌂', 'Beranda', '/member/dashboard')
         add('◫', 'Ruang Anggota', '/member/hub')
-        add('◎', 'Dompet', '/wallet')
-        add('＋', 'Topup Wallet', '/wallet')
+        add('◎','Dompet','/wallet')
+        add('⌗','Scan QR Bayar','/wallet/scan-qr')
+        add('＋','Topup Wallet','/wallet')
         add('◇', 'Kredit Saya', '/loans')
         add('↗', 'Ajukan Kredit', '/loans/apply')
         add('◷', 'Pembayaran', '/loans/my-payments')
@@ -3559,8 +3580,10 @@ def mobile_app_menu(user, active_url=''):
     elif role in ('kasir', 'branch_cashier'):
         add('⌂', 'Dashboard', '/')
         add('⚡', 'Kasir Cepat', '/quick-cashier')
-        add('▣', 'Kasir', '/cashier')
-        add('％', 'Kasir Diskon', '/cashier-with-discount')
+        add('▣','Kasir','/cashier')
+        add('▦','QR Payment Statis','/cashier/qr-payment')
+        add('⌗','Generate QR Nominal','/cashier/qr-dynamic')
+        add('％','Kasir Diskon', '/cashier-with-discount')
         add('◷', 'Riwayat Penjualan', '/sales-history')
         add('▤', 'Laporan Harian', '/daily-report')
         add('□', 'Master Barang', '/products')
@@ -3582,15 +3605,16 @@ def mobile_app_menu(user, active_url=''):
         add('▧', 'Akuntansi', '/accounting')
         add('⚙', 'Pengaturan', '/settings')
     elif role == 'manager':
-        add('⌂','Executive Monitor','/manager/dashboard')
-        add('⌖','Peta Semua Cabang','/maps')
+        add('⌂','Beranda Manager','/manager/dashboard')
+        add('▤','Keuangan Cabang','/manager/finance')
+        add('□','Stok Semua Cabang','/manager/inventory')
+        add('⌖','Peta Cabang','/maps')
+        add('⇄','Flow Data','/manager/flow')
         add('▥','Analitik Laporan','/reports')
         add('◷','Riwayat Penjualan','/sales-history')
-        add('□','Stok Cabang','/manager/inventory')
+        add('♙','Sesi Operator Kasir','/cashier/operator-sessions')
         add('≡','Ledger Stok','/stock-history')
-        add('▤','Keuangan Cabang','/manager/finance')
-        add('⇄','Flow Data','/manager/flow')
-        add('⚙','Pengaturan','/settings')
+        add('⚙','Pengaturan Akun','/settings')
     elif role == 'supervisor':
         add('⌂', 'Dashboard', '/')
         add('▥', 'Laporan', '/reports')
@@ -3603,8 +3627,10 @@ def mobile_app_menu(user, active_url=''):
     elif role == 'branch_admin':
         add('⌂', 'Dashboard', '/')
         add('⚡', 'Kasir Cepat', '/quick-cashier')
-        add('▣', 'Kasir', '/cashier')
-        add('％', 'Kasir Diskon', '/cashier-with-discount')
+        add('▣','Kasir','/cashier')
+        add('▦','QR Payment Statis','/cashier/qr-payment')
+        add('⌗','Generate QR Nominal','/cashier/qr-dynamic')
+        add('％','Kasir Diskon', '/cashier-with-discount')
         add('◷', 'Riwayat Penjualan', '/sales-history')
         add('↶', 'Retur Penjualan', '/sales-returns')
         add('▤', 'Laporan Harian', '/daily-report')
@@ -3615,7 +3641,8 @@ def mobile_app_menu(user, active_url=''):
         add('✓', 'Stock Opname', '/stock-opname')
         add('⌖', 'Peta Stok', '/maps')
         add('◈', 'Kelola Cabang', '/admin/branches')
-        add('⌛', 'Verifikasi QC', '/quick-cashier/queue')
+        add('⌛','Verifikasi QC','/quick-cashier/queue')
+        add('♙','Sesi Operator Kasir','/cashier/operator-sessions')
         add('◉', 'Simpanan', '/savings')
         add('◇', 'Pinjaman', '/loans')
         add('✓', 'Verifikasi Angsuran', '/loans/verify-payments')
@@ -3631,7 +3658,9 @@ def mobile_app_menu(user, active_url=''):
     else:  # admin
         add('⌂', 'Command Center', '/admin/command-center')
         add('⚡', 'Kasir Cepat', '/quick-cashier')
-        add('▣', 'Kasir', '/cashier')
+        add('▣','Kasir','/cashier')
+        add('▦','QR Payment Statis','/cashier/qr-payment')
+        add('⌗','Generate QR Nominal','/cashier/qr-dynamic')
         add('％', 'Kasir Diskon', '/cashier-with-discount')
         add('◷', 'Riwayat Penjualan', '/sales-history')
         add('↶', 'Retur Penjualan', '/sales-returns')
@@ -3652,7 +3681,11 @@ def mobile_app_menu(user, active_url=''):
         add('⌖', 'Peta Stok', '/maps')
         add('▰', 'Kategori', '/categories')
         add('◈', 'Kelola Cabang', '/admin/branches')
-        add('⌛', 'Verifikasi QC', '/quick-cashier/queue')
+        add('⌛','Verifikasi QC','/quick-cashier/queue')
+        add('◉','Kontrol Kasir','/admin/cashier-control')
+        add('♙','Akun Operator','/admin/cashier-operators')
+        add('⇄','Log Rotasi Kasir','/admin/cashier-rotation-log')
+        add('▤','Rekap Sesi Kasir','/cashier/operator-sessions')
         add('◭', 'Supplier', '/suppliers')
         add('▣', 'Pembelian', '/purchase-orders')
         add('▤', 'Hutang Supplier', '/supplier-payments')
@@ -3703,6 +3736,7 @@ def mobile_bottom_navigation(user, active_path=''):
         'branch_cashier': [('⌂','Beranda',home), ('⚡','Kasir','/quick-cashier'), ('⇄','Stok','/stock-movements')],
         'bendahara': [('⌂','Beranda',home), ('◇','Pinjaman','/loans'), ('✓','Verifikasi','/loans/verify-payments')],
         'supervisor': [('⌂','Beranda',home), ('▥','Laporan','/reports'), ('⌕','Audit','/audit')],
+        'manager': [('⌂','Beranda','/manager/dashboard'), ('▤','Keuangan','/manager/finance'), ('⌖','Peta','/maps')],
         'branch_admin': [('⌂','Beranda',home), ('⚡','Kasir','/quick-cashier'), ('✓','Opname','/stock-opname')],
         'supplier': [('⌂','Portal',home), ('▤','Pesanan','/purchase-orders/history'), ('⚙','Akun','/settings')],
     }
@@ -3711,11 +3745,12 @@ def mobile_bottom_navigation(user, active_path=''):
         '/member/dashboard':'member_dashboard','/wallet':'wallet','/loans':'loans','/admin/command-center':'admin_command_center',
         '/quick-cashier':'quick_cashier','/admin/topup-approval':'topup_approval','/sales-history':'sales_history',
         '/stock-movements':'stock_movements','/loans/verify-payments':'verify_loan_payments','/reports':'reports','/audit':'audit',
-        '/stock-opname':'stock_opname','/supplier/portal':'supplier_portal','/purchase-orders/history':'purchase_order_history','/settings':'settings','/':'dashboard'
+        '/stock-opname':'stock_opname','/supplier/portal':'supplier_portal','/purchase-orders/history':'purchase_order_history','/settings':'settings','/':'dashboard',
+        '/manager/dashboard':'manager_dashboard','/manager/finance':'manager_finance','/manager/inventory':'manager_inventory','/manager/flow':'manager_flow','/maps':'maps'
     }
     for icon, label, url in by_role.get(role, by_role['admin']):
         mid = path_map.get(url)
-        if mid and is_menu_visible(mid, role):
+        if mid and (role == 'manager' or is_menu_visible(mid, role)):
             current = active_path.rstrip('/') or '/'
             target = url.rstrip('/') or '/'
             active = current == target or (target != '/' and current.startswith(target + '/'))
@@ -3787,6 +3822,8 @@ def render_page(title, body, **ctx):
             nav_html += _sidebar_section('Transaksi', '🛒', [
                 ('quick_cashier', url_for('quick_cashier'), '⚡', 'Kasir Cepat'),
                 ('cashier', url_for('cashier'), '🧾', 'Kasir'),
+                ('cashier_qr_payment',url_for('cashier_qr_payment'),'▦','QR Payment Statis'),
+                ('cashier_qr_dynamic',url_for('cashier_qr_dynamic'),'⌗','Generate QR Nominal'),
                 ('sales_history', url_for('sales_history'), '📊', 'Riwayat Penjualan'),
             ])
             nav_html += _sidebar_section('Barang', '📦', [
@@ -3852,8 +3889,15 @@ def render_page(title, body, **ctx):
             ], default_open=True)
             nav_html += _sidebar_section('Kasir & Penjualan', '▣', [
                 ('quick_cashier', url_for('quick_cashier'), '⚡', 'Kasir Cepat'),
-                ('cashier', url_for('cashier'), '▣', 'Kasir'),
+                ('cashier',url_for('cashier'),'▣','Kasir'),
+                ('cashier_qr_payment',url_for('cashier_qr_payment'),'▦','QR Payment Statis'),
+                ('cashier_qr_dynamic',url_for('cashier_qr_dynamic'),'⌗','Generate QR Nominal'),
                 ('quick_cashier_queue', url_for('quick_cashier_queue'), '✓', 'Verifikasi Transaksi'),
+                ('admin_cashier_control',url_for('admin_cashier_control'),'◉','Control Center Kasir'),
+                ('admin_cashier_operators',url_for('admin_cashier_operators'),'♙','Akun Operator Kasir'),
+                ('cashier_operator_sessions',url_for('cashier_operator_sessions'),'▤','Rekap Sesi Kasir'),
+                ('branch_qr_payment_history',url_for('branch_qr_payment_history'),'◎','Riwayat QR Payment'),
+                ('admin_cashier_rotation_log',url_for('admin_cashier_rotation_log'),'⇄','Log Rotasi Kasir'),
                 ('sales_history', url_for('sales_history'), '◷', 'Riwayat Penjualan'),
                 ('sales_returns', url_for('sales_returns'), '↶', 'Retur Penjualan'),
                 ('daily_report', url_for('daily_report'), '▤', 'Laporan Harian'),
@@ -3907,21 +3951,21 @@ def render_page(title, body, **ctx):
                 ('tutorial', url_for('tutorial'), '?', 'Panduan'),
             ])
         elif role == 'manager':
-            nav_html += _sidebar_section('Executive Monitor','◇',[
-                ('manager_dashboard',url_for('manager_dashboard'),'⌂','Executive Dashboard'),
+            nav_html += _sidebar_section('Beranda','⌂',[
+                ('manager_dashboard',url_for('manager_dashboard'),'⌂','Beranda Manager'),
                 ('maps',url_for('maps'),'⌖','Peta Semua Cabang'),
             ],default_open=True)
-            nav_html += _sidebar_section('Keuangan & Analitik','▥',[
+            nav_html += _sidebar_section('Keuangan & Penjualan','▤',[
                 ('manager_finance',url_for('manager_finance'),'▤','Keuangan per Cabang'),
                 ('reports',url_for('reports'),'▥','Analitik Laporan'),
                 ('sales_history',url_for('sales_history'),'◷','Riwayat Penjualan'),
             ],default_open=True)
-            nav_html += _sidebar_section('Persediaan & Flow','□',[
+            nav_html += _sidebar_section('Persediaan & Data','□',[
                 ('manager_inventory',url_for('manager_inventory'),'□','Stok Semua Cabang'),
                 ('stock_history',url_for('stock_history'),'≡','Ledger Stok'),
                 ('manager_flow',url_for('manager_flow'),'⇄','Flow Data'),
             ],default_open=True)
-            nav_html += _sidebar_section('Sistem','⚙',[
+            nav_html += _sidebar_section('Akun','⚙',[
                 ('settings',url_for('settings'),'⚙','Pengaturan'),
                 ('logout',url_for('logout'),'↪','Keluar'),
             ])
@@ -3932,6 +3976,9 @@ def render_page(title, body, **ctx):
             nav_html += _sidebar_section('Transaksi', '🛒', [
                 ('quick_cashier', url_for('quick_cashier'), '⚡', 'Kasir Cepat'),
                 ('cashier', url_for('cashier'), '🧾', 'Kasir'),
+                ('cashier_qr_payment',url_for('cashier_qr_payment'),'▦','QR Payment Statis'),
+                ('cashier_qr_dynamic',url_for('cashier_qr_dynamic'),'⌗','Generate QR Nominal'),
+                ('branch_qr_payment_history',url_for('branch_qr_payment_history'),'◎','Riwayat QR Payment'),
                 ('sales_history', url_for('sales_history'), '📊', 'Riwayat Penjualan'),
                 ('sales_returns', url_for('sales_returns'), '🔄', 'Retur Penjualan'),
                 ('daily_report', url_for('daily_report'), '📑', 'Laporan Harian'),
@@ -3981,7 +4028,7 @@ def render_page(title, body, **ctx):
     </section>
     <nav class="mobile-nav" aria-label="Navigasi utama perangkat">
       {{% for tab in mobile_tabs[:2] %}}<a href="{{{{ tab.url }}}}" class="mn-item{{% if tab.active %}} active{{% endif %}}"{{% if tab.active %}} aria-current="page"{{% endif %}}><span class="mn-icon" aria-hidden="true">{{{{ tab.icon }}}}</span><span class="mn-label">{{{{ tab.label }}}}</span></a>{{% endfor %}}
-      <button type="button" class="mn-item nav-primary" onclick="toggleMobileApps(event)" aria-label="Buka semua menu" aria-controls="mobileAppSheet" aria-expanded="false"><span class="mn-icon" aria-hidden="true">＋</span><span class="mn-label">Menu</span><span id="mobile-sidebar-badge" class="mobile-nav-badge">0</span></button>
+      {{% if user['role']=='user' %}}<a href="{{{{url_for('wallet_qr_scanner')}}}}" class="mn-item nav-primary qr-camera-primary" aria-label="Buka kamera untuk scan QR pembayaran"><span class="mn-icon camera-glyph" aria-hidden="true"></span><span class="mn-label">Scan</span></a>{{% else %}}<button type="button" class="mn-item nav-primary" onclick="toggleMobileApps(event)" aria-label="Buka semua menu" aria-controls="mobileAppSheet" aria-expanded="false"><span class="mn-icon" aria-hidden="true">＋</span><span class="mn-label">Menu</span><span id="mobile-sidebar-badge" class="mobile-nav-badge">0</span></button>{{% endif %}}
       {{% for tab in mobile_tabs[2:] %}}<a href="{{{{ tab.url }}}}" class="mn-item{{% if tab.active %}} active{{% endif %}}"{{% if tab.active %}} aria-current="page"{{% endif %}}><span class="mn-icon" aria-hidden="true">{{{{ tab.icon }}}}</span><span class="mn-label">{{{{ tab.label }}}}</span></a>{{% endfor %}}
       <button type="button" onclick="toggleMobileNotifications(event)" class="mn-item mobile-notif-nav" aria-label="Buka notifikasi" aria-controls="mobileNotifSheet" aria-expanded="false"><span class="mn-icon" aria-hidden="true">◌</span><span class="mn-label">Notifikasi</span></button>
     </nav>
@@ -4547,6 +4594,51 @@ def handle_sqlite_programming_error(err):
         return redirect(request.referrer or url_for('dashboard'))
     return ('Database programming error',500)
 
+
+# =========================
+# Real-time Admin Presence
+# =========================
+def ensure_admin_presence_schema():
+    conn=get_conn()
+    try:
+        conn.execute('''CREATE TABLE IF NOT EXISTS admin_presence(
+          session_token TEXT PRIMARY KEY,user_id INTEGER NOT NULL,login_at TEXT NOT NULL,last_seen TEXT NOT NULL,
+          current_endpoint TEXT,current_path TEXT,ip_address TEXT,user_agent TEXT,is_online INTEGER DEFAULT 1,
+          logout_at TEXT,FOREIGN KEY(user_id) REFERENCES users(id))''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_admin_presence_seen ON admin_presence(is_online,last_seen)')
+        conn.commit()
+    finally: conn.close()
+
+def touch_admin_presence():
+    user=current_user()
+    if not user or user['role']!='admin': return
+    ensure_admin_presence_schema()
+    token=session.get('admin_presence_token')
+    if not token:
+        token=os.urandom(16).hex(); session['admin_presence_token']=token
+        exec_sql('''INSERT OR REPLACE INTO admin_presence(session_token,user_id,login_at,last_seen,current_endpoint,current_path,ip_address,user_agent,is_online,logout_at) VALUES(?,?,?,?,?,?,?,?,1,NULL)''',[token,user['id'],now_str(),now_str(),request.endpoint or '',request.path,request.remote_addr or '',(request.headers.get('User-Agent') or '')[:250]])
+        log_action('ADMIN_ONLINE','admin_presence',user['id'],f'token={token[:8]}; ip={request.remote_addr}')
+    else:
+        exec_sql('''UPDATE admin_presence SET last_seen=?,current_endpoint=?,current_path=?,ip_address=?,user_agent=?,is_online=1,logout_at=NULL WHERE session_token=?''',[now_str(),request.endpoint or '',request.path,request.remote_addr or '',(request.headers.get('User-Agent') or '')[:250],token])
+
+@app.before_request
+def admin_presence_heartbeat():
+    if request.endpoint and request.endpoint not in ('static','api_admin_presence'):
+        touch_admin_presence()
+
+@app.route('/api/admin-presence')
+@login_required
+@role_required('admin')
+def api_admin_presence():
+    ensure_admin_presence_schema()
+    cutoff=(datetime.now()-timedelta(seconds=75)).strftime('%Y-%m-%d %H:%M:%S')
+    exec_sql('UPDATE admin_presence SET is_online=0 WHERE is_online=1 AND last_seen<?',[cutoff])
+    rows=q_all('''SELECT p.*,u.full_name,u.username,COALESCE(b.name,'PUSAT') branch_name FROM admin_presence p JOIN users u ON u.id=p.user_id LEFT JOIN koperasi_branches b ON b.id=u.branch_id WHERE p.is_online=1 AND p.last_seen>=? ORDER BY p.last_seen DESC''',[cutoff])
+    data=[]
+    for r in rows:
+        data.append({'token':r['session_token'][:8],'user_id':r['user_id'],'name':r['full_name'] or r['username'],'username':r['username'],'branch':r['branch_name'],'login_at':r['login_at'],'last_seen':r['last_seen'],'path':r['current_path'] or '/','endpoint':r['current_endpoint'] or '','ip':r['ip_address'] or '-','device':'Mobile' if any(x in (r['user_agent'] or '').lower() for x in ('android','iphone','mobile')) else 'Desktop','self':r['session_token']==session.get('admin_presence_token')})
+    return jsonify({'ok':True,'online_count':len(data),'admins':data,'server_time':now_str()})
+
 # =========================
 # Login Page - Fresh & Clean (Split Layout)
 # =========================
@@ -4775,6 +4867,9 @@ def register():
 @app.route('/logout', methods=['GET', 'POST'])
 @login_required
 def logout():
+    if session.get('cashier_operator_session_id'): close_cashier_operator_session('Logout aplikasi')
+    if session.get('admin_presence_token'):
+        exec_sql('UPDATE admin_presence SET is_online=0,logout_at=?,last_seen=? WHERE session_token=?',[now_str(),now_str(),session.get('admin_presence_token')])
     log_action('LOGOUT', 'users', session.get('user_id'), 'Logout')
     session.clear()
     flash('Logout berhasil. Sampai jumpa!', 'success')
@@ -5016,7 +5111,7 @@ def member_loan_dashboard():
     <div class="table-wrap"><table><thead><tr><th>No Pinjaman</th><th>Tanggal</th><th>Pokok</th><th>Tagihan</th><th>Terbayar</th><th>Sisa</th><th>Status</th><th>Aksi</th></tr></thead>
     <tbody>{% for r in all_loans %}<tr><td>{{ r.loan_no }}</td><td>{{ r.loan_date }}</td><td>{{ rupiah(r.principal) }}</td><td>{{ rupiah(r.total_receivable) }}</td><td>{{ rupiah(r.paid) }}</td><td>{{ rupiah(r.remaining) }}</td>
     <td><span class="badge {% if r.status == 'Berjalan' %}badge-success{% elif r.status == 'Lunas' %}badge-info{% elif r.status == 'SUBMITTED' %}badge-warn{% else %}badge-gray{% endif %}">{{ r.status }}</span></td>
-    <td>{% if r.status == 'Berjalan' %}<a href="/loans/pay/{{ r.id }}" class="btn btn-sm btn-success">Pembayaran Angsuran </a>{% endif %}</td></tr>{% else %}<tr><td colspan="8" class="muted text-center">Anda belum memiliki pinjaman.</td></tr>{% endfor %}</tbody></table></div>
+    <td>{% if r.status == 'Berjalan' %}<a href="/loans/pay/{{ r.id }}" class="btn btn-sm btn-success">Pembayaran Angsuran </a>{% endif %}</td></tr>{% else %}<tr><td colspan="11" class="muted text-center">Anda belum memiliki pinjaman.</td></tr>{% endfor %}</tbody></table></div>
     </div></div></div>''', member=member, saldo=saldo, active_loans=active_loans, all_loans=all_loans, total_paid_all=total_paid_all, total_loan=total_loan, rupiah=rupiah)
     return render_page('Dashboard Pinjaman', body)
 
@@ -5510,6 +5605,12 @@ def topup_approval_legacy():
 # =========================
 # Dashboard
 # =========================
+CSS_DESIGN += r"""
+.branch-qr-dashboard{display:flex;justify-content:space-between;align-items:center;gap:18px;margin:14px 0;padding:20px;border:1px solid rgba(103,232,249,.16);border-radius:17px;background:radial-gradient(circle at 88% 12%,rgba(37,99,235,.3),transparent 25%),linear-gradient(135deg,#071421,#103a52);color:#fff;box-shadow:0 16px 38px rgba(7,20,33,.18)}.branch-qr-dashboard>div:first-child span{color:#67e8f9;font-size:8px;font-weight:950;letter-spacing:.17em}.branch-qr-dashboard h3{margin:6px 0;color:#fff}.branch-qr-dashboard p{margin:0;color:#b8ccda;font-size:9px}.branch-qr-dashboard-actions{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;min-width:480px}.branch-qr-dashboard-actions a{padding:12px;border:1px solid rgba(255,255,255,.12);border-radius:12px;background:rgba(255,255,255,.07);color:#fff;text-decoration:none;transition:.2s}.branch-qr-dashboard-actions a:hover{transform:translateY(-2px);background:rgba(255,255,255,.12)}.branch-qr-dashboard-actions i,.branch-qr-dashboard-actions b,.branch-qr-dashboard-actions small{display:block}.branch-qr-dashboard-actions i{color:#67e8f9;font-style:normal;font-size:18px}.branch-qr-dashboard-actions b{margin:7px 0 2px;font-size:10px}.branch-qr-dashboard-actions small{color:#a9becd;font-size:7px}.dynamic-qr-layout{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:14px}.dynamic-qr-result{overflow:hidden;border:1px solid #d9e4ed;border-radius:15px;background:#fff;text-align:center;box-shadow:0 8px 24px rgba(15,35,52,.05)}.dynamic-qr-result>img{display:block;width:255px;height:255px;margin:20px auto 9px;padding:10px;border:1px solid #dce6ed;border-radius:18px}.dynamic-qr-result>b,.dynamic-qr-result>small{display:block}.dynamic-qr-result>b{font-size:27px}.dynamic-qr-result>small{padding:8px 15px 18px;color:#8191a0}.branch-qr-hero.dynamic{background:radial-gradient(circle at 84% 18%,rgba(124,58,237,.37),transparent 27%),linear-gradient(135deg,#07111f,#2d245a)}
+@media(max-width:900px){.branch-qr-dashboard{align-items:flex-start;flex-direction:column}.branch-qr-dashboard-actions{width:100%;min-width:0}.dynamic-qr-layout{grid-template-columns:1fr}}
+@media(max-width:768px){.branch-qr-dashboard{margin:12px;padding:17px;border-radius:21px}.branch-qr-dashboard-actions{grid-template-columns:1fr}.dynamic-qr-result{border-radius:20px}.dynamic-qr-result>img{width:220px;height:220px}}
+"""
+
 @app.route('/')
 @login_required
 def dashboard():
@@ -5560,6 +5661,7 @@ def dashboard():
     pay_chart=horizontal_bar_chart_svg([(f"{r['payment_method']} ({r['cnt']})",float(r['total'])) for r in pay_method],f'Komposisi Pembayaran {cur_month[5:]}/{cur_month[:4]}',colors=['#3b82f6','#8b5cf6','#f59e0b'])
     body = render_template_string('''
     <section class="command-center-v13"><div class="cc-main"><div class="command-kicker">OPERATIONS COMMAND CENTER</div><h2>Kendali operasional {{branch_name if branch_mode else "seluruh koperasi"}}</h2><p>{% if branch_mode %}Data pada halaman ini hanya berasal dari cabang {{branch_name}}, termasuk penjualan, stok, produk kritis, dan aktivitas kasir.{% else %}Pantau arus transaksi, validasi pekerjaan, dan kondisi keuangan melalui satu pandangan yang terhubung.{% endif %}</p><div class="command-actions"><a class="primary" href="{{ url_for('quick_cashier') }}">Transaksi Baru</a><a href="{{ url_for('products') }}">Kelola Barang</a><a href="{{ url_for('reports') }}">Buka Laporan</a></div></div><div class="cc-status"><div class="cc-status-head"><span>Status Operasional</span><b class="cc-live">LIVE</b></div><div class="cc-status-grid"><div><strong>{{pending_approval}}</strong><span>Approval</span></div><div><strong>{{pending_users}}</strong><span>User Baru</span></div><div><strong>{{low_stock_count}}</strong><span>Stok Kritis</span></div><div><strong>{{active_loan_count}}</strong><span>Kredit Aktif</span></div></div></div></section>
+    {% if branch_mode %}<section class="branch-qr-dashboard"><div><span>BRANCH QR PAYMENT</span><h3>Pembayaran QR {{branch_name}}</h3><p>Gunakan QR statis cabang atau buat QR khusus sesuai nominal transaksi.</p></div><div class="branch-qr-dashboard-actions"><a href="{{url_for('cashier_qr_payment')}}"><i>▦</i><b>QR Statis</b><small>QR tetap cabang</small></a><a href="{{url_for('cashier_qr_dynamic')}}"><i>⌗</i><b>Generate Nominal</b><small>QR khusus transaksi</small></a><a href="{{url_for('branch_qr_payment_history')}}"><i>◷</i><b>Riwayat QR</b><small>Audit pembayaran</small></a></div></section>{% endif %}
     <section class="data-flow-panel"><div class="flow-head"><div><span class="command-kicker">DATA FLOW</span><h3>Alur data operasional</h3></div><span>Input hingga laporan</span></div><div class="flow-track"><a href="{{url_for('members')}}" class="flow-node"><i>01</i><b>Anggota & Master</b><small>{{m_count}} anggota · {{p_count}} barang</small></a><span class="flow-arrow">→</span><a href="{{url_for('quick_cashier')}}" class="flow-node"><i>02</i><b>Transaksi</b><small>{{rupiah(sale_today)}} hari ini</small></a><span class="flow-arrow">→</span><a href="{{url_for('approvals')}}" class="flow-node"><i>03</i><b>Verifikasi</b><small>{{pending_approval}} menunggu</small></a><span class="flow-arrow">→</span><a href="{{url_for('accounting')}}" class="flow-node"><i>04</i><b>Keuangan</b><small>{{rupiah(profit_month-expense_month)}} laba bersih</small></a><span class="flow-arrow">→</span><a href="{{url_for('reports')}}" class="flow-node"><i>05</i><b>Laporan</b><small>Siap dianalisis</small></a></div></section>
     <div class="section-caption"><h3>Ringkasan Kinerja</h3><span>Diperbarui dari data transaksi aktif</span></div>
     <div class="metrics">
@@ -6040,6 +6142,496 @@ CSS_DESIGN += r"""
 @media(max-width:768px){.sales-suite{padding:0 12px}.sales-hero{align-items:flex-start;flex-direction:column;padding:19px;border-radius:20px}.sales-hero h2{font-size:22px}.sales-hero-chip{width:100%}.sales-main-grid{padding:0!important}.sales-main-grid>.col-6>.card,.sales-main-grid>.col-4>.card,.sales-main-grid>.col-8>.card,.sales-panel{margin:0!important;border-radius:18px!important}.quick-suite #totalDisplay{font-size:30px!important}.quick-suite .keypad button{height:48px!important}.sales-panel-head{align-items:flex-start;flex-direction:column;padding:15px}.sales-panel-head>.btn{width:100%}.history-suite .sales-panel-head form{display:grid!important;grid-template-columns:1fr 1fr!important}.history-suite .sales-panel-head form>button{grid-column:1/-1}.sales-panel .table-wrap{padding:0!important}.sales-panel table{min-width:760px!important}#sidebar .sidebar-section-header{grid-template-columns:31px minmax(0,1fr) auto 18px!important}#sidebar .sidebar-section-items a{grid-template-columns:24px minmax(0,1fr) auto!important}}
 """
 
+
+# =========================
+# Cashier Operator Sessions
+# =========================
+def ensure_cashier_operator_schema():
+    conn=get_conn()
+    try:
+        conn.execute('''CREATE TABLE IF NOT EXISTS cashier_operator_sessions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operator_user_id INTEGER NOT NULL,
+            terminal_user_id INTEGER NOT NULL,
+            branch_id INTEGER,
+            login_at TEXT NOT NULL,
+            logout_at TEXT,
+            status TEXT DEFAULT 'OPEN',
+            sales_count INTEGER DEFAULT 0,
+            sales_total REAL DEFAULT 0,
+            quick_count INTEGER DEFAULT 0,
+            quick_total REAL DEFAULT 0,
+            last_activity_at TEXT,
+            FOREIGN KEY(operator_user_id) REFERENCES users(id),
+            FOREIGN KEY(terminal_user_id) REFERENCES users(id)
+        )''')
+        session_cols={r['name'] for r in conn.execute('PRAGMA table_info(cashier_operator_sessions)').fetchall()}
+        session_add={
+          'home_branch_id':'INTEGER','shift_name':'TEXT','opening_cash':'REAL DEFAULT 0','closing_cash':'REAL DEFAULT 0',
+          'expected_cash':'REAL DEFAULT 0','cash_difference':'REAL DEFAULT 0','login_ip':'TEXT','logout_ip':'TEXT',
+          'user_agent':'TEXT','login_note':'TEXT','closing_note':'TEXT','break_started_at':'TEXT','break_minutes':'INTEGER DEFAULT 0'
+        }
+        for col,decl in session_add.items():
+            if col not in session_cols: conn.execute(f'ALTER TABLE cashier_operator_sessions ADD COLUMN {col} {decl}')
+        conn.execute('''CREATE TABLE IF NOT EXISTS cashier_rotation_logs(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,operator_user_id INTEGER,session_id INTEGER,home_branch_id INTEGER,
+          worked_branch_id INTEGER,event_type TEXT,event_at TEXT,terminal_user_id INTEGER,ip_address TEXT,note TEXT)''')
+        for table,col,decl in [('sales','cashier_session_id','INTEGER'),('quick_cashier_queue','cashier_session_id','INTEGER')]:
+            cols=[r['name'] for r in conn.execute(f'PRAGMA table_info({table})').fetchall()]
+            if col not in cols: conn.execute(f'ALTER TABLE {table} ADD COLUMN {col} {decl}')
+        conn.commit()
+    finally: conn.close()
+
+def active_cashier_operator():
+    ensure_cashier_operator_schema()
+    sid=session.get('cashier_operator_session_id'); oid=session.get('cashier_operator_user_id')
+    if not sid or not oid: return None
+    return q_one('''SELECT cs.*,u.username,u.full_name,u.role,COALESCE(b.name,'PUSAT') branch_name,
+                    COALESCE(hb.name,'Belum ditetapkan') home_branch_name
+                    FROM cashier_operator_sessions cs JOIN users u ON u.id=cs.operator_user_id
+                    LEFT JOIN koperasi_branches b ON b.id=cs.branch_id LEFT JOIN koperasi_branches hb ON hb.id=cs.home_branch_id
+                    WHERE cs.id=? AND cs.operator_user_id=? AND cs.status='OPEN' ''',[sid,oid])
+
+def cashier_operator_id():
+    op=active_cashier_operator()
+    return int(op['operator_user_id']) if op else None
+
+def cashier_operator_session_id():
+    op=active_cashier_operator()
+    return int(op['id']) if op else None
+
+def safe_request_ip():
+    try:
+        return request.remote_addr or ''
+    except RuntimeError:
+        return ''
+    except Exception:
+        return ''
+
+def close_cashier_operator_session(reason='Logout operator',closing_cash=None,closing_note=''):
+    op=active_cashier_operator()
+    if not op:
+        session.pop('cashier_operator_session_id',None); session.pop('cashier_operator_user_id',None); return
+    stats=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM sales WHERE cashier_session_id=?',[op['id']])
+    qstats=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM quick_cashier_queue WHERE cashier_session_id=?',[op['id']])
+    cash_sales=q_one("SELECT COALESCE(SUM(total),0) total FROM sales WHERE cashier_session_id=? AND LOWER(COALESCE(payment_method,''))='tunai' AND status='Posted'",[op['id']])['total'] or 0
+    cash_quick=q_one("SELECT COALESCE(SUM(total),0) total FROM quick_cashier_queue WHERE cashier_session_id=? AND LOWER(COALESCE(payment_method,''))='tunai'",[op['id']])['total'] or 0
+    expected=float(op['opening_cash'] or 0)+float(cash_sales)+float(cash_quick)
+    actual=expected if closing_cash is None else float(closing_cash or 0); difference=actual-expected
+    exec_sql('''UPDATE cashier_operator_sessions SET logout_at=?,status='CLOSED',sales_count=?,sales_total=?,quick_count=?,quick_total=?,last_activity_at=?,closing_cash=?,expected_cash=?,cash_difference=?,closing_note=?,logout_ip=? WHERE id=?''',
+             [now_str(),stats['n'],stats['total'],qstats['n'],qstats['total'],now_str(),actual,expected,difference,closing_note,safe_request_ip(),op['id']])
+    exec_sql('''INSERT INTO cashier_rotation_logs(operator_user_id,session_id,home_branch_id,worked_branch_id,event_type,event_at,terminal_user_id,ip_address,note) VALUES(?,?,?,?,?,?,?,?,?)''',[op['operator_user_id'],op['id'],op['home_branch_id'],op['branch_id'],'LOGOUT',now_str(),op['terminal_user_id'],safe_request_ip(),f'{reason}; selisih kas={difference}'])
+    log_action('CASHIER_OPERATOR_LOGOUT','cashier_operator_sessions',op['id'],f"{op['full_name'] or op['username']}; {reason}; sales={stats['n']}; quick={qstats['n']}")
+    session.pop('cashier_operator_session_id',None); session.pop('cashier_operator_user_id',None)
+
+def cashier_operator_banner():
+    op=active_cashier_operator()
+    if not op: return ''
+    stats=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM sales WHERE cashier_session_id=?',[op['id']])
+    qstats=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM quick_cashier_queue WHERE cashier_session_id=?',[op['id']])
+    return render_template_string('''<section class="operator-strip"><div class="operator-avatar">{{(op.full_name or op.username)[0]|upper}}</div><div class="operator-main"><span>OPERATOR KASIR AKTIF</span><b>{{op.full_name or op.username}}</b><small>Bertugas di {{op.branch_name}} · Asal {{op.home_branch_name}} · Shift {{op.shift_name or '-'}} · Masuk {{op.login_at}}</small></div><div class="operator-stat"><span>Sales</span><b>{{stats.n}}</b></div><div class="operator-stat"><span>Quick</span><b>{{qstats.n}}</b></div><div class="operator-stat operator-value"><span>Total sesi</span><b>{{rupiah((stats.total or 0)+(qstats.total or 0))}}</b></div><div class="operator-actions"><form method="post" action="{{url_for('cashier_operator_break')}}"><button type="submit" class="btn btn-ghost">{{'Selesai Istirahat' if op.break_started_at else 'Istirahat'}}</button></form><a class="btn btn-danger" href="{{url_for('cashier_operator_close')}}">Tutup Sesi</a></div></section>''',op=op,stats=stats,qstats=qstats,rupiah=rupiah)
+
+@app.before_request
+def require_cashier_operator_session():
+    protected={'cashier','quick_cashier','cashier_discount','cashier_qr_payment','cashier_qr_dynamic'}
+    if request.endpoint not in protected or request.method not in ('GET','POST'): return None
+    if not current_user(): return None
+    op=active_cashier_operator()
+    if op and op['break_started_at']:
+        flash('Operator sedang berstatus istirahat. Tekan Selesai Istirahat sebelum transaksi.','warning')
+        return redirect(url_for('cashier_operator_close'))
+    if not op:
+        session['cashier_operator_next']=request.full_path if request.query_string else request.path
+        flash('Masukkan akun operator kasir sebelum memulai transaksi. Login berlaku sampai tombol Logout Kasir ditekan.','warning')
+        return redirect(url_for('cashier_operator_login'))
+
+@app.route('/cashier/operator-login',methods=['GET','POST'])
+@login_required
+@role_required('admin','kasir','branch_admin','branch_cashier')
+def cashier_operator_login():
+    ensure_cashier_operator_schema()
+    terminal=current_user(); terminal_bid=get_branch_id()
+    existing=active_cashier_operator()
+    if existing: return redirect(session.pop('cashier_operator_next',None) or url_for('cashier'))
+    if request.method=='POST':
+        username=(request.form.get('username') or '').strip(); password=request.form.get('password') or ''
+        operator=q_one('SELECT * FROM users WHERE username=?',[username])
+        allowed_roles=('kasir','branch_cashier','branch_admin')
+        error='Username atau password operator salah.'
+        if operator and verify_password(operator['password_hash'],password):
+            if not operator['active']: error='Akun operator sedang nonaktif.'
+            elif operator['role'] not in allowed_roles: error='Akun ini bukan akun operator kasir.'
+            elif not terminal_bid: error='Terminal belum memiliki lokasi cabang aktif.'
+            else:
+                shift=(request.form.get('shift_name') or 'REGULER').strip()[:30]; opening=parse_float(request.form.get('opening_cash'),0); login_note=(request.form.get('login_note') or '').strip()[:300]
+                sid=exec_sql('''INSERT INTO cashier_operator_sessions(operator_user_id,terminal_user_id,branch_id,home_branch_id,login_at,status,last_activity_at,shift_name,opening_cash,login_ip,user_agent,login_note) VALUES(?,?,?,?,?,'OPEN',?,?,?,?,?,?)''',[operator['id'],terminal['id'],terminal_bid,operator['branch_id'],now_str(),now_str(),shift,opening,request.remote_addr,(request.headers.get('User-Agent') or '')[:250],login_note])
+                exec_sql('''INSERT INTO cashier_rotation_logs(operator_user_id,session_id,home_branch_id,worked_branch_id,event_type,event_at,terminal_user_id,ip_address,note) VALUES(?,?,?,?,?,?,?,?,?)''',[operator['id'],sid,operator['branch_id'],terminal_bid,'LOGIN',now_str(),terminal['id'],request.remote_addr,f'Rotasi ke {get_branch_name(terminal_bid)}; shift={shift}'])
+                session['cashier_operator_session_id']=sid; session['cashier_operator_user_id']=operator['id']
+                log_action('CASHIER_OPERATOR_LOGIN','cashier_operator_sessions',sid,f"{operator['full_name'] or operator['username']}; branch={terminal_bid or 'PUSAT'}")
+                flash(f"Operator aktif: {operator['full_name'] or operator['username']}",'success')
+                return redirect(session.pop('cashier_operator_next',None) or url_for('cashier'))
+        flash(error,'error')
+    body=render_template_string('''<div class="operator-login-shell"><section class="operator-login-visual"><div class="operator-hairlines"></div><span>SECURE CASHIER SESSION</span><h2>Identitas Operator Kasir</h2><p>Satu kali login untuk seluruh mode kasir. Semua transaksi berikutnya dicatat atas nama operator sampai Logout Kasir ditekan.</p><div class="operator-steps"><i>01</i><b>Login operator</b><i>02</i><b>Catat transaksi</b><i>03</i><b>Logout dan rekap sesi</b></div></section><section class="operator-login-card"><span>TERMINAL AKTIF</span><h3>{{get_branch_name(terminal_bid)}}</h3><p>Akun kasir dari cabang mana pun dapat bertugas di terminal ini. Lokasi transaksi tetap mengikuti cabang terminal.</p><form method="post"><div class="form-group"><label>Username Operator</label><input name="username" autocomplete="username" required autofocus></div><div class="form-group"><label>Password</label><input type="password" name="password" autocomplete="current-password" required></div><div class="operator-login-grid"><div class="form-group"><label>Shift</label><select name="shift_name"><option>PAGI</option><option>SIANG</option><option>MALAM</option><option>REGULER</option></select></div><div class="form-group"><label>Kas Awal</label><input type="number" name="opening_cash" min="0" step="1000" value="0"></div></div><div class="form-group"><label>Catatan Penugasan</label><input name="login_note" placeholder="Opsional, misalnya menggantikan operator A"></div><button type="submit" class="btn-success">Mulai Sesi Kasir</button></form><a href="{{url_for('dashboard')}}">Kembali ke Beranda</a></section></div>''',terminal_bid=terminal_bid,get_branch_name=get_branch_name)
+    return render_page('Login Operator Kasir',body)
+
+@app.route('/cashier/operator-close',methods=['GET','POST'])
+@login_required
+def cashier_operator_close():
+    op=active_cashier_operator()
+    if not op: return redirect(url_for('cashier_operator_login'))
+    stats=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM sales WHERE cashier_session_id=?',[op['id']]); qstats=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM quick_cashier_queue WHERE cashier_session_id=?',[op['id']])
+    cash_sales=q_one("SELECT COALESCE(SUM(total),0) total FROM sales WHERE cashier_session_id=? AND LOWER(COALESCE(payment_method,''))='tunai' AND status='Posted'",[op['id']])['total'] or 0
+    cash_quick=q_one("SELECT COALESCE(SUM(total),0) total FROM quick_cashier_queue WHERE cashier_session_id=? AND LOWER(COALESCE(payment_method,''))='tunai'",[op['id']])['total'] or 0
+    expected=float(op['opening_cash'] or 0)+float(cash_sales)+float(cash_quick)
+    if request.method=='POST':
+        actual=parse_float(request.form.get('closing_cash'),0); note=(request.form.get('closing_note') or '').strip()[:500]
+        close_cashier_operator_session('Tutup shift operator',actual,note); save_cart([]); session.pop('discount_cart_branch',None); session.pop('cart_branch_id',None)
+        flash(f'Sesi ditutup. Kas sistem {rupiah(expected)}, kas aktual {rupiah(actual)}, selisih {rupiah(actual-expected)}.','success'); return redirect(url_for('cashier_operator_login'))
+    body=render_template_string('''<div class="operator-close-shell"><header><span>SHIFT CLOSING</span><h2>Tutup Sesi Kasir</h2><p>{{op.full_name or op.username}} · {{op.branch_name}} · {{op.shift_name}}</p></header><section class="operator-close-kpis"><article><span>Sales</span><b>{{stats.n}}</b><small>{{rupiah(stats.total)}}</small></article><article><span>Quick</span><b>{{qstats.n}}</b><small>{{rupiah(qstats.total)}}</small></article><article><span>Kas Awal</span><b>{{rupiah(op.opening_cash)}}</b></article><article><span>Kas Sistem</span><b>{{rupiah(expected)}}</b></article></section><form method="post" class="card"><div class="form-group"><label>Kas Aktual di Laci</label><input type="number" name="closing_cash" value="{{expected}}" min="0" step="1000" required></div><div class="form-group"><label>Catatan Penutupan</label><textarea name="closing_note" placeholder="Catat serah terima, selisih, atau kendala"></textarea></div><button class="btn-danger" data-confirm="Tutup sesi dan simpan rekap?">Tutup Sesi & Rekonsiliasi</button></form></div>''',op=op,stats=stats,qstats=qstats,expected=expected,rupiah=rupiah)
+    return render_page('Tutup Sesi Kasir',body)
+
+@app.route('/cashier/operator-break',methods=['POST'])
+@login_required
+def cashier_operator_break():
+    op=active_cashier_operator()
+    if not op: return redirect(url_for('cashier_operator_login'))
+    if op['break_started_at']:
+        try: minutes=max(0,int((datetime.now()-datetime.strptime(op['break_started_at'],'%Y-%m-%d %H:%M:%S')).total_seconds()/60))
+        except Exception: minutes=0
+        exec_sql('UPDATE cashier_operator_sessions SET break_started_at=NULL,break_minutes=COALESCE(break_minutes,0)+?,last_activity_at=? WHERE id=?',[minutes,now_str(),op['id']]); event='BREAK_END'
+    else:
+        exec_sql('UPDATE cashier_operator_sessions SET break_started_at=?,last_activity_at=? WHERE id=?',[now_str(),now_str(),op['id']]); event='BREAK_START'
+    exec_sql('INSERT INTO cashier_rotation_logs(operator_user_id,session_id,home_branch_id,worked_branch_id,event_type,event_at,terminal_user_id,ip_address,note) VALUES(?,?,?,?,?,?,?,?,?)',[op['operator_user_id'],op['id'],op['home_branch_id'],op['branch_id'],event,now_str(),op['terminal_user_id'],request.remote_addr,''])
+    return redirect(request.referrer or url_for('cashier'))
+
+@app.route('/cashier/operator-sessions')
+@login_required
+@role_required('admin','branch_admin','manager')
+def cashier_operator_sessions():
+    ensure_cashier_operator_schema(); user=current_user(); bid=get_branch_id(); params=[]
+    sql='''SELECT cs.*,u.full_name,u.username,tu.full_name terminal_name,COALESCE(b.name,'PUSAT') branch_name,COALESCE(hb.name,'Belum ditetapkan') home_branch_name FROM cashier_operator_sessions cs JOIN users u ON u.id=cs.operator_user_id LEFT JOIN users tu ON tu.id=cs.terminal_user_id LEFT JOIN koperasi_branches b ON b.id=cs.branch_id LEFT JOIN koperasi_branches hb ON hb.id=cs.home_branch_id WHERE 1=1'''
+    if user['role']=='branch_admin': sql+=' AND cs.branch_id=?'; params.append(bid)
+    rows=q_all(sql+' ORDER BY cs.id DESC LIMIT 300',params)
+    enriched=[]
+    for r in rows:
+        d=dict(r)
+        if d['status']=='OPEN':
+            st=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM sales WHERE cashier_session_id=?',[d['id']]); qs=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM quick_cashier_queue WHERE cashier_session_id=?',[d['id']])
+            d['sales_count'],d['sales_total'],d['quick_count'],d['quick_total']=st['n'],st['total'],qs['n'],qs['total']
+        enriched.append(d)
+    rows=enriched
+    body=render_template_string('''<div class="sales-suite"><header class="sales-hero"><div><span>CASHIER ACCOUNTABILITY</span><h2>Rekap Sesi Operator</h2><p>Siapa menjalankan kasir, waktu masuk-keluar, jumlah record, dan nilai transaksi setiap sesi.</p></div></header><div class="card sales-panel"><div class="table-wrap"><table><thead><tr><th>Operator</th><th>Cabang Asal</th><th>Cabang Bertugas</th><th>Shift</th><th>Login</th><th>Logout</th><th>Sales</th><th>Quick</th><th>Total Sesi</th><th>Status</th></tr></thead><tbody>{% for r in rows %}<tr><td><b>{{r.full_name or r.username}}</b><small>{{r.username}}</small></td><td>{{r.home_branch_name or '-'}}</td><td>{{r.branch_name}}</td><td>{{r.shift_name or '-'}}</td><td>{{r.login_at}}</td><td>{{r.logout_at or '-'}}</td><td>{{r.sales_count}}</td><td>{{r.quick_count}}</td><td>{{rupiah((r.sales_total or 0)+(r.quick_total or 0))}}</td><td><span class="badge {{'badge-success' if r.status=='OPEN' else 'badge-gray'}}">{{r.status}}</span></td></tr>{% else %}<tr><td colspan="10" class="muted text-center">Belum ada sesi operator.</td></tr>{% endfor %}</tbody></table></div></div></div>''',rows=rows,rupiah=rupiah)
+    return render_page('Sesi Operator Kasir',body)
+
+CSS_DESIGN += r'''
+.operator-strip{display:grid;grid-template-columns:42px minmax(0,1fr) repeat(3,auto) auto;gap:12px;align-items:center;padding:12px 14px;border:1px solid #bddbd1;border-radius:13px;background:linear-gradient(135deg,#f8fffc,#eef8f4);box-shadow:0 7px 20px rgba(15,122,85,.07)}.operator-avatar{display:grid;place-items:center;width:42px;height:42px;border-radius:13px;background:linear-gradient(145deg,#176b4b,#26916a);color:#fff;font-size:16px;font-weight:900}.operator-main span,.operator-main b,.operator-main small,.operator-stat span,.operator-stat b{display:block}.operator-main span{color:#0f7a55;font-size:7px;font-weight:950;letter-spacing:.15em}.operator-main b{margin:3px 0;font-size:12px}.operator-main small{color:#718078;font-size:8px}.operator-stat{min-width:60px;padding:7px 10px;border-left:1px solid #d7e7e0}.operator-stat span{color:#718078;font-size:7px;text-transform:uppercase}.operator-stat b{margin-top:3px;font-size:11px}.operator-strip form{margin:0}.operator-login-shell{display:grid;grid-template-columns:1.05fr .95fr;min-height:560px;overflow:hidden;border-radius:22px;background:#fff;box-shadow:0 25px 70px rgba(7,17,31,.16)}.operator-login-visual{position:relative;overflow:hidden;padding:50px;background:radial-gradient(circle at 82% 18%,rgba(37,99,235,.35),transparent 28%),linear-gradient(135deg,#06111d,#123b55);color:#fff}.operator-login-visual>span{color:#67e8f9;font-size:8px;font-weight:950;letter-spacing:.2em}.operator-login-visual h2{max-width:480px;margin:12px 0;color:#fff;font-size:34px}.operator-login-visual p{max-width:530px;color:#b7ccda;line-height:1.7}.operator-hairlines{position:absolute;inset:-20% -35% -20% 30%;background:repeating-radial-gradient(ellipse at 100% 10%,transparent 0 12px,rgba(103,232,249,.22) 13px 14px,transparent 15px 29px);animation:managerHairDrift 12s ease-in-out infinite alternate}.operator-steps{position:relative;display:grid;grid-template-columns:34px 1fr;gap:10px;margin-top:36px}.operator-steps i{display:grid;place-items:center;width:32px;height:32px;border:1px solid rgba(103,232,249,.3);border-radius:50%;color:#67e8f9;font-style:normal;font-size:8px}.operator-steps b{align-self:center;font-size:10px}.operator-login-card{display:flex;flex-direction:column;justify-content:center;padding:45px}.operator-login-card>span{color:#0f7a55;font-size:8px;font-weight:950;letter-spacing:.15em}.operator-login-card h3{margin:7px 0;font-size:22px}.operator-login-card p{margin:0 0 22px;color:#718078}.operator-login-card form{display:grid;gap:11px}.operator-login-card button{width:100%}.operator-login-card>a{margin-top:18px;text-align:center;font-size:9px}
+.operator-actions{display:flex;gap:7px}.operator-actions form{margin:0}.operator-login-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}.operator-close-shell{display:grid;gap:14px}.operator-close-shell>header{padding:24px;border-radius:18px;background:linear-gradient(135deg,#06111d,#123b55);color:#fff}.operator-close-shell>header span{color:#67e8f9;font-size:8px;font-weight:900;letter-spacing:.17em}.operator-close-shell>header h2{margin:7px 0;color:#fff}.operator-close-shell>header p{margin:0;color:#b8ccda}.operator-close-kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.operator-close-kpis article{padding:14px;border:1px solid #d9e4ed;border-radius:13px;background:#fff}.operator-close-kpis span,.operator-close-kpis b,.operator-close-kpis small{display:block}.operator-close-kpis span{color:#718078;font-size:8px}.operator-close-kpis b{margin-top:5px;font-size:16px}
+@media(max-width:900px){.operator-strip{grid-template-columns:42px minmax(0,1fr) auto}.operator-stat{display:none}.operator-value{display:block}.operator-login-shell{grid-template-columns:1fr}.operator-login-visual{min-height:270px;padding:30px}.operator-login-card{padding:30px}}
+@media(max-width:768px){.operator-login-grid{grid-template-columns:1fr}.operator-close-shell{padding:0 12px}.operator-close-kpis{grid-template-columns:1fr 1fr}.operator-actions{grid-column:1/-1}.operator-actions .btn{flex:1}.operator-strip{grid-template-columns:36px minmax(0,1fr);margin:0!important;padding:11px;border-radius:17px}.operator-avatar{width:36px;height:36px}.operator-strip form{grid-column:1/-1}.operator-strip button{width:100%;min-height:38px!important}.operator-value{display:none}.operator-login-shell{margin:0 12px;border-radius:22px}.operator-login-visual{min-height:230px;padding:24px}.operator-login-visual h2{font-size:25px}.operator-login-card{padding:24px}.operator-steps{margin-top:22px}}
+'''
+
+
+CSS_DESIGN += r'''
+.cash-admin{display:grid;gap:14px}.cash-admin-hero{position:relative;overflow:hidden;padding:26px;border-radius:17px;background:radial-gradient(circle at 84% 20%,rgba(37,99,235,.34),transparent 27%),linear-gradient(135deg,#07111f,#163b55);color:#fff;box-shadow:0 18px 45px rgba(7,17,31,.2)}.cash-admin-hero:before{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(103,232,249,.07) 1px,transparent 1px),linear-gradient(90deg,rgba(96,165,250,.06) 1px,transparent 1px);background-size:25px 25px;animation:managerGridMove 18s linear infinite}.cash-admin-hero>div{position:relative;z-index:2}.cash-admin-hero span,.cash-admin-head span{color:#67e8f9;font-size:8px;font-weight:950;letter-spacing:.17em}.cash-admin-hero h2{margin:7px 0;color:#fff;font-size:27px}.cash-admin-hero p{margin:0;color:#b9cede;font-size:10px}.cash-admin-kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px}.cash-admin-kpis article{padding:15px;border:1px solid #d9e4ed;border-radius:12px;background:#fff}.cash-admin-kpis span,.cash-admin-kpis b,.cash-admin-kpis small{display:block}.cash-admin-kpis span{color:#64748b;font-size:8px;font-weight:900;text-transform:uppercase}.cash-admin-kpis b{margin:7px 0 3px;font-size:18px}.cash-admin-kpis small{color:#94a3b8;font-size:8px}.cash-admin-grid{display:grid;grid-template-columns:1.05fr .95fr;gap:14px}.cash-admin-card{overflow:hidden;border:1px solid #d9e4ed;border-radius:14px;background:#fff;box-shadow:0 8px 24px rgba(15,35,52,.05)}.cash-admin-card.wide{grid-column:1/-1}.cash-admin-head{display:flex;justify-content:space-between;align-items:center;padding:17px 19px;border-bottom:1px solid #e5edf3}.cash-admin-head span{color:#0f9f97}.cash-admin-head h3{margin:4px 0 0;font-size:15px}.cash-live-list{display:grid;gap:8px;padding:14px}.cash-live{display:grid;grid-template-columns:38px minmax(0,1fr) repeat(3,auto);gap:10px;align-items:center;padding:11px;border:1px solid #e2eaf0;border-radius:11px}.cash-live>i{display:grid;place-items:center;width:36px;height:36px;border-radius:12px;background:#e8faf6;color:#087e6a;font-style:normal;font-weight:900}.cash-live b,.cash-live small,.cash-live strong span{display:block}.cash-live small{color:#8494a5;font-size:8px}.cash-live strong{text-align:right;font-size:10px}.cash-live strong span{color:#94a3b8;font-size:7px}.cash-admin-actions{display:grid;grid-template-columns:repeat(2,1fr);gap:9px;padding:14px}.cash-admin-actions a{display:block;padding:15px;border:1px solid #dfe8ef;border-radius:12px;background:linear-gradient(145deg,#fff,#f5f9fc);text-decoration:none;color:#183047}.cash-admin-actions i,.cash-admin-actions b,.cash-admin-actions small{display:block}.cash-admin-actions i{color:#0f9f97;font-style:normal;font-size:18px}.cash-admin-actions b{margin:8px 0 4px}.cash-admin-actions small{color:#8191a0;font-size:8px;line-height:1.5}.operator-admin-form{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;padding:17px}.operator-admin-form .full{grid-column:1/-1}.rotation-filter{display:flex;gap:8px;align-items:end}.rotation-filter input,.rotation-filter select{min-width:150px}
+@media(max-width:1000px){.cash-admin-kpis{grid-template-columns:repeat(3,1fr)}.cash-admin-grid{grid-template-columns:1fr}.cash-admin-card.wide{grid-column:1}}
+@media(max-width:768px){.cash-admin{padding:0 12px}.cash-admin-hero{padding:20px;border-radius:21px}.cash-admin-hero h2{font-size:23px}.cash-admin-kpis{grid-template-columns:1fr 1fr}.cash-admin-kpis article{padding:12px}.cash-admin-card{border-radius:18px}.cash-admin-head{align-items:flex-start;flex-direction:column;gap:9px;padding:15px}.cash-live{grid-template-columns:34px minmax(0,1fr) auto}.cash-live strong:nth-of-type(n+2){display:none}.cash-admin-actions{grid-template-columns:1fr}.operator-admin-form{grid-template-columns:1fr;padding:14px}.operator-admin-form .full{grid-column:1}.rotation-filter{display:grid;grid-template-columns:1fr 1fr;width:100%}.rotation-filter input,.rotation-filter select{min-width:0;width:100%}.rotation-filter button{grid-column:1/-1}}
+'''
+
+@app.route('/admin/cashier-control')
+@login_required
+@role_required('admin')
+def admin_cashier_control():
+    ensure_cashier_operator_schema()
+    open_rows=q_all('''SELECT cs.*,u.full_name,u.username,COALESCE(b.name,'PUSAT') branch_name,COALESCE(hb.name,'Belum ditetapkan') home_branch_name FROM cashier_operator_sessions cs JOIN users u ON u.id=cs.operator_user_id LEFT JOIN koperasi_branches b ON b.id=cs.branch_id LEFT JOIN koperasi_branches hb ON hb.id=cs.home_branch_id WHERE cs.status='OPEN' ORDER BY cs.login_at''')
+    live=[]
+    for r in open_rows:
+        d=dict(r); st=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM sales WHERE cashier_session_id=?',[r['id']]); qs=q_one('SELECT COUNT(*) n,COALESCE(SUM(total),0) total FROM quick_cashier_queue WHERE cashier_session_id=?',[r['id']]); d.update(sales_n=st['n'],sales_total=st['total'],quick_n=qs['n'],quick_total=qs['total']); live.append(d)
+    today=today_str(); today_summary=q_one('''SELECT COUNT(*) sessions,COUNT(DISTINCT operator_user_id) operators,COALESCE(SUM(sales_count+quick_count),0) records,COALESCE(SUM(sales_total+quick_total),0) total,COALESCE(SUM(ABS(cash_difference)),0) cash_diff FROM cashier_operator_sessions WHERE substr(login_at,1,10)=?''',[today])
+    rotations=q_one("SELECT COUNT(*) n FROM cashier_rotation_logs WHERE event_type='LOGIN' AND substr(event_at,1,10)=? AND COALESCE(home_branch_id,0)<>COALESCE(worked_branch_id,0)",[today])
+    body=render_template_string(r'''<div class="cash-admin"><header class="cash-admin-hero"><div><span>CASHIER OPERATIONS COMMAND</span><h2>Control Center Kasir</h2><p>Pusat administrasi operator, sesi aktif, rotasi cabang, transaksi, dan rekonsiliasi kas.</p></div></header><section class="cash-admin-kpis"><article><span>Sesi Aktif</span><b>{{live|length}}</b><small>Sedang bertugas</small></article><article><span>Operator Hari Ini</span><b>{{today_summary.operators}}</b><small>{{today_summary.sessions}} sesi</small></article><article><span>Record Hari Ini</span><b>{{today_summary.records}}</b><small>Sales + Quick</small></article><article><span>Nilai Sesi</span><b>{{rupiah(today_summary.total)}}</b><small>Hari ini</small></article><article><span>Rotasi Cabang</span><b>{{rotations.n}}</b><small>Penugasan lintas cabang</small></article></section><section class="cash-admin-grid"><article class="cash-admin-card"><div class="cash-admin-head"><div><span>LIVE CASHIER FLOOR</span><h3>Operator Sedang Aktif</h3></div><a href="{{url_for('cashier_operator_sessions')}}">Semua Sesi</a></div><div class="cash-live-list">{% for r in live %}<div class="cash-live"><i>{{(r.full_name or r.username)[0]|upper}}</i><div><b>{{r.full_name or r.username}}</b><small>{{r.branch_name}} - Shift {{r.shift_name or '-'}}{% if r.break_started_at %} - ISTIRAHAT{% endif %}</small></div><strong><span>RECORD</span>{{r.sales_n+r.quick_n}}</strong><strong><span>TOTAL</span>{{rupiah((r.sales_total or 0)+(r.quick_total or 0))}}</strong><strong><span>MASUK</span>{{r.login_at[11:16]}}</strong></div>{% else %}<div class="ai-empty">Tidak ada operator aktif.</div>{% endfor %}</div></article><article class="cash-admin-card"><div class="cash-admin-head"><div><span>ADMIN TOOLS</span><h3>Administrasi Kasir</h3></div></div><div class="cash-admin-actions"><a href="{{url_for('admin_cashier_operators')}}"><i>♙</i><b>Akun Operator</b><small>Buat, aktifkan, reset password, dan atur cabang asal kasir.</small></a><a href="{{url_for('cashier_operator_sessions')}}"><i>▤</i><b>Rekap Sesi</b><small>Lihat login, logout, shift, transaksi, kas, dan selisih.</small></a><a href="{{url_for('admin_cashier_rotation_log')}}"><i>⇄</i><b>Log Rotasi</b><small>Telusuri perpindahan operator dan aktivitas istirahat.</small></a><a href="{{url_for('sales_history')}}"><i>◷</i><b>Riwayat Penjualan</b><small>Audit transaksi berdasarkan operator dan cabang.</small></a></div></article></section></div>''',live=live,today_summary=today_summary,rotations=rotations,rupiah=rupiah)
+    return render_page('Control Center Kasir',body)
+
+@app.route('/admin/cashier-operators',methods=['GET','POST'])
+@login_required
+@role_required('admin')
+def admin_cashier_operators():
+    ensure_cashier_operator_schema()
+    if request.method=='POST':
+        action=request.form.get('action','create')
+        if action=='create':
+            username=(request.form.get('username') or '').strip(); name=(request.form.get('full_name') or '').strip(); password=request.form.get('password') or ''; bid=request.form.get('branch_id') or None
+            if not username or not name or len(password)<6: flash('Username, nama, dan password minimal 6 karakter wajib diisi.','error')
+            else:
+                try: uid=exec_sql('INSERT INTO users(username,full_name,password_hash,role,active,status,branch_id) VALUES(?,?,?,\'kasir\',1,\'ACTIVE\',?)',[username,name,hash_password(password),bid]); log_action('CREATE_CASHIER_OPERATOR','users',uid,f'{username}; home_branch={bid}'); flash('Akun operator kasir berhasil dibuat dan aktif.','success')
+                except sqlite3.IntegrityError: flash('Username sudah digunakan.','error')
+        elif action=='toggle':
+            uid=int(request.form.get('user_id') or 0); row=q_one("SELECT active,username FROM users WHERE id=? AND role IN ('kasir','branch_cashier')",[uid])
+            if row: active=0 if row['active'] else 1; exec_sql('UPDATE users SET active=?,status=? WHERE id=?',[active,'ACTIVE' if active else 'NONACTIVE',uid]); log_action('TOGGLE_CASHIER_OPERATOR','users',uid,f"{row['username']} active={active}"); flash('Status operator diperbarui.','success')
+        elif action=='reset_password':
+            uid=int(request.form.get('user_id') or 0); password=request.form.get('new_password') or ''
+            if len(password)<6: flash('Password baru minimal 6 karakter.','error')
+            else: exec_sql("UPDATE users SET password_hash=? WHERE id=? AND role IN ('kasir','branch_cashier')",[hash_password(password),uid]); log_action('RESET_CASHIER_PASSWORD','users',uid,'Reset oleh admin'); flash('Password operator berhasil direset.','success')
+        return redirect(url_for('admin_cashier_operators'))
+    branches=q_all('SELECT id,branch_code,name FROM koperasi_branches WHERE is_active=1 ORDER BY name'); rows=q_all("SELECT u.*,COALESCE(b.name,'Belum ditetapkan') branch_name,(SELECT COUNT(*) FROM cashier_operator_sessions cs WHERE cs.operator_user_id=u.id) session_count,(SELECT MAX(login_at) FROM cashier_operator_sessions cs WHERE cs.operator_user_id=u.id) last_login FROM users u LEFT JOIN koperasi_branches b ON b.id=u.branch_id WHERE u.role IN ('kasir','branch_cashier') ORDER BY u.full_name")
+    body=render_template_string(r'''<div class="cash-admin"><header class="cash-admin-hero"><div><span>CASHIER IDENTITY ADMIN</span><h2>Akun Operator Kasir</h2><p>Kelola identitas kasir. Cabang asal hanya untuk administrasi, operator tetap dapat dirotasi ke cabang mana pun.</p></div></header><section class="cash-admin-card"><div class="cash-admin-head"><div><span>NEW OPERATOR</span><h3>Tambah Akun Kasir</h3></div></div><form method="post" class="operator-admin-form"><input type="hidden" name="action" value="create"><div class="form-group"><label>Username</label><input name="username" required></div><div class="form-group"><label>Nama Lengkap</label><input name="full_name" required></div><div class="form-group"><label>Password Awal</label><input type="password" name="password" minlength="6" required></div><div class="form-group"><label>Cabang Asal</label><select name="branch_id"><option value="">Belum ditetapkan</option>{% for b in branches %}<option value="{{b.id}}">{{b.branch_code}} - {{b.name}}</option>{% endfor %}</select></div><button class="btn-success full">Buat Operator Aktif</button></form></section><section class="cash-admin-card"><div class="cash-admin-head"><div><span>OPERATOR DIRECTORY</span><h3>Daftar Operator</h3></div></div><div class="table-wrap"><table><thead><tr><th>Operator</th><th>Cabang Asal</th><th>Sesi</th><th>Login Terakhir</th><th>Status</th><th>Aksi</th></tr></thead><tbody>{% for r in rows %}<tr><td><b>{{r.full_name}}</b><small>{{r.username}}</small></td><td>{{r.branch_name}}</td><td>{{r.session_count}}</td><td>{{r.last_login or '-'}}</td><td><span class="badge {{'badge-success' if r.active else 'badge-danger'}}">{{'Aktif' if r.active else 'Nonaktif'}}</span></td><td><div style="display:flex;gap:5px;flex-wrap:wrap"><form method="post"><input type="hidden" name="action" value="toggle"><input type="hidden" name="user_id" value="{{r.id}}"><button class="btn-sm {{'btn-danger' if r.active else 'btn-success'}}">{{'Nonaktifkan' if r.active else 'Aktifkan'}}</button></form><form method="post" style="display:flex;gap:4px"><input type="hidden" name="action" value="reset_password"><input type="hidden" name="user_id" value="{{r.id}}"><input type="password" name="new_password" minlength="6" placeholder="Password baru" required style="width:130px"><button class="btn-sm btn-ghost">Reset</button></form></div></td></tr>{% else %}<tr><td colspan="6" class="muted text-center">Belum ada operator.</td></tr>{% endfor %}</tbody></table></div></section></div>''',rows=rows,branches=branches)
+    return render_page('Akun Operator Kasir',body)
+
+@app.route('/admin/cashier-rotation-log')
+@login_required
+@role_required('admin')
+def admin_cashier_rotation_log():
+    ensure_cashier_operator_schema(); start=request.args.get('start') or today_str(); end=request.args.get('end') or today_str(); event=(request.args.get('event') or '').strip(); params=[start+' 00:00:00',end+' 23:59:59']
+    sql='''SELECT rl.*,u.full_name,u.username,COALESCE(hb.name,'Belum ditetapkan') home_branch,COALESCE(wb.name,'PUSAT') worked_branch,tu.full_name terminal_name FROM cashier_rotation_logs rl LEFT JOIN users u ON u.id=rl.operator_user_id LEFT JOIN koperasi_branches hb ON hb.id=rl.home_branch_id LEFT JOIN koperasi_branches wb ON wb.id=rl.worked_branch_id LEFT JOIN users tu ON tu.id=rl.terminal_user_id WHERE rl.event_at BETWEEN ? AND ?'''
+    if event: sql+=' AND rl.event_type=?'; params.append(event)
+    rows=q_all(sql+' ORDER BY rl.id DESC LIMIT 1000',params)
+    body=render_template_string(r'''<div class="cash-admin"><header class="cash-admin-hero"><div><span>ROTATION AUDIT LEDGER</span><h2>Log Rotasi Kasir</h2><p>Jejak login, logout, perpindahan cabang, istirahat, terminal, IP, dan catatan penugasan.</p></div></header><section class="cash-admin-card"><div class="cash-admin-head"><div><span>AUDIT FILTER</span><h3>Aktivitas Operator</h3></div><form method="get" class="rotation-filter"><input type="date" name="start" value="{{start}}"><input type="date" name="end" value="{{end}}"><select name="event"><option value="">Semua event</option>{% for x in ['LOGIN','LOGOUT','BREAK_START','BREAK_END'] %}<option value="{{x}}" {{'selected' if event==x else ''}}>{{x}}</option>{% endfor %}</select><button>Terapkan</button></form></div><div class="table-wrap"><table><thead><tr><th>Waktu</th><th>Operator</th><th>Event</th><th>Asal</th><th>Bertugas</th><th>Terminal</th><th>IP</th><th>Catatan</th></tr></thead><tbody>{% for r in rows %}<tr><td>{{r.event_at}}</td><td><b>{{r.full_name or r.username}}</b><small>{{r.username}}</small></td><td><span class="badge {{'badge-success' if r.event_type=='LOGIN' else 'badge-danger' if r.event_type=='LOGOUT' else 'badge-info'}}">{{r.event_type}}</span></td><td>{{r.home_branch}}</td><td>{{r.worked_branch}}</td><td>{{r.terminal_name or '-'}}</td><td><code>{{r.ip_address or '-'}}</code></td><td>{{r.note or '-'}}</td></tr>{% else %}<tr><td colspan="8" class="muted text-center">Tidak ada log pada periode ini.</td></tr>{% endfor %}</tbody></table></div></section></div>''',rows=rows,start=start,end=end,event=event)
+    return render_page('Log Rotasi Kasir',body)
+
+
+# =========================
+# Static Branch QR Wallet Payment
+# =========================
+def ensure_branch_qr_payment_schema():
+    conn=get_conn()
+    try:
+        conn.execute('''CREATE TABLE IF NOT EXISTS branch_qr_profiles(
+          branch_id INTEGER PRIMARY KEY,qr_token TEXT UNIQUE NOT NULL,is_active INTEGER DEFAULT 1,
+          created_at TEXT NOT NULL,created_by INTEGER,last_generated_at TEXT,
+          FOREIGN KEY(branch_id) REFERENCES koperasi_branches(id))''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS branch_qr_payment_intents(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,payment_code TEXT UNIQUE NOT NULL,branch_id INTEGER NOT NULL,
+          amount REAL NOT NULL,status TEXT DEFAULT 'WAITING',note TEXT,operator_user_id INTEGER,
+          cashier_session_id INTEGER,member_id INTEGER,wallet_account_no TEXT,created_at TEXT NOT NULL,
+          paid_at TEXT,cancelled_at TEXT,expires_at TEXT,client_reference TEXT,
+          FOREIGN KEY(branch_id) REFERENCES koperasi_branches(id),FOREIGN KEY(member_id) REFERENCES members(id))''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS branch_qr_payment_events(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,intent_id INTEGER,branch_id INTEGER,event_type TEXT,
+          event_at TEXT,user_id INTEGER,member_id INTEGER,ip_address TEXT,detail TEXT)''')
+        cols={r['name'] for r in conn.execute('PRAGMA table_info(branch_qr_payment_intents)').fetchall()}
+        if 'qr_mode' not in cols: conn.execute("ALTER TABLE branch_qr_payment_intents ADD COLUMN qr_mode TEXT DEFAULT 'STATIC'")
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_branch_qr_intent_branch ON branch_qr_payment_intents(branch_id,status,id)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_branch_qr_event_intent ON branch_qr_payment_events(intent_id,id)')
+        conn.commit()
+    finally: conn.close()
+
+def branch_qr_profile(branch_id,create=True):
+    ensure_branch_qr_payment_schema()
+    row=q_one('SELECT * FROM branch_qr_profiles WHERE branch_id=?',[branch_id])
+    if not row and create:
+        token=os.urandom(20).hex()
+        exec_sql('INSERT INTO branch_qr_profiles(branch_id,qr_token,is_active,created_at,created_by,last_generated_at) VALUES(?,?,1,?,?,?)',[branch_id,token,now_str(),session.get('user_id'),now_str()])
+        row=q_one('SELECT * FROM branch_qr_profiles WHERE branch_id=?',[branch_id])
+        log_action('CREATE_BRANCH_STATIC_QR','branch_qr_profiles',branch_id,f'token={token[:8]}')
+    return row
+
+def qr_payment_event(intent_id,branch_id,event_type,detail='',member_id=None):
+    exec_sql('INSERT INTO branch_qr_payment_events(intent_id,branch_id,event_type,event_at,user_id,member_id,ip_address,detail) VALUES(?,?,?,?,?,?,?,?)',[intent_id,branch_id,event_type,now_str(),session.get('user_id'),member_id,safe_request_ip() if 'safe_request_ip' in globals() else (request.remote_addr or ''),detail[:500]])
+
+def current_wallet_member():
+    return wallet_member_for_user(current_user()) if 'wallet_member_for_user' in globals() else None
+
+
+CSS_DESIGN += r"""
+/* STATIC QR MENU VISIBILITY + PREMIUM CAMERA */
+#sidebar a[href="/cashier/qr-payment"],#sidebar a[href="/cashier/qr-payment/history"]{display:grid!important;visibility:visible!important;opacity:1!important}
+.camera-glyph{position:relative!important}.camera-glyph:before{content:'';display:block;width:20px;height:14px;border:2px solid currentColor;border-radius:5px}.camera-glyph:after{content:'';position:absolute;width:6px;height:6px;border:2px solid currentColor;border-radius:50%;left:50%;top:50%;transform:translate(-50%,-50%)}.qr-camera-primary .camera-glyph{background:linear-gradient(145deg,#2563eb,#0f9f97)!important;color:#fff!important}
+.wallet-scanner{display:grid;gap:14px;max-width:680px;margin:0 auto}.scanner-hero{position:relative;overflow:hidden;padding:27px;border-radius:22px;background:radial-gradient(circle at 85% 15%,rgba(37,99,235,.4),transparent 27%),linear-gradient(135deg,#05101c,#123c55);color:#fff;box-shadow:0 22px 55px rgba(5,16,28,.25)}.scanner-grid{position:absolute;inset:0;background-image:linear-gradient(rgba(103,232,249,.07) 1px,transparent 1px),linear-gradient(90deg,rgba(96,165,250,.06) 1px,transparent 1px);background-size:25px 25px;animation:managerGridMove 18s linear infinite}.scanner-hero>span,.scanner-hero h2,.scanner-hero p{position:relative;z-index:2}.scanner-hero>span{color:#67e8f9;font-size:8px;font-weight:950;letter-spacing:.18em}.scanner-hero h2{margin:8px 0;color:#fff;font-size:28px}.scanner-hero p{margin:0;max-width:530px;color:#b9cede;font-size:10px;line-height:1.6}.scanner-stage{position:relative;overflow:hidden;aspect-ratio:4/5;max-height:590px;border:1px solid rgba(103,232,249,.17);border-radius:25px;background:#030b12;box-shadow:0 20px 50px rgba(3,11,18,.28)}.scanner-stage video{width:100%;height:100%;object-fit:cover}.scanner-overlay{position:absolute;left:50%;top:48%;width:min(68%,330px);aspect-ratio:1;transform:translate(-50%,-50%);border:1px solid rgba(255,255,255,.13);border-radius:25px;box-shadow:0 0 0 999px rgba(2,8,14,.45)}.scanner-overlay>i{position:absolute;width:52px;height:52px;border-color:#67e8f9;border-style:solid;filter:drop-shadow(0 0 7px #22d3ee)}.scanner-overlay>i:nth-child(1){left:-2px;top:-2px;border-width:4px 0 0 4px;border-radius:20px 0 0}.scanner-overlay>i:nth-child(2){right:-2px;top:-2px;border-width:4px 4px 0 0;border-radius:0 20px 0 0}.scanner-overlay>i:nth-child(3){left:-2px;bottom:-2px;border-width:0 0 4px 4px;border-radius:0 0 0 20px}.scanner-overlay>i:nth-child(4){right:-2px;bottom:-2px;border-width:0 4px 4px 0;border-radius:0 0 20px}.scanner-overlay>span{position:absolute;left:12%;right:12%;top:0;height:2px;background:linear-gradient(90deg,transparent,#67e8f9,transparent);box-shadow:0 0 16px #22d3ee;animation:scannerSweep 2.4s ease-in-out infinite alternate}.scanner-status{position:absolute;left:18px;right:18px;bottom:18px;display:flex;align-items:center;gap:9px;padding:12px 14px;border:1px solid rgba(255,255,255,.12);border-radius:16px;background:rgba(3,11,18,.72);backdrop-filter:blur(14px);color:#c3d4df;font-size:9px}.scanner-status>i{width:8px;height:8px;border-radius:50%;background:#f59e0b;box-shadow:0 0 10px #f59e0b}.scanner-status.ok>i{background:#2dd4bf;box-shadow:0 0 10px #2dd4bf;animation:adminPresencePulse 1.8s infinite}.scanner-tools{display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:17px;border:1px solid #dce6ed;border-radius:20px;background:#fff}.scanner-tools>button{width:100%}.scanner-manual{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;color:#64748b;font-size:8px;font-weight:900}.scanner-manual input{grid-column:1}.scanner-manual button{grid-column:2;grid-row:2}.scanner-tools>p{grid-column:1/-1;margin:0;color:#8b98a5;font-size:8px;line-height:1.5}@keyframes scannerSweep{to{top:100%}}
+@media(max-width:768px){.wallet-scanner{padding:0 12px}.scanner-hero{padding:21px;border-radius:22px}.scanner-hero h2{font-size:24px}.scanner-stage{max-height:none;aspect-ratio:3/4;border-radius:23px}.scanner-tools{border-radius:20px}.scanner-manual{grid-template-columns:1fr}.scanner-manual input,.scanner-manual button{grid-column:1;grid-row:auto}.qr-camera-primary .mn-icon{width:50px!important;height:50px!important;margin-top:-25px!important;border:5px solid #eef3ef!important;border-radius:18px!important;box-shadow:0 13px 27px rgba(37,99,235,.32)!important}}
+"""
+
+@app.route('/wallet/scan-qr')
+@login_required
+@role_required('user')
+def wallet_qr_scanner():
+    member=current_wallet_member()
+    if not member:
+        flash('Akun anggota belum terhubung dengan wallet.','error'); return redirect(url_for('dashboard'))
+    body=render_template_string(r'''<div class="wallet-scanner"><header class="scanner-hero"><div class="scanner-grid"></div><span>KOPERASI WALLET CAMERA</span><h2>Scan untuk Bayar</h2><p>Arahkan kamera ke QR statis cabang. Nominal aktif dari kasir akan muncul otomatis setelah QR terbaca.</p></header><section class="scanner-stage"><video id="qrCamera" playsinline muted></video><div class="scanner-overlay"><i></i><i></i><i></i><i></i><span></span></div><div class="scanner-beam"></div><div id="scannerStatus" class="scanner-status"><i></i><span>Menyiapkan kamera...</span></div></section><section class="scanner-tools"><button type="button" id="startScan" class="btn-success">Aktifkan Kamera</button><button type="button" id="switchCamera" class="btn-ghost">Ganti Kamera</button><label class="scanner-manual">Atau tempel tautan QR<input id="manualQrUrl" type="url" placeholder="http://server:5000/pay/branch/..."><button type="button" id="openManual">Buka Pembayaran</button></label><p>Kamera browser membutuhkan HTTPS, kecuali saat memakai localhost. Jika kamera ditolak, izinkan akses kamera pada pengaturan browser.</p></section></div><script>(function(){var video=document.getElementById('qrCamera'),status=document.getElementById('scannerStatus'),stream=null,facing='environment',running=false,detector=null;function setStatus(t,ok){status.querySelector('span').textContent=t;status.classList.toggle('ok',!!ok)}function valid(url){try{var u=new URL(url,location.origin);return u.origin===location.origin&&u.pathname.indexOf('/pay/branch/')===0}catch(e){return false}}function go(url){if(!valid(url)){setStatus('QR bukan QR pembayaran koperasi',false);return}setStatus('QR terbaca. Membuka pembayaran...',true);stop();location.href=new URL(url,location.origin).href}async function scanLoop(){if(!running||!detector)return;try{var codes=await detector.detect(video);if(codes&&codes.length){go(codes[0].rawValue);return}}catch(e){}requestAnimationFrame(scanLoop)}async function start(){stop();setStatus('Meminta izin kamera...',false);try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:facing}},audio:false});video.srcObject=stream;await video.play();running=true;if('BarcodeDetector' in window){detector=new BarcodeDetector({formats:['qr_code']});setStatus('Kamera aktif. Arahkan ke QR cabang.',true);scanLoop()}else{setStatus('Browser belum mendukung pembaca QR otomatis. Gunakan Chrome terbaru atau tempel tautan QR.',false)}}catch(e){setStatus('Kamera tidak dapat dibuka: '+(e.message||e.name),false)}}function stop(){running=false;if(stream){stream.getTracks().forEach(function(t){t.stop()});stream=null}}document.getElementById('startScan').onclick=start;document.getElementById('switchCamera').onclick=function(){facing=facing==='environment'?'user':'environment';start()};document.getElementById('openManual').onclick=function(){go(document.getElementById('manualQrUrl').value)};window.addEventListener('pagehide',stop);if(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia)start();else setStatus('Perangkat tidak mendukung akses kamera browser.',false)})();</script>''')
+    return render_page('Scan QR Pembayaran',body)
+
+
+@app.route('/cashier/qr-dynamic',methods=['GET','POST'])
+@login_required
+@role_required('admin','kasir','branch_admin','branch_cashier')
+def cashier_qr_dynamic():
+    ensure_branch_qr_payment_schema(); bid=get_branch_id()
+    if not bid:
+        flash('Terminal belum mempunyai cabang aktif.','error'); return redirect(url_for('dashboard'))
+    intent=None
+    if request.method=='POST':
+        amount=parse_float(request.form.get('amount'),0); note=(request.form.get('note') or '').strip()[:200]
+        if amount<1000:
+            flash('Nominal minimal Rp1.000.','error')
+        else:
+            code='QRD-'+datetime.now().strftime('%Y%m%d%H%M%S')+'-'+os.urandom(3).hex().upper()
+            expires=(datetime.now()+timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M:%S')
+            iid=exec_sql('''INSERT INTO branch_qr_payment_intents(payment_code,branch_id,amount,status,note,operator_user_id,cashier_session_id,created_at,expires_at,qr_mode) VALUES(?,?,?,'WAITING',?,?,?,?,?,'DYNAMIC')''',[code,bid,amount,note,cashier_operator_id(),cashier_operator_session_id(),now_str(),expires])
+            qr_payment_event(iid,bid,'DYNAMIC_CREATED',f'Nominal {amount}')
+            return redirect(url_for('cashier_qr_dynamic',intent=iid))
+    iid=request.args.get('intent',type=int)
+    if iid: intent=q_one("SELECT * FROM branch_qr_payment_intents WHERE id=? AND branch_id=? AND qr_mode='DYNAMIC'",[iid,bid])
+    recent=q_all("SELECT * FROM branch_qr_payment_intents WHERE branch_id=? AND qr_mode='DYNAMIC' ORDER BY id DESC LIMIT 10",[bid])
+    body=render_template_string(r'''<div class="branch-qr-suite"><header class="branch-qr-hero dynamic"><div class="branch-qr-lines"></div><div><span>ONE-TIME AMOUNT QR</span><h2>Generate QR Nominal</h2><p>Buat QR khusus untuk satu nominal. QR ini berbeda tiap transaksi dan tidak terpengaruh tagihan QR statis cabang.</p></div><div class="branch-qr-live"><i></i> SECURE INTENT</div></header><section class="dynamic-qr-layout"><article class="branch-qr-terminal"><div class="branch-qr-title"><div><span>MANUAL AMOUNT</span><h3>Buat Tagihan Baru</h3></div></div><form method="post" class="qr-amount-form"><label>Nominal pembayaran<input type="number" name="amount" min="1000" step="1000" placeholder="Rp 20.000" required autofocus></label><label>Catatan transaksi<input name="note" maxlength="200" placeholder="Contoh: Belanja koperasi"></label><button class="btn-success">Generate QR Sekarang</button></form></article>{% if intent %}<article class="dynamic-qr-result" id="dynamicQR" data-id="{{intent.id}}"><div class="branch-qr-title"><div><span>QR TRANSAKSI</span><h3>{{intent.payment_code}}</h3></div><span class="badge badge-warn" id="dynamicStatus">{{intent.status}}</span></div><img src="{{url_for('dynamic_qr_image',payment_code=intent.payment_code)}}"><b>{{rupiah(intent.amount)}}</b><small>Berlaku sampai {{intent.expires_at}}</small><div id="dynamicPaidResult"></div></article>{% endif %}</section><section class="branch-qr-history"><header><div><span>GENERATED HISTORY</span><h3>QR Nominal Terbaru</h3></div></header><div>{% for r in recent %}<article><i class="{{r.status|lower}}"></i><div><b>{{r.payment_code}}</b><small>{{r.created_at}} · {{r.note or '-'}}</small></div><strong>{{rupiah(r.amount)}}</strong><span class="badge {{'badge-success' if r.status=='PAID' else 'badge-warn' if r.status=='WAITING' else 'badge-gray'}}">{{r.status}}</span></article>{% endfor %}</div></section></div>{% if intent %}<script>(function(){var id={{intent.id}};function poll(){fetch('{{url_for("api_dynamic_qr_status",intent_id=intent.id)}}',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){if(!d.ok)return;document.getElementById('dynamicStatus').textContent=d.status;if(d.status==='PAID'){document.getElementById('dynamicPaidResult').innerHTML='<div class="qr-paid-pop"><i>✓</i><b>Pembayaran Berhasil</b><strong>'+d.member_name+'</strong></div>';setTimeout(function(){location.reload()},2500)}})}poll();setInterval(poll,2000)})();</script>{% endif %}''',intent=intent,recent=recent,rupiah=rupiah)
+    return render_page('Generate QR Nominal',cashier_operator_banner()+body)
+
+@app.route('/cashier/qr-dynamic/image/<payment_code>')
+@login_required
+def dynamic_qr_image(payment_code):
+    row=q_one("SELECT * FROM branch_qr_payment_intents WHERE payment_code=? AND qr_mode='DYNAMIC'",[payment_code])
+    if not row: return ('QR tidak ditemukan',404)
+    user=current_user(); bid=get_branch_id()
+    if is_branch_role(user) and int(bid or 0)!=int(row['branch_id']): return ('Forbidden',403)
+    url=request.host_url.rstrip('/')+url_for('dynamic_qr_pay',payment_code=payment_code)
+    img=qrcode.make(url); buf=BytesIO(); img.save(buf,format='PNG'); buf.seek(0)
+    return send_file(buf,mimetype='image/png',download_name=f'{payment_code}.png')
+
+@app.route('/pay/intent/<payment_code>',methods=['GET','POST'])
+@login_required
+def dynamic_qr_pay(payment_code):
+    ensure_branch_qr_payment_schema(); intent=q_one("SELECT * FROM branch_qr_payment_intents WHERE payment_code=? AND qr_mode='DYNAMIC'",[payment_code])
+    if not intent: return ('Tagihan QR tidak ditemukan.',404)
+    member=current_wallet_member()
+    if not member:
+        flash('Akun anggota belum terhubung ke wallet.','error'); return redirect(url_for('dashboard'))
+    if intent['status']=='WAITING' and intent['expires_at']<now_str():
+        exec_sql("UPDATE branch_qr_payment_intents SET status='EXPIRED',cancelled_at=? WHERE id=? AND status='WAITING'",[now_str(),intent['id']]); intent=q_one('SELECT * FROM branch_qr_payment_intents WHERE id=?',[intent['id']])
+    balance=wallet_balance(member['id'])
+    if request.method=='POST':
+        conn=get_conn()
+        try:
+            conn.execute('BEGIN IMMEDIATE'); locked=conn.execute("SELECT * FROM branch_qr_payment_intents WHERE id=? AND status='WAITING'",[intent['id']]).fetchone()
+            if not locked: raise ValueError('Tagihan tidak lagi aktif.')
+            saldo=conn.execute('SELECT COALESCE(SUM(CASE WHEN tipe="MASUK" THEN nominal ELSE -nominal END),0) saldo FROM saldo_history WHERE member_id=?',[member['id']]).fetchone()['saldo'] or 0; amount=float(locked['amount'])
+            if float(saldo)<amount: raise ValueError(f'Saldo tidak cukup. Tersedia {rupiah(saldo)}.')
+            after=float(saldo)-amount
+            conn.execute('INSERT INTO saldo_history(member_id,tipe,nominal,saldo_sebelum,saldo_setelah,keterangan,reference_id,created_by) VALUES(?,"KELUAR",?,?,?,?,?,?)',[member['id'],amount,saldo,after,f'QR Dinamis {locked["payment_code"]}',locked['id'],session.get('user_id')])
+            changed=conn.execute("UPDATE branch_qr_payment_intents SET status='PAID',member_id=?,wallet_account_no=(SELECT account_no FROM wallet_accounts WHERE member_id=?),paid_at=? WHERE id=? AND status='WAITING'",[member['id'],member['id'],now_str(),locked['id']]).rowcount
+            if changed!=1: raise ValueError('Pembayaran sudah diproses.')
+            conn.execute('INSERT INTO branch_qr_payment_events(intent_id,branch_id,event_type,event_at,user_id,member_id,ip_address,detail) VALUES(?,?,?,?,?,?,?,?)',[locked['id'],locked['branch_id'],'DYNAMIC_PAID',now_str(),session.get('user_id'),member['id'],request.remote_addr or '',f'saldo={saldo}->{after}'])
+            conn.commit(); flash('Pembayaran berhasil.','success'); return redirect(url_for('dynamic_qr_pay',payment_code=payment_code))
+        except Exception as e: conn.rollback(); flash(str(e),'error')
+        finally: conn.close()
+    intent=q_one('SELECT * FROM branch_qr_payment_intents WHERE id=?',[intent['id']])
+    body=render_template_string(r'''<div class="member-qr-pay"><header><span>DYNAMIC QR PAYMENT</span><h2>{{branch}}</h2><p>Tagihan khusus {{intent.payment_code}}</p></header><section class="member-pay-card"><div><span>{{intent.status}}</span><b>{{rupiah(intent.amount)}}</b><small>{{intent.note or 'Pembayaran koperasi'}}</small></div><div class="member-pay-balance"><span>Saldo Anda</span><b>{{rupiah(balance)}}</b></div>{% if intent.status=='WAITING' %}<form method="post"><button class="btn-success" {{'disabled' if balance<intent.amount else ''}}>Bayar Sekarang</button></form>{% elif intent.status=='PAID' %}<div class="member-pay-success"><i>✓</i><h3>Sudah Dibayar</h3><small>{{intent.paid_at}}</small></div>{% else %}<p>Tagihan sudah {{intent.status}}.</p>{% endif %}</section></div>''',intent=intent,balance=float(balance),branch=get_branch_name(intent['branch_id']),rupiah=rupiah)
+    return render_page('Bayar QR Nominal',body)
+
+@app.route('/api/cashier/qr-dynamic/status/<int:intent_id>')
+@login_required
+@role_required('admin','kasir','branch_admin','branch_cashier')
+def api_dynamic_qr_status(intent_id):
+    bid=get_branch_id(); row=q_one('''SELECT i.status,i.amount,i.paid_at,COALESCE(m.name,'') member_name FROM branch_qr_payment_intents i LEFT JOIN members m ON m.id=i.member_id WHERE i.id=? AND i.branch_id=?''',[intent_id,bid])
+    return jsonify({'ok':bool(row),**(dict(row) if row else {})})
+
+@app.route('/cashier/qr-payment',methods=['GET','POST'])
+@login_required
+@role_required('admin','kasir','branch_admin','branch_cashier')
+def cashier_qr_payment():
+    ensure_branch_qr_payment_schema(); bid=get_branch_id(); operator=active_cashier_operator()
+    if not bid:
+        flash('Terminal kasir belum memiliki cabang aktif.','error'); return redirect(url_for('dashboard'))
+    profile=branch_qr_profile(bid)
+    if request.method=='POST':
+        action=request.form.get('action','create')
+        if action=='create':
+            amount=parse_float(request.form.get('amount'),0); note=(request.form.get('note') or '').strip()[:200]
+            if amount<1000: flash('Nominal QR minimal Rp1.000.','error')
+            else:
+                # Only one waiting price on a terminal/operator at a time; old ones are safely cancelled.
+                exec_sql("UPDATE branch_qr_payment_intents SET status='CANCELLED',cancelled_at=? WHERE branch_id=? AND status='WAITING'",[now_str(),bid])
+                code='QRP-'+datetime.now().strftime('%Y%m%d%H%M%S')+'-'+os.urandom(3).hex().upper()
+                expires=(datetime.now()+timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M:%S')
+                iid=exec_sql('''INSERT INTO branch_qr_payment_intents(payment_code,branch_id,amount,status,note,operator_user_id,cashier_session_id,created_at,expires_at) VALUES(?,?,?,'WAITING',?,?,?,?,?)''',[code,bid,amount,note,cashier_operator_id(),cashier_operator_session_id(),now_str(),expires])
+                qr_payment_event(iid,bid,'CREATED',f'Nominal {amount}; operator={cashier_operator_id()}')
+                flash(f'Tagihan {rupiah(amount)} aktif. Pelanggan dapat scan QR statis cabang.','success')
+        elif action=='cancel':
+            iid=int(request.form.get('intent_id') or 0)
+            changed=exec_sql("UPDATE branch_qr_payment_intents SET status='CANCELLED',cancelled_at=? WHERE id=? AND branch_id=? AND status='WAITING'",[now_str(),iid,bid])
+            qr_payment_event(iid,bid,'CANCELLED','Dibatalkan kasir')
+            flash('Tagihan QR dibatalkan.','warning')
+        return redirect(url_for('cashier_qr_payment'))
+    active=q_one("SELECT * FROM branch_qr_payment_intents WHERE branch_id=? AND operator_user_id=? AND status='WAITING' ORDER BY id DESC LIMIT 1",[bid,cashier_operator_id()])
+    recent=q_all('''SELECT i.*,m.name member_name FROM branch_qr_payment_intents i LEFT JOIN members m ON m.id=i.member_id WHERE i.branch_id=? ORDER BY i.id DESC LIMIT 20''',[bid])
+    pay_url=request.host_url.rstrip('/')+url_for('branch_qr_pay',token=profile['qr_token'])
+    body=render_template_string(r'''<div class="branch-qr-suite"><header class="branch-qr-hero"><div class="branch-qr-lines"></div><div><span>STATIC BRANCH PAYMENT NODE</span><h2>QR Payment {{branch_name}}</h2><p>QR tetap untuk cabang ini. Kasir cukup menentukan nominal, pelanggan scan dari akun wallet, lalu status pembayaran muncul otomatis.</p></div><div class="branch-qr-live"><i></i> REAL-TIME</div></header><section class="branch-qr-grid"><article class="branch-qr-code"><div class="branch-qr-title"><div><span>QR STATIS CABANG</span><h3>{{branch_name}}</h3></div><a href="{{url_for('branch_qr_image',branch_id=bid)}}" target="_blank">Cetak QR</a></div><img src="{{url_for('branch_qr_image',branch_id=bid)}}" alt="QR pembayaran cabang"><code>{{pay_url}}</code><small>QR tidak berubah ketika nominal berganti.</small></article><article class="branch-qr-terminal"><div class="branch-qr-title"><div><span>PAYMENT TERMINAL</span><h3>Nominal Transaksi</h3></div></div>{% if active %}<div id="qrActiveIntent" data-id="{{active.id}}" class="qr-active"><span>MENUNGGU PEMBAYARAN</span><b>{{rupiah(active.amount)}}</b><small>{{active.payment_code}} · Kedaluwarsa {{active.expires_at}}</small><div class="qr-radar"><i></i><em></em></div><form method="post"><input type="hidden" name="action" value="cancel"><input type="hidden" name="intent_id" value="{{active.id}}"><button class="btn-danger">Batalkan Tagihan</button></form></div>{% else %}<form method="post" class="qr-amount-form"><input type="hidden" name="action" value="create"><label>Nominal pembayaran<input type="number" name="amount" min="1000" step="1000" placeholder="Rp 20.000" required autofocus></label><label>Catatan transaksi<input name="note" maxlength="200" placeholder="Opsional, misalnya belanja koperasi"></label><button class="btn-success">Aktifkan Tagihan QR</button></form>{% endif %}<div id="qrPaymentResult"></div></article></section><section class="branch-qr-history"><header><div><span>LIVE PAYMENT HISTORY</span><h3>Transaksi QR Cabang</h3></div><a href="{{url_for('branch_qr_payment_history')}}">Lihat Semua</a></header><div id="qrRecentList">{% for r in recent %}<article><i class="{{r.status|lower}}"></i><div><b>{{r.payment_code}}</b><small>{{r.member_name or 'Belum dibayar'}} · {{r.created_at}}</small></div><strong>{{rupiah(r.amount)}}</strong><span class="badge {{'badge-success' if r.status=='PAID' else 'badge-warn' if r.status=='WAITING' else 'badge-gray'}}">{{r.status}}</span></article>{% endfor %}</div></section></div><script>(function(){var last={{recent[0].id if recent else 0}},active=document.getElementById('qrActiveIntent');function rupiah(n){return 'Rp'+Number(n||0).toLocaleString('id-ID')}function poll(){fetch('{{url_for("api_cashier_qr_status")}}?after='+last,{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){if(!d.ok)return;if(d.latest_id>last)last=d.latest_id;if(active&&d.active&&Number(active.dataset.id)===Number(d.active.id)&&d.active.status==='PAID'){var box=document.getElementById('qrPaymentResult');box.innerHTML='<div class="qr-paid-pop"><i>✓</i><b>Pembayaran Berhasil</b><strong>'+rupiah(d.active.amount)+'</strong><small>'+d.active.member_name+' · '+d.active.payment_code+'</small></div>';active.style.display='none';setTimeout(function(){location.reload()},2600)}if(d.new_paid&&d.new_paid.length&&!active){location.reload()}}).catch(function(){})}poll();setInterval(poll,2000)})();</script>''',bid=bid,branch_name=get_branch_name(bid),profile=profile,active=active,recent=recent,pay_url=pay_url,rupiah=rupiah)
+    return render_page('QR Payment Cabang',cashier_operator_banner()+body)
+
+@app.route('/cashier/qr-payment/image/<int:branch_id>')
+@login_required
+def branch_qr_image(branch_id):
+    user=current_user(); bid=get_branch_id()
+    if is_branch_role(user) and int(bid or 0)!=branch_id: return ('Forbidden',403)
+    profile=branch_qr_profile(branch_id); url=request.host_url.rstrip('/')+url_for('branch_qr_pay',token=profile['qr_token'])
+    img=qrcode.make(url); buf=BytesIO(); img.save(buf,format='PNG'); buf.seek(0)
+    exec_sql('UPDATE branch_qr_profiles SET last_generated_at=? WHERE branch_id=?',[now_str(),branch_id])
+    return send_file(buf,mimetype='image/png',download_name=f'QR-PAY-{branch_id}.png')
+
+@app.route('/api/cashier/qr-payment/status')
+@login_required
+@role_required('admin','kasir','branch_admin','branch_cashier')
+def api_cashier_qr_status():
+    bid=get_branch_id(); after=request.args.get('after',0,type=int)
+    active=q_one('''SELECT i.*,COALESCE(m.name,'') member_name FROM branch_qr_payment_intents i LEFT JOIN members m ON m.id=i.member_id WHERE i.branch_id=? AND i.operator_user_id=? ORDER BY i.id DESC LIMIT 1''',[bid,cashier_operator_id()])
+    paid=q_all('''SELECT i.id,i.payment_code,i.amount,i.paid_at,COALESCE(m.name,'') member_name FROM branch_qr_payment_intents i LEFT JOIN members m ON m.id=i.member_id WHERE i.branch_id=? AND i.status='PAID' AND i.id>? ORDER BY i.id''',[bid,after])
+    latest=q_one('SELECT COALESCE(MAX(id),0) id FROM branch_qr_payment_intents WHERE branch_id=?',[bid])['id']
+    return jsonify({'ok':True,'latest_id':latest,'active':dict(active) if active else None,'new_paid':[dict(x) for x in paid]})
+
+@app.route('/pay/branch/<token>',methods=['GET','POST'])
+@login_required
+def branch_qr_pay(token):
+    ensure_branch_qr_payment_schema(); profile=q_one('SELECT * FROM branch_qr_profiles WHERE qr_token=? AND is_active=1',[token])
+    if not profile: return ('QR cabang tidak valid atau sudah dinonaktifkan.',404)
+    member=current_wallet_member()
+    if not member:
+        flash('QR pembayaran hanya dapat digunakan oleh akun anggota yang terhubung ke wallet.','error'); return redirect(url_for('dashboard'))
+    bid=profile['branch_id']; branch_name=get_branch_name(bid)
+    # Expire stale intents before display.
+    exec_sql("UPDATE branch_qr_payment_intents SET status='EXPIRED',cancelled_at=? WHERE branch_id=? AND status='WAITING' AND expires_at<?",[now_str(),bid,now_str()])
+    intent=q_one("SELECT * FROM branch_qr_payment_intents WHERE branch_id=? AND status='WAITING' ORDER BY id DESC LIMIT 1",[bid])
+    balance=wallet_balance(member['id']) if 'wallet_balance' in globals() else q_one('SELECT COALESCE(SUM(CASE WHEN tipe="MASUK" THEN nominal ELSE -nominal END),0) saldo FROM saldo_history WHERE member_id=?',[member['id']])['saldo']
+    if request.method=='POST':
+        iid=int(request.form.get('intent_id') or 0)
+        conn=get_conn()
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            locked=conn.execute("SELECT * FROM branch_qr_payment_intents WHERE id=? AND branch_id=? AND status='WAITING'",[iid,bid]).fetchone()
+            if not locked: raise ValueError('Tagihan sudah dibayar, dibatalkan, atau kedaluwarsa.')
+            if locked['expires_at'] and locked['expires_at']<now_str(): raise ValueError('Tagihan sudah kedaluwarsa.')
+            saldo=conn.execute('SELECT COALESCE(SUM(CASE WHEN tipe="MASUK" THEN nominal ELSE -nominal END),0) saldo FROM saldo_history WHERE member_id=?',[member['id']]).fetchone()['saldo'] or 0
+            amount=float(locked['amount'] or 0)
+            if float(saldo)<amount: raise ValueError(f'Saldo wallet tidak cukup. Saldo tersedia {rupiah(saldo)}.')
+            after=float(saldo)-amount
+            conn.execute('INSERT INTO saldo_history(member_id,tipe,nominal,saldo_sebelum,saldo_setelah,keterangan,reference_id,created_by) VALUES(?,"KELUAR",?,?,?,?,?,?)',[member['id'],amount,saldo,after,f'QR Payment {branch_name} - {locked["payment_code"]}',iid,session.get('user_id')])
+            changed=conn.execute("UPDATE branch_qr_payment_intents SET status='PAID',member_id=?,wallet_account_no=(SELECT account_no FROM wallet_accounts WHERE member_id=?),paid_at=? WHERE id=? AND status='WAITING'",[member['id'],member['id'],now_str(),iid]).rowcount
+            if changed!=1: raise ValueError('Pembayaran diproses pihak lain. Saldo tidak dikurangi.')
+            conn.execute('INSERT INTO branch_qr_payment_events(intent_id,branch_id,event_type,event_at,user_id,member_id,ip_address,detail) VALUES(?,?,?,?,?,?,?,?)',[iid,bid,'PAID',now_str(),session.get('user_id'),member['id'],request.remote_addr or '',f'Saldo sebelum={saldo}; sesudah={after}'])
+            conn.commit(); log_action('BRANCH_QR_PAID','branch_qr_payment_intents',iid,f'{branch_name}; member={member["id"]}; amount={amount}')
+            flash(f'Pembayaran {rupiah(amount)} ke {branch_name} berhasil.','success'); return redirect(url_for('branch_qr_pay',token=token,success=iid))
+        except Exception as e:
+            conn.rollback(); flash(str(e),'error')
+        finally: conn.close()
+        return redirect(url_for('branch_qr_pay',token=token))
+    success=request.args.get('success',type=int); paid=q_one('SELECT * FROM branch_qr_payment_intents WHERE id=? AND member_id=? AND status="PAID"',[success,member['id']]) if success else None
+    body=render_template_string(r'''<div class="member-qr-pay"><header><span>SCAN TO PAY</span><h2>{{branch_name}}</h2><p>Pembayaran langsung dari saldo Koperasi Wallet.</p></header>{% if paid %}<section class="member-pay-success"><i>✓</i><h3>Pembayaran Berhasil</h3><b>{{rupiah(paid.amount)}}</b><small>{{paid.payment_code}} · {{paid.paid_at}}</small><a href="{{url_for('wallet')}}">Lihat Mutasi Wallet</a></section>{% elif intent %}<section class="member-pay-card"><div><span>TAGIHAN AKTIF</span><b>{{rupiah(intent.amount)}}</b><small>{{intent.payment_code}} · {{intent.note or 'Pembayaran koperasi'}}</small></div><div class="member-pay-balance"><span>Saldo Anda</span><b>{{rupiah(balance)}}</b></div><form method="post"><input type="hidden" name="intent_id" value="{{intent.id}}"><button class="btn-success" {{'disabled' if balance<intent.amount else ''}} data-confirm="Bayar {{rupiah(intent.amount)}} ke {{branch_name}}?">Bayar Sekarang</button></form>{% if balance<intent.amount %}<p class="pay-insufficient">Saldo tidak cukup. Silakan isi saldo terlebih dahulu.</p>{% endif %}</section>{% else %}<section class="member-pay-wait"><div class="qr-radar"><i></i><em></em></div><h3>Menunggu nominal dari kasir</h3><p>QR cabang sudah benar. Minta kasir mengaktifkan nominal transaksi, lalu halaman akan memeriksa otomatis.</p></section><script>setTimeout(function(){location.reload()},3000)</script>{% endif %}</div>''',branch_name=branch_name,intent=intent,balance=float(balance or 0),member=member,paid=paid,rupiah=rupiah)
+    return render_page('Bayar QR Cabang',body)
+
+@app.route('/cashier/qr-payment/history')
+@login_required
+@role_required('admin','branch_admin','manager')
+def branch_qr_payment_history():
+    ensure_branch_qr_payment_schema(); user=current_user(); bid=get_branch_id(); start=request.args.get('start') or today_str(); end=request.args.get('end') or today_str(); status=request.args.get('status',''); params=[start+' 00:00:00',end+' 23:59:59']
+    sql='''SELECT i.*,COALESCE(b.name,'PUSAT') branch_name,COALESCE(m.name,'-') member_name,COALESCE(u.full_name,u.username,'-') operator_name FROM branch_qr_payment_intents i LEFT JOIN koperasi_branches b ON b.id=i.branch_id LEFT JOIN members m ON m.id=i.member_id LEFT JOIN users u ON u.id=i.operator_user_id WHERE i.created_at BETWEEN ? AND ?'''
+    if user['role']=='branch_admin': sql+=' AND i.branch_id=?'; params.append(bid)
+    if status: sql+=' AND i.status=?'; params.append(status)
+    rows=q_all(sql+' ORDER BY i.id DESC LIMIT 1000',params)
+    body=render_template_string(r'''<div class="branch-qr-suite"><header class="branch-qr-hero"><div><span>QR PAYMENT LEDGER</span><h2>Riwayat QR Payment</h2><p>Audit tagihan, pembayaran wallet, operator, anggota, cabang, dan waktu penyelesaian.</p></div></header><section class="branch-qr-history"><header><form method="get" class="qr-history-filter"><input type="date" name="start" value="{{start}}"><input type="date" name="end" value="{{end}}"><select name="status"><option value="">Semua status</option>{% for x in ['WAITING','PAID','CANCELLED','EXPIRED'] %}<option value="{{x}}" {{'selected' if status==x else ''}}>{{x}}</option>{% endfor %}</select><button>Terapkan</button></form></header><div class="table-wrap"><table><thead><tr><th>Kode</th><th>Mode QR</th><th>Cabang</th><th>Operator</th><th>Anggota</th><th>Nominal</th><th>Dibuat</th><th>Dibayar</th><th>Status</th></tr></thead><tbody>{% for r in rows %}<tr><td><code>{{r.payment_code}}</code></td><td><span class="badge badge-info">{{r.qr_mode or "STATIC"}}</span></td><td>{{r.branch_name}}</td><td>{{r.operator_name}}</td><td>{{r.member_name}}</td><td><b>{{rupiah(r.amount)}}</b></td><td>{{r.created_at}}</td><td>{{r.paid_at or '-'}}</td><td><span class="badge {{'badge-success' if r.status=='PAID' else 'badge-warn' if r.status=='WAITING' else 'badge-gray'}}">{{r.status}}</span></td></tr>{% else %}<tr><td colspan="9" class="muted text-center">Belum ada transaksi QR.</td></tr>{% endfor %}</tbody></table></div></section></div>''',rows=rows,start=start,end=end,status=status,rupiah=rupiah)
+    return render_page('Riwayat QR Payment',body)
+
+CSS_DESIGN += r'''
+.branch-qr-suite{display:grid;gap:14px}.branch-qr-hero{position:relative;overflow:hidden;display:flex;justify-content:space-between;align-items:flex-end;min-height:185px;padding:25px;border-radius:18px;background:radial-gradient(circle at 82% 18%,rgba(37,99,235,.36),transparent 27%),linear-gradient(135deg,#06111d,#123b55);color:#fff;box-shadow:0 18px 45px rgba(6,17,29,.22)}.branch-qr-lines{position:absolute;inset:-40px -80px -50px 42%;background:repeating-radial-gradient(ellipse at 100% 10%,transparent 0 12px,rgba(103,232,249,.22) 13px 14px,transparent 15px 29px);animation:managerHairDrift 12s ease-in-out infinite alternate}.branch-qr-hero>div:not(.branch-qr-lines){position:relative;z-index:2}.branch-qr-hero span,.branch-qr-title span,.branch-qr-history header span{color:#67e8f9;font-size:8px;font-weight:950;letter-spacing:.17em}.branch-qr-hero h2{margin:7px 0;color:#fff;font-size:27px}.branch-qr-hero p{margin:0;max-width:670px;color:#b9cede;font-size:10px}.branch-qr-live{display:flex;align-items:center;gap:7px;padding:9px 12px;border:1px solid rgba(255,255,255,.16);border-radius:999px;background:rgba(255,255,255,.08);font-size:8px;font-weight:900}.branch-qr-live i{width:8px;height:8px;border-radius:50%;background:#5eead4;animation:adminPresencePulse 1.8s infinite}.branch-qr-grid{display:grid;grid-template-columns:380px minmax(0,1fr);gap:14px}.branch-qr-code,.branch-qr-terminal,.branch-qr-history{overflow:hidden;border:1px solid #d9e4ed;border-radius:15px;background:#fff;box-shadow:0 8px 24px rgba(15,35,52,.05)}.branch-qr-title,.branch-qr-history>header{display:flex;justify-content:space-between;align-items:center;padding:16px 18px;border-bottom:1px solid #e7edf2}.branch-qr-title span,.branch-qr-history header span{color:#0f9f97}.branch-qr-title h3,.branch-qr-history h3{margin:4px 0 0}.branch-qr-code>img{display:block;width:250px;height:250px;margin:22px auto 12px;padding:10px;border:1px solid #dfe8ef;border-radius:18px}.branch-qr-code>code{display:block;margin:0 16px;padding:9px;border-radius:8px;background:#f1f5f8;font-size:7px;overflow:hidden;text-overflow:ellipsis}.branch-qr-code>small{display:block;padding:10px 16px 17px;color:#8494a5;text-align:center}.qr-amount-form{display:grid;gap:13px;padding:22px}.qr-amount-form label{display:grid;gap:6px;font-size:9px;font-weight:800}.qr-amount-form input[type=number]{height:65px;font-size:27px;font-weight:900;text-align:center}.qr-active{position:relative;display:grid;place-items:center;min-height:330px;padding:25px;text-align:center;overflow:hidden}.qr-active>span{color:#0f9f97;font-size:8px;font-weight:950;letter-spacing:.15em}.qr-active>b{margin:10px 0;font-size:38px}.qr-active>small{color:#7d8d9c}.qr-radar{position:relative;width:115px;height:115px;margin:20px}.qr-radar:before,.qr-radar:after{content:'';position:absolute;inset:0;border:1px solid rgba(37,99,235,.18);border-radius:50%;animation:managerRingBreath 2.7s infinite}.qr-radar:after{inset:18px;animation-delay:-1s}.qr-radar i{position:absolute;left:50%;top:50%;width:12px;height:12px;border-radius:50%;background:#2dd4bf;transform:translate(-50%,-50%);box-shadow:0 0 0 7px rgba(45,212,191,.13),0 0 20px #2dd4bf}.qr-radar em{position:absolute;left:50%;top:50%;width:48%;height:1px;background:linear-gradient(90deg,#67e8f9,transparent);transform-origin:left;animation:managerSpin 2s linear infinite}.qr-paid-pop{display:grid;place-items:center;margin:0 20px 20px;padding:22px;border-radius:16px;background:#e8faf4;color:#087e6a}.qr-paid-pop i{display:grid;place-items:center;width:48px;height:48px;border-radius:50%;background:#10b981;color:#fff;font-size:24px;font-style:normal}.qr-paid-pop b,.qr-paid-pop strong,.qr-paid-pop small{display:block;margin-top:6px}.branch-qr-history>div>article{display:grid;grid-template-columns:10px minmax(0,1fr) auto 80px;gap:10px;align-items:center;padding:12px 17px;border-bottom:1px solid #edf2f6}.branch-qr-history article>i{width:8px;height:8px;border-radius:50%;background:#94a3b8}.branch-qr-history article>i.paid{background:#10b981;box-shadow:0 0 9px #10b981}.branch-qr-history article>i.waiting{background:#f59e0b}.branch-qr-history article b,.branch-qr-history article small{display:block}.branch-qr-history article small{color:#8494a5;font-size:8px}.qr-history-filter{display:flex;gap:7px;align-items:end}.member-qr-pay{display:grid;gap:14px;max-width:520px;margin:0 auto}.member-qr-pay>header{position:relative;overflow:hidden;padding:25px;border-radius:21px;background:linear-gradient(135deg,#06111d,#123b55);color:#fff}.member-qr-pay>header span{color:#67e8f9;font-size:8px;letter-spacing:.18em}.member-qr-pay>header h2{margin:7px 0;color:#fff}.member-qr-pay>header p{margin:0;color:#b9cede}.member-pay-card,.member-pay-success,.member-pay-wait{padding:24px;border:1px solid #d9e4ed;border-radius:20px;background:#fff;text-align:center;box-shadow:0 12px 35px rgba(15,35,52,.08)}.member-pay-card>div:first-child span,.member-pay-card>div:first-child b,.member-pay-card>div:first-child small{display:block}.member-pay-card>div:first-child span{color:#0f9f97;font-size:8px;font-weight:950}.member-pay-card>div:first-child b{margin:10px;font-size:36px}.member-pay-card>div:first-child small{color:#7d8d9c}.member-pay-balance{display:flex;justify-content:space-between;margin:22px 0;padding:13px;border-radius:12px;background:#f1f6f8}.member-pay-card button{width:100%}.member-pay-success i{display:grid;place-items:center;width:60px;height:60px;margin:auto;border-radius:50%;background:#10b981;color:#fff;font-size:30px;font-style:normal}.member-pay-success b{display:block;margin:12px;font-size:30px}.member-pay-success small,.member-pay-success a{display:block;margin-top:8px}.pay-insufficient{color:#b42335;font-size:9px}
+@media(max-width:900px){.branch-qr-grid{grid-template-columns:1fr}.branch-qr-code>img{width:220px;height:220px}}
+@media(max-width:768px){.branch-qr-suite{padding:0 12px}.branch-qr-hero{align-items:flex-start;flex-direction:column;min-height:210px;padding:20px;border-radius:22px}.branch-qr-hero h2{font-size:23px}.branch-qr-lines{inset:0 -180px 0 10%}.branch-qr-code,.branch-qr-terminal,.branch-qr-history{border-radius:20px}.qr-active{min-height:300px}.qr-active>b{font-size:31px}.branch-qr-history>div>article{grid-template-columns:8px minmax(0,1fr) auto}.branch-qr-history article>span{display:none}.qr-history-filter{display:grid;grid-template-columns:1fr 1fr;width:100%}.qr-history-filter select,.qr-history-filter button{grid-column:1/-1}.member-qr-pay{padding:0 12px}.member-pay-card>div:first-child b{font-size:30px}}
+'''
+
 @app.route('/quick-cashier', methods=['GET', 'POST'])
 @login_required
 @role_required('admin', 'kasir', 'branch_admin', 'branch_cashier')
@@ -6078,8 +6670,8 @@ def quick_cashier():
             paid = total
         # Simpan ke antrian verifikasi (PENDING) — stok belum dikurangi
         cashier_branch_id = get_branch_id()
-        qid = exec_sql('INSERT INTO quick_cashier_queue(invoice_no, trx_date, total, payment_method, member_id, customer_name, note, status, created_by, stock_branch_id) VALUES (?, ?, ?, ?, ?, ?, ?, "PENDING", ?, ?)',
-            [invoice, today_str(), total, payment_method, member_id, customer_name, note, session.get('user_id'), cashier_branch_id])
+        qid = exec_sql('INSERT INTO quick_cashier_queue(invoice_no,trx_date,total,payment_method,member_id,customer_name,note,status,created_by,stock_branch_id,cashier_session_id) VALUES(?,?,?,?,?,?,?,"PENDING",?,?,?)',
+            [invoice,today_str(),total,payment_method,member_id,customer_name,note,cashier_operator_id(),cashier_branch_id,cashier_operator_session_id()])
         log_action('QUICK_CASHIER_PENDING', 'quick_cashier_queue', qid, f'Total {total} metode {payment_method} — menunggu verifikasi')
         flash(f'✅ Transaksi antri verifikasi! Invoice: {invoice} — {rupiah(total)}. Status: PENDING. Admin akan verifikasi untuk kurangi stok.', 'success')
         return redirect(url_for('quick_cashier'))
@@ -6222,7 +6814,7 @@ def quick_cashier():
     document.getElementById('paidInput').addEventListener('input',hitungKembalian);
     </script>
     ''', members_rows=members_rows, total=0, rupiah=rupiah, cashier_branch_name=cashier_branch_name)
-    return render_page('Kasir Cepat', body)
+    return render_page('Kasir Cepat', cashier_operator_banner()+body)
 
 # =========================
 # Quick Cashier Queue — Verifikasi Admin untuk Kurangi Stok
@@ -6558,8 +7150,8 @@ def quick_cashier_verify(qid):
                             pname=conn.execute('SELECT product_name FROM products WHERE id=?',[pid]).fetchone()
                             raise ValueError(f'Stok {pname["product_name"] if pname else pid} di {get_branch_name(selected_bid)} tidak cukup. Tersedia {avail}, dibutuhkan {need}.')
                     invoice=queue['invoice_no']; sale_total=float(queue['total'] or total_items)
-                    sid=conn.execute('''INSERT INTO sales(invoice_no,trx_date,member_id,cashier_id,customer_name,total,paid,change_amount,note,status,payment_method,branch_id)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "Posted", ?, ?)''',[invoice,queue['trx_date'],queue['member_id'],queue['created_by'],queue['customer_name'] or '',sale_total,sale_total,0,queue['note'] or '',queue['payment_method'],selected_bid]).lastrowid
+                    sid=conn.execute('''INSERT INTO sales(invoice_no,trx_date,member_id,cashier_id,customer_name,total,paid,change_amount,note,status,payment_method,branch_id,cashier_session_id)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "Posted", ?, ?, ?)''',[invoice,queue['trx_date'],queue['member_id'],queue['created_by'],queue['customer_name'] or '',sale_total,sale_total,0,queue['note'] or '',queue['payment_method'],selected_bid,queue['cashier_session_id']]).lastrowid
                     br=conn.execute('SELECT branch_code FROM koperasi_branches WHERE id=?',[selected_bid]).fetchone()
                     for it in items:
                         conn.execute('INSERT INTO sales_items(sales_id,product_id,barcode,product_name,qty,price,subtotal) VALUES (?, ?, ?, ?, ?, ?, ?)',[sid,it['product_id'],'',it['product_name'],it['qty'],it['price'],it['subtotal']])
@@ -6680,7 +7272,8 @@ def cashier():
                 if available < float(item['qty']):
                     flash(f"Stok {item['product_name']} di {get_branch_name(bid)} tidak cukup. Tersedia {available}.", 'error')
                     return redirect(url_for('cashier'))
-            sid = exec_sql('INSERT INTO sales(invoice_no,trx_date,member_id,cashier_id,customer_name,total,paid,change_amount,note,status,payment_method,branch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "Posted", ?, ?)', [invoice,today_str(),member_id,session.get('user_id'),customer_name,total,paid,change_amount,note,payment_method,bid])
+            sid = exec_sql('INSERT INTO sales(invoice_no,trx_date,member_id,cashier_id,customer_name,total,paid,change_amount,note,status,payment_method,branch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "Posted", ?, ?)', [invoice,today_str(),member_id,cashier_operator_id(),customer_name,total,paid,change_amount,note,payment_method,bid])
+            exec_sql('UPDATE sales SET cashier_session_id=? WHERE id=?',[cashier_operator_session_id(),sid])
             payload = []
             for item in cart:
                 unit_cost = consume_from_batches(item['product_id'], item['qty'], bid)
@@ -6746,7 +7339,7 @@ def cashier():
     }
     </script>
     ''', cart=cart, total=total, members_rows=members_rows, rupiah=rupiah, cashier_branch_name=cashier_branch_name)
-    return render_page('Kasir', body)
+    return render_page('Kasir', cashier_operator_banner()+body)
 
 # =========================
 # Sales History
@@ -9447,7 +10040,8 @@ def cashier_discount():
             for item in cart:
                 if get_product_stock(item['product_id'],bid)<float(item['qty']):
                     flash(f"Stok {item['product_name']} di {get_branch_name(bid)} tidak cukup.",'error'); return redirect(url_for('cashier_discount'))
-            sid=exec_sql('INSERT INTO sales(invoice_no,trx_date,member_id,cashier_id,customer_name,total,paid,change_amount,note,status,payment_method,branch_id) VALUES(?,?,?,?,?,?,?,?,?,"Posted",?,?)',[invoice,today_str(),member_id,user['id'],customer_name,final_total,paid,change_amount,note+' '+disc_note,payment_method,bid])
+            sid=exec_sql('INSERT INTO sales(invoice_no,trx_date,member_id,cashier_id,customer_name,total,paid,change_amount,note,status,payment_method,branch_id) VALUES(?,?,?,?,?,?,?,?,?,"Posted",?,?)',[invoice,today_str(),member_id,cashier_operator_id(),customer_name,final_total,paid,change_amount,note+' '+disc_note,payment_method,bid])
+            exec_sql('UPDATE sales SET cashier_session_id=? WHERE id=?',[cashier_operator_session_id(),sid])
             for item in cart:
                 exec_sql('INSERT INTO sales_items(sales_id, product_id, barcode, product_name, qty, price, subtotal) VALUES (?, ?, ?, ?, ?, ?, ?)', [sid, item['product_id'], item['barcode'], item['product_name'], item['qty'], item['price'], item.get('subtotal', item['qty'] * item['price'])])
                 update_branch_stock(item['product_id'],item['qty'],bid,'subtract')
@@ -9466,7 +10060,7 @@ def cashier_discount():
     members_rows = q_all("SELECT id, member_code, name FROM members WHERE status='Aktif' ORDER BY name ASC")
     total = sum(float(i.get('subtotal', i['qty'] * i['price'])) for i in cart)
     body = render_template_string('''<div class="grid"><div class="col-4"><div class="card"><h2>🧾 Kasir + Diskon</h2><hr><form method="post"><input type="hidden" name="action" value="add_item"><div class="form-group"><label>Barcode</label><input name="barcode" placeholder="Scan barcode..." autofocus></div><div class="form-group"><label>Qty</label><input type="number" name="qty" value="1"></div><button type="submit">Tambah Produk Kredit</button></form><hr><h3>Total: <strong>{{ rupiah(total) }}</strong></h3><form method="post"><input type="hidden" name="action" value="save_sale"><div class="form-group"><label>Member</label><select name="member_id"><option value="">Umum</option>{% for m in members_rows %}<option value="{{ m['id'] }}">{{ m['member_code'] }} — {{ m['name'] }}</option>{% endfor %}</select></div><div class="form-group"><label>Nama Pelanggan</label><input name="customer_name" placeholder="(opsional)"></div><div class="form-group"><label>🛒 Diskon Global</label><div style="display:flex;gap:8px;"><input type="number" name="global_discount" value="0" style="width:100px;"><select name="global_disc_type" style="width:60px;"><option value="%">% </option><option value="rp">Rp</option></select></div></div><div class="form-group"><label>Pilih Metode Pembayaran</label><select name="payment_method"><option value="tunai">💰 Tunai</option><option value="wallet">💳 Wallet</option></select></div><div class="form-group"><label>Bayar</label><input type="number" name="paid" value="{{ total }}"></div><div class="form-group"><label>Catatan</label><textarea name="note" style="min-height:40px;"></textarea></div><button type="submit" class="btn-success">💾 Simpan Transaksi</button></form><form method="post" style="margin-top:8px;"><input type="hidden" name="action" value="clear"><button class="btn-ghost btn-danger" type="submit">🗑️ Kosongkan</button></form></div></div><div class="col-8"><div class="card"><h2>Keranjang</h2><div class="table-wrap"><table><thead><tr><th>Barang</th><th>Qty</th><th>Harga</th><th>Diskon</th><th>Subtotal</th><th>Aksi</th></tr></thead><tbody>{% for i in cart %}<tr><td>{{ i['product_name'] }}</td><td>{{ i['qty'] }}</td><td>{{ rupiah(i['price']) }}</td><td>{% if i.get('discount_amount',0) > 0 %}<span style="color:#ef4444;">-{{ rupiah(i['discount_amount']) }}</span>{% else %}-{% endif %}</td><td>{{ rupiah(i.get('subtotal', i['qty']*i['price'])) }}</td><td><form method="post" style="display:flex;gap:4px;"><input type="hidden" name="action" value="set_discount"><input type="hidden" name="item_idx" value="{{ loop.index0 }}"><input type="number" name="discount_value" placeholder="Diskon" style="width:70px;"><select name="discount_type" style="width:50px;"><option value="%">%</option><option value="rp">Rp</option></select><button class="btn-sm btn-warn" type="submit">💾</button></form></td></tr>{% else %}<tr><td colspan="6" class="muted text-center">Keranjang kosong.</td></tr>{% endfor %}</tbody></table></div></div></div></div>''', cart=cart, total=total, members_rows=members_rows, rupiah=rupiah)
-    return render_page('Kasir + Diskon', body)
+    return render_page('Kasir + Diskon', cashier_operator_banner()+body)
 
 # =========================
 # Fitur 4: Import Member dari Excel
@@ -10142,6 +10736,66 @@ body.page-manager_dashboard .manager-flow div{transition:transform .2s,box-shado
 @media(max-width:800px){body.page-manager_dashboard .manager-network-map{height:430px!important}.manager-map-node span{display:none}.manager-map-node>i{width:16px;height:16px}.manager-map-core{width:72px!important;height:72px!important}}
 @media(max-width:600px){body.page-manager_dashboard .main-content{padding-left:0!important;padding-right:0!important}body.page-manager_dashboard .manager-mobile-shell{padding:0 12px!important}.manager-hero{min-height:235px!important;padding:20px!important}.manager-hero-content{min-height:195px!important;align-items:flex-start!important;flex-direction:column!important}.manager-hero h2{font-size:25px!important}.manager-live{align-self:flex-start!important}.manager-hairlines{inset:0 -190px 0 18%!important}.manager-orbit{opacity:.55}.manager-kpis{grid-template-columns:1fr 1fr!important}.manager-network-map{height:370px!important}.manager-branch-list{padding:10px!important}.manager-flow{padding:15px!important}}
 @media(prefers-reduced-motion:reduce){body.page-manager_dashboard *{animation-duration:.01ms!important;animation-iteration-count:1!important}}
+"""
+
+CSS_DESIGN += r"""
+/* MANAGER SMARTPHONE FINAL LAYOUT */
+@media(max-width:768px){
+  body.page-manager_dashboard .main-content,body.page-manager_finance .main-content,body.page-manager_inventory .main-content,body.page-manager_flow .main-content,body.page-maps .main-content{padding:84px 0 calc(102px + env(safe-area-inset-bottom))!important;overflow-x:hidden!important;background:#eef3f7!important}
+  body.page-manager_dashboard .topbar,body.page-manager_finance .topbar,body.page-manager_inventory .topbar,body.page-manager_flow .topbar,body.page-maps .topbar{display:none!important}
+  body.page-manager_dashboard .manager-mobile-shell,body.page-manager_finance .manager-module,body.page-manager_inventory .manager-module,body.page-manager_flow .manager-module{display:grid!important;gap:12px!important;width:auto!important;margin:0!important;padding:0 12px 20px!important}
+  body.page-manager_dashboard .manager-hero,body.page-manager_finance .manager-module-hero,body.page-manager_inventory .manager-module-hero,body.page-manager_flow .manager-module-hero{min-height:0!important;margin:0!important;padding:20px!important;border-radius:22px!important;box-sizing:border-box!important}
+  body.page-manager_dashboard .manager-hero-content{display:flex!important;min-height:190px!important;align-items:flex-start!important;justify-content:space-between!important;flex-direction:column!important;gap:14px!important}
+  body.page-manager_dashboard .manager-hero h2,body.page-manager_finance .manager-module-hero h2,body.page-manager_inventory .manager-module-hero h2,body.page-manager_flow .manager-module-hero h2{font-size:24px!important;line-height:1.08!important;max-width:88%!important}
+  body.page-manager_dashboard .manager-hero p,body.page-manager_finance .manager-module-hero p,body.page-manager_inventory .manager-module-hero p,body.page-manager_flow .manager-module-hero p{font-size:10px!important;line-height:1.55!important;max-width:92%!important}
+  body.page-manager_dashboard .manager-hairlines{inset:-20px -190px -30px 12%!important;opacity:.65!important}
+  body.page-manager_dashboard .manager-orbit.o1{right:-25px!important;top:25px!important;width:125px!important;height:125px!important}.manager-orbit.o2{right:27px!important;top:58px!important;width:62px!important;height:62px!important}
+  body.page-manager_dashboard .manager-data-particles{opacity:.55!important}
+  body.page-manager_dashboard .manager-kpis,body.page-manager_finance .manager-module-kpis,body.page-manager_inventory .manager-module-kpis,body.page-manager_flow .manager-module-kpis{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:8px!important;margin:0!important;padding:0!important}
+  body.page-manager_dashboard .manager-kpis article,body.page-manager_finance .manager-module-kpis article,body.page-manager_inventory .manager-module-kpis article,body.page-manager_flow .manager-module-kpis article{min-width:0!important;margin:0!important;padding:13px!important;border-radius:16px!important;box-sizing:border-box!important}
+  body.page-manager_dashboard .manager-kpis b,body.page-manager_finance .manager-module-kpis b,body.page-manager_inventory .manager-module-kpis b,body.page-manager_flow .manager-module-kpis b{font-size:14px!important;line-height:1.2!important;overflow-wrap:anywhere!important}
+  body.page-manager_dashboard .manager-grid,body.page-manager_finance .manager-module-grid,body.page-manager_inventory .manager-module-grid,body.page-manager_flow .manager-module-grid{display:grid!important;grid-template-columns:minmax(0,1fr)!important;gap:12px!important;width:100%!important}
+  body.page-manager_dashboard .manager-panel,body.page-manager_finance .manager-module-card,body.page-manager_inventory .manager-module-card,body.page-manager_flow .manager-module-card{grid-column:1!important;width:100%!important;min-width:0!important;margin:0!important;border-radius:20px!important;box-sizing:border-box!important}
+  body.page-manager_dashboard .manager-panel-head,body.page-manager_finance .manager-module-head,body.page-manager_inventory .manager-module-head,body.page-manager_flow .manager-module-head{align-items:flex-start!important;gap:9px!important;padding:15px!important;flex-wrap:wrap!important}
+  body.page-manager_dashboard .manager-panel-head h3,body.page-manager_finance .manager-module-head h3,body.page-manager_inventory .manager-module-head h3,body.page-manager_flow .manager-module-head h3{font-size:14px!important}
+  body.page-manager_dashboard .manager-panel-head>a,body.page-manager_finance .manager-module-head>a,body.page-manager_inventory .manager-module-head>a,body.page-manager_flow .manager-module-head>a{min-height:34px!important;padding:8px 10px!important;border-radius:10px!important;background:#edf7f5!important;font-size:8px!important}
+  body.page-manager_dashboard .manager-network-map{height:320px!important;min-height:320px!important;border-radius:0!important}
+  body.page-manager_dashboard .manager-map-rings{width:210px!important;height:210px!important;box-shadow:0 0 0 27px rgba(45,212,191,.035),0 0 0 55px rgba(59,130,246,.025)!important}
+  body.page-manager_dashboard .manager-map-core{width:67px!important;height:67px!important}.manager-map-core i{width:49px!important;height:49px!important}.manager-map-core b{font-size:7px!important}
+  body.page-manager_dashboard .manager-map-node span{display:none!important}.manager-map-node>i{width:16px!important;height:16px!important}
+  body.page-manager_dashboard .manager-branch-list{gap:8px!important;padding:10px!important}
+  body.page-manager_dashboard .manager-branch-card{display:grid!important;grid-template-columns:minmax(0,1fr) auto 18px!important;gap:8px!important;padding:12px!important;border-radius:14px!important}
+  body.page-manager_dashboard .manager-branch-card strong:nth-of-type(n+2){display:none!important}.manager-branch-card strong{font-size:9px!important}.manager-branch-card small{white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;max-width:180px!important}
+  body.page-manager_dashboard .activity-list{padding:0 12px 8px!important}.activity-item{grid-template-columns:34px minmax(0,1fr) auto!important;gap:8px!important;min-height:56px!important}.activity-item>span{display:none!important}.activity-item strong{font-size:9px!important;max-width:92px!important;text-align:right!important;overflow-wrap:anywhere!important}
+  body.page-manager_dashboard .manager-flow{display:flex!important;gap:9px!important;padding:14px!important;overflow-x:auto!important;scroll-snap-type:x mandatory!important}.manager-flow div{flex:0 0 76%!important;min-width:0!important;scroll-snap-align:start!important}.manager-flow>span{flex:0 0 auto!important;align-self:center!important}
+  body.page-manager_dashboard .manager-bars{padding:14px!important}
+  body.page-manager_finance .manager-finance-row{display:grid!important;grid-template-columns:minmax(0,1fr) 100px!important;gap:8px!important;padding:12px 14px!important}.manager-finance-row strong{font-size:9px!important}.manager-finance-row strong:nth-of-type(n+2){display:none!important}
+  body.page-manager_inventory .manager-stock-cards{display:grid!important;grid-template-columns:minmax(0,1fr)!important;gap:9px!important;padding:10px!important}.manager-stock-card{padding:13px!important;border-radius:15px!important}.manager-stock-card p{grid-template-columns:repeat(3,minmax(0,1fr))!important}.manager-stock-card p span{min-width:0!important;overflow:hidden!important}.manager-stock-card p b{font-size:9px!important;overflow-wrap:anywhere!important}
+  body.page-manager_flow .flow-monitor{display:grid!important;grid-template-columns:minmax(0,1fr)!important;gap:22px!important;padding:14px!important}.flow-monitor article{padding:15px!important;border-radius:15px!important}.flow-monitor article:not(:last-child):after{content:'↓'!important;right:50%!important;top:auto!important;bottom:-20px!important}
+  body.page-maps .card,body.page-maps .metrics,body.page-maps .grid{margin-left:12px!important;margin-right:12px!important}.manager-map-page{height:350px!important;margin:0 12px 12px!important;border-radius:20px!important}.manager-map-page .manager-map-rings{width:215px!important;height:215px!important}.manager-map-page .manager-map-node span{display:none!important}.manager-leaflet-map{height:300px!important;margin:0 12px 12px!important}.page-maps .grid{grid-template-columns:1fr!important}.page-maps .col-4{grid-column:1!important}.page-maps .card{padding:14px!important}
+}
+@media(max-width:380px){
+  body.page-manager_dashboard .manager-kpis,body.page-manager_finance .manager-module-kpis,body.page-manager_inventory .manager-module-kpis,body.page-manager_flow .manager-module-kpis{grid-template-columns:1fr!important}
+  body.page-manager_dashboard .manager-hero h2,body.page-manager_finance .manager-module-hero h2,body.page-manager_inventory .manager-module-hero h2,body.page-manager_flow .manager-module-hero h2{font-size:21px!important}
+  body.page-manager_dashboard .manager-network-map{height:285px!important;min-height:285px!important}.manager-map-page{height:315px!important}
+}
+"""
+
+CSS_DESIGN += r"""
+/* MANAGER NAVIGATION FINAL */
+@media(max-width:768px){
+  body.page-manager_dashboard .mobile-header,body.page-manager_finance .mobile-header,body.page-manager_inventory .mobile-header,body.page-manager_flow .mobile-header,body.page-maps .mobile-header{background:linear-gradient(135deg,rgba(5,18,31,.97),rgba(13,52,75,.96))!important;border:1px solid rgba(103,232,249,.17)!important;box-shadow:0 18px 45px rgba(4,17,29,.28)!important}
+  body.page-manager_dashboard .mobile-header .mh-greeting,body.page-manager_finance .mobile-header .mh-greeting,body.page-manager_inventory .mobile-header .mh-greeting,body.page-manager_flow .mobile-header .mh-greeting,body.page-maps .mobile-header .mh-greeting{display:block!important;color:#67e8f9!important;font-size:7px!important;font-weight:900!important;letter-spacing:.12em!important;text-transform:uppercase!important}
+  body.page-manager_dashboard .mobile-header .mh-title,body.page-manager_finance .mobile-header .mh-title,body.page-manager_inventory .mobile-header .mh-title,body.page-manager_flow .mobile-header .mh-title,body.page-maps .mobile-header .mh-title{color:#fff!important;font-size:13px!important}
+  body.page-manager_dashboard .mh-hamburger,body.page-manager_finance .mh-hamburger,body.page-manager_inventory .mh-hamburger,body.page-manager_flow .mh-hamburger,body.page-maps .mh-hamburger,body.page-manager_dashboard .mh-profile,body.page-manager_finance .mh-profile,body.page-manager_inventory .mh-profile,body.page-manager_flow .mh-profile,body.page-maps .mh-profile{background:rgba(255,255,255,.09)!important;border:1px solid rgba(255,255,255,.13)!important;color:#fff!important;box-shadow:none!important}
+  body.page-manager_dashboard .mobile-nav,body.page-manager_finance .mobile-nav,body.page-manager_inventory .mobile-nav,body.page-manager_flow .mobile-nav,body.page-maps .mobile-nav{display:grid!important;grid-template-columns:repeat(5,minmax(0,1fr))!important;background:rgba(5,18,31,.97)!important;border-color:rgba(103,232,249,.14)!important;box-shadow:0 20px 50px rgba(4,17,29,.32)!important}
+  body.page-manager_dashboard .mobile-nav .mn-item,body.page-manager_finance .mobile-nav .mn-item,body.page-manager_inventory .mobile-nav .mn-item,body.page-manager_flow .mobile-nav .mn-item,body.page-maps .mobile-nav .mn-item{display:flex!important;color:#8fa9b9!important;background:transparent!important;font-size:7.5px!important}
+  body.page-manager_dashboard .mobile-nav .mn-item.active,body.page-manager_finance .mobile-nav .mn-item.active,body.page-manager_inventory .mobile-nav .mn-item.active,body.page-manager_flow .mobile-nav .mn-item.active,body.page-maps .mobile-nav .mn-item.active{color:#67e8f9!important;background:rgba(103,232,249,.09)!important}
+  body.page-manager_dashboard .mobile-nav .mn-item.active .mn-icon,body.page-manager_finance .mobile-nav .mn-item.active .mn-icon,body.page-manager_inventory .mobile-nav .mn-item.active .mn-icon,body.page-manager_flow .mobile-nav .mn-item.active .mn-icon,body.page-maps .mobile-nav .mn-item.active .mn-icon{background:#0f9f97!important;color:#fff!important}
+  body.page-manager_dashboard .mobile-nav .nav-primary .mn-icon,body.page-manager_finance .mobile-nav .nav-primary .mn-icon,body.page-manager_inventory .mobile-nav .nav-primary .mn-icon,body.page-manager_flow .mobile-nav .nav-primary .mn-icon,body.page-maps .mobile-nav .nav-primary .mn-icon{border-color:#eef3f7!important;background:linear-gradient(145deg,#2563eb,#0f9f97)!important;box-shadow:0 13px 26px rgba(37,99,235,.32)!important}
+  body.page-manager_dashboard .mobile-nav .nav-primary,body.page-manager_finance .mobile-nav .nav-primary,body.page-manager_inventory .mobile-nav .nav-primary,body.page-manager_flow .mobile-nav .nav-primary,body.page-maps .mobile-nav .nav-primary{color:#67e8f9!important}
+  body.page-manager_dashboard .mobile-nav .mobile-notif-nav,body.page-manager_finance .mobile-nav .mobile-notif-nav,body.page-manager_inventory .mobile-nav .mobile-notif-nav,body.page-manager_flow .mobile-nav .mobile-notif-nav,body.page-maps .mobile-nav .mobile-notif-nav{display:flex!important;color:#8fa9b9!important}
+}
 """
 
 @app.route('/manager/dashboard')
@@ -11292,6 +11946,13 @@ def payment_accounts():
     body=render_template_string(r'''<div class="bank-suite"><header class="bank-hero"><div><span>PAYMENT ROUTING</span><h2>Rekening Pembayaran</h2><p>Kelola rekening resmi koperasi dengan validasi, versioning, snapshot transaksi, dan histori perubahan.</p></div><div class="bank-hero-stats"><article><b>{{active_count}}</b><small>Aktif</small></article><article><b>{{rows|length}}</b><small>Total</small></article><article><b>{{default_count}}</b><small>Utama</small></article></div></header><div class="bank-layout"><aside class="bank-form"><h3>{{'Perbarui rekening' if edit else 'Tambah rekening'}}</h3><p class="bank-form-note">Data rekening akan digunakan sebagai tujuan resmi pembayaran anggota.</p><form method="post"><input type="hidden" name="action" value="{{'update' if edit else 'create'}}">{% if edit %}<input type="hidden" name="account_id" value="{{edit.id}}">{% endif %}<label>Bank / penyedia<input name="bank_name" value="{{edit.bank_name if edit else ''}}" minlength="2" required></label><label>Nomor rekening<input name="account_number" value="{{edit.account_number if edit else ''}}" minlength="5" required></label><label>Nama pemilik<input name="account_holder" value="{{edit.account_holder if edit else ''}}" minlength="3" required></label><div class="bank-two"><label>Digunakan untuk<select name="account_type"><option value="KREDIT" {% if edit and edit.account_type=='KREDIT' %}selected{% endif %}>Kredit</option><option value="EWALLET" {% if edit and edit.account_type=='EWALLET' %}selected{% endif %}>E-Wallet</option><option value="SEMUA" {% if edit and edit.account_type=='SEMUA' %}selected{% endif %}>Semua</option></select></label><label>Mata uang<select name="currency"><option value="IDR" {% if not edit or edit.currency=='IDR' %}selected{% endif %}>IDR</option><option value="JPY" {% if edit and edit.currency=='JPY' %}selected{% endif %}>JPY</option></select></label></div><label>Instruksi pembayaran<textarea name="instructions" placeholder="Contoh: Cantumkan nomor kredit pada berita transfer">{{edit.instructions if edit else ''}}</textarea></label><label class="bank-check"><input type="checkbox" name="is_default" {% if edit and edit.is_default %}checked{% endif %}> Jadikan rekening utama kredit</label><label>Alasan perubahan {% if not edit %}<small>(opsional)</small>{% endif %}<input name="reason" placeholder="Contoh: rekening operasional baru" {% if edit %}minlength="5" required{% endif %}></label><button type="submit">{{'Simpan perubahan' if edit else 'Tambahkan rekening'}}</button>{% if edit %}<a href="{{url_for('payment_accounts')}}" class="btn btn-ghost">Batal edit</a>{% endif %}</form></aside><main><div class="bank-grid">{% for a in rows %}<article class="{{'inactive' if a.status!='ACTIVE'}}"><header><i>{{a.bank_name[:3]|upper}}</i><span>{{a.account_type}}</span></header><h3>{{a.account_number}}</h3><p>a.n. {{a.account_holder}}</p><div><b>{{a.status}}</b><small>Versi {{a.version_no or 1}}</small>{% if a.is_default %}<em>UTAMA</em>{% endif %}</div><footer><a href="?edit={{a.id}}">Edit</a><form method="post"><input type="hidden" name="action" value="toggle"><input type="hidden" name="account_id" value="{{a.id}}"><input name="reason" placeholder="Alasan perubahan" minlength="5" required><button type="submit">{{'Nonaktifkan' if a.status=='ACTIVE' else 'Aktifkan'}}</button></form></footer></article>{% else %}<div class="bank-empty"><i>＋</i><h3>Belum ada rekening</h3><p>Tambahkan rekening kredit pertama melalui form di sebelah kiri.</p></div>{% endfor %}</div><section class="bank-history"><h3>Histori Perubahan</h3>{% for h in history %}<div><i></i><span><b>{{h.action}}</b><small>{{h.full_name or '-'}} · {{h.changed_at}}</small><p>{{h.reason or '-'}}</p></span></div>{% else %}<div class="bank-empty-small">Belum ada histori perubahan.</div>{% endfor %}</section></main></div></div>''',rows=rows,edit=edit,history=history,active_count=active_count,default_count=default_count)
     return render_page('Rekening Pembayaran',body)
 
+CSS_DESIGN += r"""
+/* FORCE ADMIN CASHIER MENU + REALTIME PRESENCE */
+#sidebar a[href="/admin/cashier-control"],#sidebar a[href="/admin/cashier-operators"],#sidebar a[href="/cashier/operator-sessions"],#sidebar a[href="/admin/cashier-rotation-log"]{display:grid!important;visibility:visible!important;opacity:1!important}
+.admin-live-presence{overflow:hidden;border:1px solid #dce6ee;border-radius:16px;background:#fff;box-shadow:0 9px 28px rgba(15,35,52,.055)}.admin-live-presence>header{display:flex;justify-content:space-between;align-items:center;gap:15px;padding:18px 20px;border-bottom:1px solid #e8eef3}.admin-live-presence header span{color:#0f9f97;font-size:8px;font-weight:950;letter-spacing:.17em}.admin-live-presence header h2{margin:4px 0 2px;font-size:16px}.admin-live-presence header p{margin:0;color:#8191a0;font-size:9px}.admin-live-presence>header>b{padding:7px 10px;border-radius:999px;background:#e7faf5;color:#087e6a;font-size:8px;letter-spacing:.08em;box-shadow:0 0 0 5px rgba(45,212,191,.06)}.admin-presence-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;padding:14px}.admin-presence-person{display:grid;grid-template-columns:42px minmax(0,1fr) auto;gap:10px;align-items:center;padding:12px;border:1px solid #e1e9f0;border-radius:12px;background:linear-gradient(145deg,#fff,#f8fbfd)}.admin-presence-person.self{border-color:#83d8cb;background:linear-gradient(145deg,#f8fffc,#ecfaf6)}.admin-presence-avatar{position:relative;display:grid;place-items:center;width:40px;height:40px;border-radius:13px;background:linear-gradient(145deg,#173c59,#2563eb);color:#fff;font-weight:950}.admin-presence-avatar>i{position:absolute;right:-2px;bottom:-2px;width:11px;height:11px;border:2px solid #fff;border-radius:50%;background:#22c55e;box-shadow:0 0 9px #22c55e}.admin-presence-person b,.admin-presence-person small,.admin-presence-person p{display:block}.admin-presence-person b{font-size:11px}.admin-presence-person b em{padding:2px 5px;border-radius:999px;background:#dff8f1;color:#087e6a;font-size:6px;font-style:normal}.admin-presence-person small{margin-top:3px;color:#7d8d9c;font-size:7px}.admin-presence-person p{margin:4px 0 0;color:#2563eb;font:700 8px ui-monospace,SFMono-Regular,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.admin-presence-person>span{display:flex;align-items:center;gap:5px;color:#15803d;font-size:7px;font-weight:900}.admin-presence-person>span i{width:6px;height:6px;border-radius:50%;background:#22c55e;animation:adminPresencePulse 1.8s infinite}.admin-presence-empty{grid-column:1/-1;padding:25px;color:#8191a0;text-align:center}@keyframes adminPresencePulse{70%{box-shadow:0 0 0 8px rgba(34,197,94,0)}}
+@media(max-width:768px){.admin-live-presence{margin:0 12px;border-radius:20px}.admin-live-presence>header{align-items:flex-start;padding:15px}.admin-presence-list{grid-template-columns:1fr;padding:10px}.admin-presence-person{grid-template-columns:38px minmax(0,1fr) auto;padding:11px}.admin-presence-avatar{width:37px;height:37px}.admin-presence-person>span{font-size:0}.admin-presence-person>span i{width:9px;height:9px}}
+"""
+
 @app.route('/admin/command-center')
 @login_required
 @role_required('admin')
@@ -11316,6 +11977,7 @@ def admin_command_center():
         <article><div class="ap-metric-icon credit">◇</div><span>KREDIT AKTIF</span><strong>{{stats.active_loans}}</strong><small>Pinjaman berstatus berjalan</small><em>Aktif</em></article>
       </section>
 
+      <section class="admin-live-presence"><header><div><span>REAL-TIME ADMIN PRESENCE</span><h2>Admin yang sedang online</h2><p>Status aktif diperbarui otomatis setiap 15 detik.</p></div><b id="adminOnlineCount">0 ONLINE</b></header><div id="adminPresenceList" class="admin-presence-list"><div class="admin-presence-empty">Memuat status admin...</div></div></section>
       <section class="ap-flow">
         <header class="ap-section-head"><div><span>LIVE DATA THREAD</span><h2>Flow operasional</h2><p>Alur modul utama yang saling terhubung.</p></div><b>REAL-TIME</b></header>
         <div class="ap-flow-grid">
@@ -11333,7 +11995,7 @@ def admin_command_center():
         <section class="ap-panel ap-audit"><header><div><span>AKTIVITAS SISTEM</span><h2>Audit Stream</h2></div><a href="{{url_for('audit')}}">Semua</a></header><div class="ap-list">{% for e in events %}<article><i></i><span><b>{{e.action}}</b><small>{{e.username}} · {{e.log_time}}</small></span></article>{% else %}<div class="ap-empty"><b>Belum ada aktivitas</b></div>{% endfor %}</div></section>
       </div>
       <footer class="ap-trust"><span>◈ Data terlindungi</span><span>● Sistem aktif</span><span>✓ Audit tercatat</span></footer>
-    </div>''',stats=stats,warnings=warnings,events=events,rupiah=rupiah,now=now_str(),range=range)
+    </div><script>(function(){function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}function loadAdmins(){fetch('/api/admin-presence',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){var count=document.getElementById('adminOnlineCount'),list=document.getElementById('adminPresenceList');if(!count||!list)return;count.textContent=d.online_count+' ONLINE';if(!d.admins.length){list.innerHTML='<div class="admin-presence-empty">Tidak ada admin online.</div>';return}list.innerHTML=d.admins.map(function(a){return '<article class="admin-presence-person'+(a.self?' self':'')+'"><div class="admin-presence-avatar">'+esc(a.name.charAt(0).toUpperCase())+'<i></i></div><div><b>'+esc(a.name)+(a.self?' <em>ANDA</em>':'')+'</b><small>@'+esc(a.username)+' · '+esc(a.device)+' · '+esc(a.ip)+'</small><p>'+esc(a.path)+'</p></div><span><i></i> Aktif</span></article>'}).join('')}).catch(function(){})}loadAdmins();setInterval(loadAdmins,15000)})();</script>''',stats=stats,warnings=warnings,events=events,rupiah=rupiah,now=now_str(),range=range)
     return render_page('Command Center',body)
 
 # ==========================================================
